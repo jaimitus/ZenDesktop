@@ -11,10 +11,9 @@ use serde::Deserialize;
 const GITHUB_API: &str = "https://api.github.com/repos/jaimitus/ZenDesktop/releases/latest";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// Ed25519 public key (hex). Generate a new keypair with:
-//   cargo run --bin gen-keys
-// Replace this with the PUBLIC_KEY output.
-const PUBKEY_HEX: &str = "e620bd0400f6d33960420789d9098dadf258cc591c79439a80de50341f1e9e04";
+// Ed25519 public key (hex). Generated 2026-08-12 with `cargo run --bin gen-keys`.
+// The matching private key is stored as the GitHub Actions secret SIGNING_KEY.
+const PUBKEY_HEX: &str = "df1c9091cd42eb37b8986f5df342667c808ac3c2fb27a9e5f1465198c2d17489";
 
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
