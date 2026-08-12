@@ -7,7 +7,7 @@ authors       = ["ZenDesktop Core Team"]
 description   = "Organizador dinamico de escritorio ultraligero y nativo para Windows (alternativa a Fences)"
 license       = "MIT"
 readme        = "README.md"
-repository    = "https://github.com/zendesktop/zendesktop"
+repository    = "https://github.com/jaimitus/ZenDesktop"
 categories    = ["gui", "os::windows-apis"]
 keywords      = ["windows", "desktop", "fences", "direct2d", "win32"]
 

@@ -18,7 +18,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.75.0
+          toolchain: stable
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -45,16 +45,16 @@ jobs:
           V="${{ steps.version.outputs.VERSION }}"
           cp src/code/target/release/zendesktop.exe "release/ZenDesktop-v${V}.exe"
           cp src/code/target/release/zendesktop.exe release/ZenDesktop.exe
-          cp src/code/LICENSE release/
-          cp src/code/README.md release/
+          cp LICENSE release/
+          cp README.md release/
           cd release
-          7z a -tzip "ZenDesktop-v${V}-portable.zip" ZenDesktop.exe LICENSE README.md
+          powershell -Command "Compress-Archive -Path ZenDesktop.exe,LICENSE,README.md -DestinationPath ZenDesktop-v${V}-portable.zip"
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           name: "ZenDesktop v${{ steps.version.outputs.VERSION }}"
-          body_path: src/code/CHANGELOG.md
+          body_path: CHANGELOG.md
           files: |
             release/ZenDesktop.exe
             release/ZenDesktop-v${{ steps.version.outputs.VERSION }}.exe
