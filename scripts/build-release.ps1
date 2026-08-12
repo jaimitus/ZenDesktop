@@ -74,7 +74,8 @@ if ($wixExe) {
     Copy-Item "$Root\README.md" "$staging\README.md" -Force
 
     # Paths in the .wxs resolve relative to the .wxs file.
-    & $wixExe build -d Version=$Version -d SrcDir=staging `
+    # -arch x64 sets the MSI platform (WiX v5 rejects Platform on Package).
+    & $wixExe build -arch x64 -d Version=$Version -d SrcDir=staging `
         "$InstallerDir\zendesktop.wxs" `
         -o "$ReleaseDir\ZenDesktop-v$Version-x64.msi"
     if ($LASTEXITCODE -ne 0) { throw "WiX build failed" }

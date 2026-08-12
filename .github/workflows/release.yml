@@ -75,9 +75,10 @@ jobs:
           cp LICENSE installer/staging/LICENSE
           cp README.md installer/staging/README.md
           # Paths in the .wxs resolve relative to the .wxs file, so run from
-          # installer/ with SrcDir=staging.
+          # installer/ with SrcDir=staging. -arch x64 sets the MSI platform
+          # (WiX v5 does not accept a Platform attribute on Package).
           cd installer
-          ~/.dotnet/tools/wix build -d Version=${V} -d SrcDir=staging \
+          ~/.dotnet/tools/wix build -arch x64 -d Version=${V} -d SrcDir=staging \
             zendesktop.wxs -o "../release/ZenDesktop-v${V}-x64.msi"
 
       - name: Generate SHA256 checksums
