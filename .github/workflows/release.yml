@@ -122,11 +122,18 @@ jobs:
           } | Set-Content -Path release\SHA256SUMS.txt -Encoding ascii
           Get-Content release\SHA256SUMS.txt
 
+      - name: Extract Release Notes
+        id: extract_notes
+        shell: bash
+        run: |
+          V="${{ steps.version.outputs.VERSION }}"
+          awk "/^## \\\[$V\\\]/ {flag=1; print; next} /^## \\\[/ {if (flag) {flag=0; exit}} flag {print}" CHANGELOG.md > RELEASE_NOTES.md
+          
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           name: "ZenDesktop v${{ steps.version.outputs.VERSION }}"
-          body_path: CHANGELOG.md
+          body_path: RELEASE_NOTES.md
           files: release/*
           draft: false
           prerelease: false
