@@ -7,6 +7,14 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.6] - 2026-08-12
+
+### Changed
+- **Self-update works for installed builds**: downloads are staged in a
+  writable location and, when the app is installed under `Program Files`,
+  the updater asks for administrator permission (UAC) automatically to
+  replace the executable. Portable installs update without elevation.
+
 ## [1.0.5] - 2026-08-12
 
 ### Changed
@@ -107,6 +115,7 @@ desktop organizer built from scratch in Rust.
 
 ---
 
+[1.0.6]: https://github.com/jaimitus/ZenDesktop/releases/tag/v1.0.6
 [1.0.5]: https://github.com/jaimitus/ZenDesktop/releases/tag/v1.0.5
 [1.0.4]: https://github.com/jaimitus/ZenDesktop/releases/tag/v1.0.4
 [1.0.3]: https://github.com/jaimitus/ZenDesktop/releases/tag/v1.0.3

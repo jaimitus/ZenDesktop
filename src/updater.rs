@@ -7,6 +7,9 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use serde::Deserialize;
+use windows::core::{w, PCWSTR};
+use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 const GITHUB_API: &str = "https://api.github.com/repos/jaimitus/ZenDesktop/releases/latest";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -126,12 +129,39 @@ fn verify_signature(data: &[u8], sig_bytes: &[u8; 64]) -> bool {
     vk.verify_strict(data, &sig).is_ok()
 }
 
-/// Downloads and installs the update, then auto-restarts the app.
+/// True si la carpeta permite crear y borrar archivos (instalacion portable).
+/// En Program Files devuelve false para un proceso sin elevacion, lo que
+/// activa la ruta de actualizacion con UAC.
+fn dir_writable(dir: &std::path::Path) -> bool {
+    let probe = dir.join(".zd-write-probe");
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Downloads and installs the update, then hands over to the new version.
 /// Verifies Ed25519 signature before installing.
+///
+/// La descarga se hace en %TEMP% (siempre escribible) y el reemplazo del
+/// ejecutable depende de los permisos de la carpeta de instalacion:
+///  * carpeta escribible (portable)     -> reemplazo directo, sin elevacion.
+///  * Program Files / carpeta protegida -> la nueva version (ya descargada y
+///    verificada) se relanza elevada (UAC) en modo `--apply-update` para
+///    poder escribir sobre el ejecutable instalado.
 pub fn download_and_install(url: &str, sig_url: &str) -> Result<PathBuf, String> {
     let current = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let app_dir = current.parent().ok_or("current_exe sin carpeta")?.to_path_buf();
     let backup = current.with_extension("exe.bak");
-    let temp = current.with_extension("exe.new");
+
+    // --- Fase 1: descargar y verificar en %TEMP% (escribible incluso desde
+    // Program Files). El binario instalado no se toca hasta estar verificado.
+    let stage_dir = std::env::temp_dir().join("ZenDesktop-update");
+    std::fs::create_dir_all(&stage_dir).map_err(|e| format!("Create stage dir: {e}"))?;
+    let staged = stage_dir.join("ZenDesktop.exe");
 
     // Download .exe
     let response = ureq::get(url)
@@ -140,7 +170,7 @@ pub fn download_and_install(url: &str, sig_url: &str) -> Result<PathBuf, String>
         .map_err(|e| format!("Download error: {e}"))?;
 
     let mut reader = response.into_reader();
-    let mut file = std::fs::File::create(&temp)
+    let mut file = std::fs::File::create(&staged)
         .map_err(|e| format!("Create temp: {e}"))?;
     std::io::copy(&mut reader, &mut file)
         .map_err(|e| format!("Write error: {e}"))?;
@@ -162,42 +192,66 @@ pub fn download_and_install(url: &str, sig_url: &str) -> Result<PathBuf, String>
     }
 
     // Verify signature
-    let exe_data = std::fs::read(&temp)
+    let exe_data = std::fs::read(&staged)
         .map_err(|e| format!("Read temp for verify: {e}"))?;
 
     if !verify_signature(&exe_data, &sig_bytes) {
-        let _ = std::fs::remove_file(&temp);
+        let _ = std::fs::remove_file(&staged);
         return Err("Signature verification FAILED — possible tampering!".into());
     }
 
     // Verify file size sanity
-    let meta = std::fs::metadata(&temp).map_err(|e| format!("metadata: {e}"))?;
+    let meta = std::fs::metadata(&staged).map_err(|e| format!("metadata: {e}"))?;
     if meta.len() < 100_000 {
-        let _ = std::fs::remove_file(&temp);
+        let _ = std::fs::remove_file(&staged);
         return Err("Downloaded file too small".into());
     }
 
-    // Rename current -> backup, new -> current
-    if backup.exists() {
-        let _ = std::fs::remove_file(&backup);
+    // --- Fase 2: aplicar el reemplazo segun los permisos de la carpeta.
+    if dir_writable(&app_dir) {
+        // Instalacion portable: swap directo, sin elevacion.
+        if backup.exists() {
+            let _ = std::fs::remove_file(&backup); // .bak obsoleto de un update previo
+        }
+        std::fs::rename(&current, &backup)
+            .map_err(|e| format!("Backup error: {e}"))?;
+
+        if let Err(e) = std::fs::copy(&staged, &current) {
+            let _ = std::fs::rename(&backup, &current);
+            return Err(format!("Replace error: {e} (original restored)"));
+        }
+        let _ = std::fs::remove_file(&staged);
+
+        // Lanza la nueva version en modo "relevo": esperara a que este proceso
+        // cierre y suelte el mutex de instancia unica antes de tomar el control.
+        // El caller debe cerrar la aplicacion inmediatamente despues.
+        let _ = std::process::Command::new(&current).arg("--update-restart").spawn();
+    } else {
+        // Program Files / carpeta protegida: relanzar la nueva version elevada
+        // (UAC) en modo helper. Ella esperara a que este proceso salga (le
+        // pasamos nuestro PID) y entonces reemplazara el ejecutable instalado.
+        let args = format!(
+            "--apply-update \"{}\" \"{}\" {}",
+            staged.to_string_lossy(),
+            current.to_string_lossy(),
+            std::process::id()
+        );
+        let file_w = crate::config::wide(&staged.to_string_lossy());
+        let args_w = crate::config::wide(&args);
+        let result = unsafe {
+            ShellExecuteW(
+                None,
+                w!("runas"),
+                PCWSTR(file_w.as_ptr()),
+                PCWSTR(args_w.as_ptr()),
+                None,
+                SW_SHOWNORMAL,
+            )
+        };
+        if result.0 as isize <= 32 {
+            return Err("No se pudo elevar la instalacion (UAC cancelado o error)".into());
+        }
     }
-    std::fs::rename(&current, &backup)
-        .map_err(|e| format!("Backup error: {e}"))?;
-
-    // Replace the exe; if this fails, restore the backup so the app
-    // stays runnable and the update can be retried.
-    if let Err(e) = std::fs::rename(&temp, &current) {
-        let _ = std::fs::rename(&backup, &current);
-        return Err(format!("Replace error: {e} (original restored)"));
-    }
-
-    // El .bak (el ejecutable antiguo, todavia en uso) no se puede borrar
-    // ahora: lo limpiara el proceso nuevo al arrancar (ver main.rs).
-
-    // Lanza la nueva version en modo "relevo": esperara a que este proceso
-    // cierre y suelte el mutex de instancia unica antes de tomar el control.
-    // El caller debe cerrar la aplicacion inmediatamente despues.
-    let _ = std::process::Command::new(&current).arg("--update-restart").spawn();
 
     Ok(current)
 }

@@ -37,29 +37,29 @@
 
 | Format | File | Best for |
 |---|---|---|
-| 🖥️ **Installer (EXE)** | `ZenDesktop-1.0.5-setup.exe` | Most users — wizard installer with Start Menu shortcut |
-| 📦 **Installer (MSI)** | `ZenDesktop-v1.0.5-x64.msi` | Enterprises / system-wide installs with clean uninstall |
-| 💾 **Portable** | `ZenDesktop-v1.0.5-portable.zip` | USB drives, custom paths, no installation |
+| 🖥️ **Installer (EXE)** | `ZenDesktop-1.0.6-setup.exe` | Most users — wizard installer with Start Menu shortcut |
+| 📦 **Installer (MSI)** | `ZenDesktop-v1.0.6-x64.msi` | Enterprises / system-wide installs with clean uninstall |
+| 💾 **Portable** | `ZenDesktop-v1.0.6-portable.zip` | USB drives, custom paths, no installation |
 
 All downloads are available at **[Releases](https://github.com/jaimitus/ZenDesktop/releases)**.
 
 ### 🖥️ EXE Installer (recommended)
 
-1. Download `ZenDesktop-1.0.5-setup.exe` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+1. Download `ZenDesktop-1.0.6-setup.exe` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Run the installer — accepts the license, installs to `Program Files\ZenDesktop`
 3. Start Menu shortcut is created automatically
 4. Uninstall via Windows Settings → Apps, or re-run the installer
 
 ### 📦 MSI Installer
 
-1. Download `ZenDesktop-v1.0.5-x64.msi` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+1. Download `ZenDesktop-v1.0.6-x64.msi` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Run the installer — it installs to `Program Files\ZenDesktop` for all users
 3. Start Menu shortcut is created automatically
 4. Uninstall via Windows Settings → Apps, or re-run the MSI
 
 ### 💾 Portable (for USB drives / custom paths)
 
-1. Download `ZenDesktop-v1.0.5-portable.zip` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+1. Download `ZenDesktop-v1.0.6-portable.zip` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Extract to any folder (e.g. `%APPDATA%\ZenDesktop\`)
 3. Run `ZenDesktop.exe` — it minimizes to the system tray
 4. **Optional**: Add a shortcut to `shell:startup` for auto-start with Windows
@@ -68,7 +68,7 @@ All downloads are available at **[Releases](https://github.com/jaimitus/ZenDeskt
 
 > 🔐 **Security**: Every update is cryptographically verified with an **Ed25519 signature** before it is installed. If the signature check fails, the download is discarded and the current version is left untouched. Released binaries also ship with a `SHA256SUMS.txt` so you can verify downloads manually.
 
-> ⚠️ **Installed (MSI) users**: The app installs to `Program Files` where standard users can't write. To update an MSI install, download the new `.msi` from the release page instead of using the in-app updater (or run the updater elevated).
+> ⚠️ **Installed users (EXE/MSI)**: The app installs to `Program Files`, where standard users can't write. The in-app updater detects this and asks for administrator permission (UAC) automatically; you can also download the new installer from the release page instead.
 
 ### From source
 

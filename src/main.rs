@@ -27,6 +27,7 @@ mod updater;
 mod watcher;
 
 use std::ffi::c_void;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -36,7 +37,7 @@ use windows::Win32::Foundation::{
     WAIT_ABANDONED, WAIT_OBJECT_0,
 };
 use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
-use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateMutexW, OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -64,6 +65,14 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
+    // Modo helper de actualizacion (proceso elevado): reemplaza el
+    // ejecutable instalado por la version nueva y la relanza. No crea
+    // ventanas ni toca el mutex de instancia unica, asi que se
+    // comprueba antes que nada.
+    if let Some((staged, target, old_pid)) = parse_apply_update_args() {
+        return apply_update_helper(&staged, &target, old_pid);
+    }
+
     // ---------------------------------------------------------------- 1. Unicidad
     let mutex = unsafe { CreateMutexW(None, true, w!("Local\\ZenDesktop.SingleInstance.v1"))? };
     let already_running = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
@@ -302,4 +311,68 @@ fn cleanup_stale_backup() {
             let _ = std::fs::remove_file(&bak);
         }
     }
+    // Limpiar descargas de actualizaciones previas en %TEMP%.
+    let stage = std::env::temp_dir().join("ZenDesktop-update");
+    if stage.exists() {
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+}
+
+/// Extrae los argumentos del modo helper: `--apply-update <staged> <target> <pid>`.
+fn parse_apply_update_args() -> Option<(PathBuf, PathBuf, u32)> {
+    let mut args = std::env::args().skip(1);
+    let mut staged: Option<PathBuf> = None;
+    let mut target: Option<PathBuf> = None;
+    let mut pid: Option<u32> = None;
+    while let Some(a) = args.next() {
+        if a == "--apply-update" {
+            staged = args.next().map(PathBuf::from);
+            target = args.next().map(PathBuf::from);
+            pid = args.next().and_then(|s| s.parse().ok());
+            break;
+        }
+    }
+    match (staged, target, pid) {
+        (Some(s), Some(t), Some(p)) => Some((s, t, p)),
+        _ => None,
+    }
+}
+
+/// Proceso elevado que completa una actualizacion: espera a que la
+/// instancia anterior salga (el propio app pide WM_CLOSE tras
+/// lanzarnos), reemplaza el ejecutable instalado con reintentos y
+/// relanza la version nueva.
+fn apply_update_helper(staged: &Path, target: &Path, old_pid: u32) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    // Esperar al cierre de la app antigua (hasta 90s: la restauracion
+    // del escritorio al salir puede tardar en escritorios con muchos archivos).
+    unsafe {
+        if let Ok(h) = OpenProcess(PROCESS_SYNCHRONIZE, false, old_pid) {
+            if !h.is_invalid() {
+                let _ = WaitForSingleObject(h, 90_000);
+                let _ = CloseHandle(h);
+            }
+        }
+    }
+
+    // El exe antiguo puede tardar un instante en soltar el bloqueo del
+    // archivo tras terminar el proceso: reintentar la copia antes de rendirse.
+    let mut copied = false;
+    for attempt in 0..12 {
+        match std::fs::copy(staged, target) {
+            Ok(_) => {
+                copied = true;
+                break;
+            }
+            Err(_e) if attempt < 11 => std::thread::sleep(Duration::from_millis(500)),
+            Err(e) => return Err(format!("Replace failed: {e}").into()),
+        }
+    }
+    if !copied {
+        return Err("Replace failed".into());
+    }
+
+    // Limpiar el archivo temporal y lanzar la version ya instalada.
+    let _ = std::fs::remove_file(staged);
+    let _ = std::process::Command::new(target).spawn();
+    Ok(ExitCode::SUCCESS)
 }
