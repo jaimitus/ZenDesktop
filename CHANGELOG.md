@@ -7,6 +7,13 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.11] - 2026-08-12
+
+### Changed
+- Test release to verify the end-to-end automatic update flow (1.0.10 ->
+  1.0.11) over the CDN-only updater: detection, download with retries,
+  signature verification, UAC elevation, mutex handoff and restart.
+
 ## [1.0.10] - 2026-08-12
 
 ### Fixed
