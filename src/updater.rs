@@ -4,8 +4,9 @@
 //! No heavy dependencies: just ureq + serde_json + ed25519-dalek.
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 use serde::Deserialize;
 use windows::core::{w, PCWSTR};
 use windows::Win32::UI::Shell::ShellExecuteW;
@@ -72,45 +73,66 @@ pub fn take_pending_update() -> Option<(String, String)> {
     PENDING_UPDATE.lock().ok().and_then(|mut slot| slot.take())
 }
 
+/// Agente HTTP con timeouts: no se cuelga si GitHub tarda en responder.
+fn http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(30))
+        .timeout_write(Duration::from_secs(30))
+        .build()
+}
+
 /// Consulta la API de GitHub Releases y compara con la version actual.
+/// Reintenta ante cortes transitorios: el CDN/API de GitHub corta conexiones
+/// de vez en cuando ("Network Error: Unexpected EOF").
 pub fn check_update() -> UpdateStatus {
-    let response = match ureq::get(GITHUB_API)
-        .set("User-Agent", "ZenDesktop-Updater/1.0")
-        .set("Accept", "application/vnd.github.v3+json")
-        .call()
-    {
-        Ok(r) => r,
-        Err(e) => return UpdateStatus::Error(format!("Network error: {e}")),
-    };
+    let agent = http_agent();
+    let mut last_err = String::new();
+    for attempt in 1..=4 {
+        let body = match (|| -> Result<String, String> {
+            let response = agent
+                .get(GITHUB_API)
+                .set("User-Agent", "ZenDesktop-Updater/1.0")
+                .set("Accept", "application/vnd.github.v3+json")
+                .call()
+                .map_err(|e| format!("Network error: {e}"))?;
+            response.into_string().map_err(|e| format!("Read error: {e}"))
+        })() {
+            Ok(b) => b,
+            Err(e) => {
+                last_err = e;
+                if attempt < 4 {
+                    std::thread::sleep(Duration::from_millis(500 * attempt));
+                }
+                continue;
+            }
+        };
 
-    let body = match response.into_string() {
-        Ok(b) => b,
-        Err(e) => return UpdateStatus::Error(format!("Read error: {e}")),
-    };
+        let release: GitHubRelease = match serde_json::from_str(&body) {
+            Ok(r) => r,
+            Err(e) => return UpdateStatus::Error(format!("Parse error: {e}")),
+        };
 
-    let release: GitHubRelease = match serde_json::from_str(&body) {
-        Ok(r) => r,
-        Err(e) => return UpdateStatus::Error(format!("Parse error: {e}")),
-    };
+        let latest = release.tag_name.trim_start_matches('v');
+        if is_up_to_date(CURRENT_VERSION, latest) {
+            return UpdateStatus::UpToDate;
+        }
 
-    let latest = release.tag_name.trim_start_matches('v');
-    if is_up_to_date(CURRENT_VERSION, latest) {
-        return UpdateStatus::UpToDate;
+        // Buscar el asset .exe portable y su .sig
+        let asset = release.assets.iter().find(|a| a.name == "ZenDesktop.exe");
+        let sig_asset = release.assets.iter().find(|a| a.name == "ZenDesktop.exe.sig");
+
+        return match (asset, sig_asset) {
+            (Some(a), Some(s)) => UpdateStatus::UpdateAvailable {
+                version: latest.to_string(),
+                url: a.browser_download_url.clone(),
+                sig_url: s.browser_download_url.clone(),
+            },
+            (Some(_), None) => UpdateStatus::Error("No .sig signature found in release".into()),
+            (None, _) => UpdateStatus::Error("No .exe asset found".into()),
+        };
     }
-
-    // Buscar el asset .exe portable y su .sig
-    let asset = release.assets.iter().find(|a| a.name == "ZenDesktop.exe");
-    let sig_asset = release.assets.iter().find(|a| a.name == "ZenDesktop.exe.sig");
-
-    match (asset, sig_asset) {
-        (Some(a), Some(s)) => UpdateStatus::UpdateAvailable {
-            version: latest.to_string(),
-            url: a.browser_download_url.clone(),
-            sig_url: s.browser_download_url.clone(),
-        },
-        (Some(_), None) => UpdateStatus::Error("No .sig signature found in release".into()),
-        (None, _) => UpdateStatus::Error("No .exe asset found".into()),
-    }
+    UpdateStatus::Error(format!("Network error after 4 attempts: {last_err}"))
 }
 
 /// Decodes the hardcoded public key from hex.
@@ -143,6 +165,109 @@ fn dir_writable(dir: &std::path::Path) -> bool {
     }
 }
 
+/// Descarga `url` en `out` reintentando ante errores de red transitorios
+/// (el CDN de GitHub corta conexiones de vez en cuando).
+fn download_retry(url: &str, out: &Path, label: &str) -> Result<(), String> {
+    let agent = http_agent();
+    let mut last_err = String::new();
+    for attempt in 1..=4 {
+        let result = (|| -> Result<(), String> {
+            let response = agent
+                .get(url)
+                .set("User-Agent", "ZenDesktop-Updater/1.0")
+                .call()
+                .map_err(|e| format!("{label} error: {e}"))?;
+            let mut reader = response.into_reader();
+            let mut file = std::fs::File::create(out)
+                .map_err(|e| format!("Create temp: {e}"))?;
+            std::io::copy(&mut reader, &mut file)
+                .map_err(|e| format!("Write error: {e}"))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = e;
+                if attempt < 4 {
+                    std::thread::sleep(Duration::from_millis(500 * attempt));
+                }
+            }
+        }
+    }
+    Err(format!("{label} failed after 4 attempts: {last_err}"))
+}
+
+/// Descarga la firma (64 bytes) reintentando ante cortes de red.
+fn download_sig_retry(url: &str) -> Result<[u8; 64], String> {
+    let agent = http_agent();
+    let mut last_err = String::new();
+    for attempt in 1..=4 {
+        let result = (|| -> Result<[u8; 64], String> {
+            let response = agent
+                .get(url)
+                .set("User-Agent", "ZenDesktop-Updater/1.0")
+                .call()
+                .map_err(|e| format!("Signature download error: {e}"))?;
+            let mut reader = response.into_reader();
+            let mut buf = [0u8; 64];
+            let n = std::io::Read::take(&mut reader, 64)
+                .read(&mut buf)
+                .map_err(|e| format!("Sig read error: {e}"))?;
+            if n != 64 {
+                return Err(format!(
+                    "Invalid signature size: {n} bytes (expected 64)"
+                ));
+            }
+            Ok(buf)
+        })();
+        match result {
+            Ok(b) => return Ok(b),
+            Err(e) => {
+                last_err = e;
+                if attempt < 4 {
+                    std::thread::sleep(Duration::from_millis(500 * attempt));
+                }
+            }
+        }
+    }
+    Err(format!("Signature download failed after 4 attempts: {last_err}"))
+}
+
+/// Descarga el exe y su firma, verificando la Ed25519 con reintentos.
+/// Si la descarga se trunca (corte de red) el archivo no verifica: se
+/// descarta y se reintenta con backoff antes de rendirse.
+fn download_and_verify(url: &str, sig_url: &str, staged: &Path) -> Result<(), String> {
+    let mut last_err = String::new();
+    for attempt in 1..=4 {
+        let result = (|| -> Result<(), String> {
+            download_retry(url, staged, "Download")?;
+            let sig_bytes = download_sig_retry(sig_url)?;
+            let exe_data =
+                std::fs::read(staged).map_err(|e| format!("Read temp for verify: {e}"))?;
+            if exe_data.len() < 100_000 {
+                return Err("Downloaded file too small".into());
+            }
+            if !verify_signature(&exe_data, &sig_bytes) {
+                return Err(
+                    "Signature verification failed (download corrupt or incomplete)".into(),
+                );
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = e;
+                let _ = std::fs::remove_file(staged);
+                if attempt < 4 {
+                    std::thread::sleep(Duration::from_millis(500 * attempt));
+                }
+            }
+        }
+    }
+    Err(format!("Update download failed after 4 attempts: {last_err}"))
+}
+
 /// Downloads and installs the update, then hands over to the new version.
 /// Verifies Ed25519 signature before installing.
 ///
@@ -163,49 +288,9 @@ pub fn download_and_install(url: &str, sig_url: &str) -> Result<PathBuf, String>
     std::fs::create_dir_all(&stage_dir).map_err(|e| format!("Create stage dir: {e}"))?;
     let staged = stage_dir.join("ZenDesktop.exe");
 
-    // Download .exe
-    let response = ureq::get(url)
-        .set("User-Agent", "ZenDesktop-Updater/1.0")
-        .call()
-        .map_err(|e| format!("Download error: {e}"))?;
-
-    let mut reader = response.into_reader();
-    let mut file = std::fs::File::create(&staged)
-        .map_err(|e| format!("Create temp: {e}"))?;
-    std::io::copy(&mut reader, &mut file)
-        .map_err(|e| format!("Write error: {e}"))?;
-
-    // Download .sig
-    let sig_response = ureq::get(sig_url)
-        .set("User-Agent", "ZenDesktop-Updater/1.0")
-        .call()
-        .map_err(|e| format!("Signature download error: {e}"))?;
-
-    let mut sig_bytes = [0u8; 64];
-    let sig_reader = sig_response.into_reader();
-    let n = std::io::Read::take(sig_reader, 64)
-        .read(&mut sig_bytes)
-        .map_err(|e| format!("Sig read error: {e}"))?;
-
-    if n != 64 {
-        return Err(format!("Invalid signature size: {n} bytes (expected 64)"));
-    }
-
-    // Verify signature
-    let exe_data = std::fs::read(&staged)
-        .map_err(|e| format!("Read temp for verify: {e}"))?;
-
-    if !verify_signature(&exe_data, &sig_bytes) {
-        let _ = std::fs::remove_file(&staged);
-        return Err("Signature verification FAILED — possible tampering!".into());
-    }
-
-    // Verify file size sanity
-    let meta = std::fs::metadata(&staged).map_err(|e| format!("metadata: {e}"))?;
-    if meta.len() < 100_000 {
-        let _ = std::fs::remove_file(&staged);
-        return Err("Downloaded file too small".into());
-    }
+    // Descargar + verificar con reintentos: un corte de red a mitad deja un
+    // archivo truncado que no verifica la firma; se descarta y se reintenta.
+    download_and_verify(url, sig_url, &staged)?;
 
     // --- Fase 2: aplicar el reemplazo segun los permisos de la carpeta.
     if dir_writable(&app_dir) {
@@ -248,8 +333,16 @@ pub fn download_and_install(url: &str, sig_url: &str) -> Result<PathBuf, String>
                 SW_SHOWNORMAL,
             )
         };
-        if result.0 as isize <= 32 {
-            return Err("No se pudo elevar la instalacion (UAC cancelado o error)".into());
+        let code = result.0 as isize;
+        if code <= 32 {
+            let detail = match code {
+                1223 => "cancelado por el usuario (UAC)",
+                5 => "denegado por UAC o bloqueado por el sistema",
+                _ => "error de elevacion",
+            };
+            return Err(format!(
+                "No se pudo elevar la instalacion ({detail}, codigo {code})"
+            ));
         }
     }
 

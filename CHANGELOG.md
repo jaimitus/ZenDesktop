@@ -7,6 +7,17 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.8] - 2026-08-12
+
+### Fixed
+- **Robust update downloads**: GitHub's CDN intermittently cuts connections
+  mid-transfer ("Network Error: Unexpected EOF"). The updater now retries
+  with backoff, and signature verification happens inside the retry loop, so
+  a truncated download is discarded and re-downloaded instead of failing.
+- **Better UAC diagnostics**: if elevation is cancelled or blocked, the
+  message now includes the real Windows error code (1223 = cancelled by
+  user, 5 = denied/blocked) so the cause is identifiable.
+
 ## [1.0.7] - 2026-08-12
 
 ### Changed
