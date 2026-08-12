@@ -17,6 +17,7 @@
 //!      kernel, por lo que en reposo el proceso consume 0 % de CPU.
 
 mod ai;
+mod changelog;
 mod config;
 mod i18n;
 mod rules;
@@ -36,7 +37,8 @@ use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MessageBoxW, TranslateMessage, MB_ICONERROR, MB_OK, MSG,
+    DispatchMessageW, GetMessageW, MessageBoxW, TranslateMessage, MB_ICONINFORMATION, MB_ICONERROR,
+    MB_OK, MSG,
 };
 
 use crate::config::Config;
@@ -96,7 +98,22 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
 
 fn bootstrap() -> Result<ExitCode, Box<dyn std::error::Error>> {
     // ------------------------------------------------------------ 4. Configuracion
-    let (cfg, cfg_path) = Config::load_or_create()?;
+    let (mut cfg, cfg_path) = Config::load_or_create()?;
+
+    // Show "What's New" dialog if this version hasn't been seen yet.
+    let current_ver = env!("CARGO_PKG_VERSION");
+    if cfg.general.last_seen_version != current_ver {
+        if let Some((ver, body)) = changelog::latest_release() {
+            // Only show if the latest changelog entry matches our version
+            if ver == current_ver {
+                show_whats_new(body);
+            }
+        }
+        // Mark as seen so the dialog doesn't appear again
+        cfg.general.last_seen_version = current_ver.to_string();
+        let _ = cfg.save(&cfg_path);
+    }
+
     if cfg.general.start_with_windows {
         // Un fallo aqui (politicas de grupo) no debe impedir el arranque.
         let _ = config::apply_autostart(true);
@@ -148,6 +165,26 @@ fn bootstrap() -> Result<ExitCode, Box<dyn std::error::Error>> {
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// Shows the "What's New" dialog with a summary of the latest release.
+fn show_whats_new(body: &str) {
+    let version = env!("CARGO_PKG_VERSION");
+    let summary = changelog::summary(body, 800);
+    let title = format!("ZenDesktop v{version} — What's New");
+    let msg = format!("ZenDesktop has been updated to v{version}!\n\n{summary}");
+
+    let title_wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let msg_wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(msg_wide.as_ptr()),
+            PCWSTR(title_wide.as_ptr()),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
 }
 
 /// Bucle principal. `GetMessageW` bloquea el hilo dentro del kernel hasta que
