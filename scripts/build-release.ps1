@@ -107,7 +107,7 @@ if ($iscc) {
     Copy-Item "$Root\LICENSE" "$staging\LICENSE" -Force
     Copy-Item "$Root\README.md" "$staging\README.md" -Force
 
-    & $iscc /DMyAppVersion=$Version "$InstallerDir\zendesktop.iss"
+    & $iscc -DMyAppVersion=$Version "$InstallerDir\zendesktop.iss"
     if ($LASTEXITCODE -ne 0) { throw "Inno Setup build failed" }
 
     Remove-Item -Recurse -Force $staging

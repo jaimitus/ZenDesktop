@@ -105,7 +105,8 @@ jobs:
           fi
           if [ -n "$ISCC" ]; then
             cd installer
-            "$ISCC" /DMyAppVersion=${V} zendesktop.iss
+            # -D en lugar de /D: MSYS convertiria /D... a una ruta de Windows
+            "$ISCC" -DMyAppVersion=${V} zendesktop.iss
           else
             echo "Inno Setup not found - skipping EXE installer"
           fi
