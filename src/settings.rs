@@ -17,9 +17,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
+use std::path::PathBuf;
 
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::UI::Controls::Dialogs::{
+    GetOpenFileNameW, GetSaveFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR,
+    OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_UNKNOWN, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
     D2D_SIZE_U,
@@ -127,6 +132,8 @@ const ID_BTN_AI_DETECT_MODELS: u16 = 211;
 const ID_BTN_AI_REORGANIZE: u16 = 212;
 const ID_BTN_CHECK_UPDATES: u16 = 213;
 const ID_BTN_DOWNLOAD_UPDATE: u16 = 214;
+const ID_BTN_EXPORT_CFG: u16 = 215;
+const ID_BTN_IMPORT_CFG: u16 = 216;
 
 const ALL_EDITS: [u16; 24] = [
     ID_EDIT_MAX_AGE, ID_EDIT_MIN_AGE, ID_EDIT_PURGE, ID_EDIT_R_TITLE, ID_EDIT_R_FOLDER,
@@ -954,6 +961,11 @@ impl Settings {
         for (i, lang) in Lang::ALL.iter().enumerate() {
             self.lang_chip(x0 + i as f32 * (chip_w + chip_gap), y, chip_w, 26.0, *lang);
         }
+        y += 10.0;
+        y = self.section(y, cx, cw, self.tr.sec_backup);
+        let bx0 = cx + 16.0;
+        self.icon_button(bx0, y, 220.0, 32.0, self.tr.btn_export_cfg, ID_BTN_EXPORT_CFG, true);
+        self.icon_button(bx0 + 230.0, y, 220.0, 32.0, self.tr.btn_import_cfg, ID_BTN_IMPORT_CFG, true);
         let _ = y;
     }
 
@@ -1740,6 +1752,8 @@ impl Settings {
                     Ctrl::Field(ID_EDIT_MIN_AGE),
                     Ctrl::Check(ID_CHECK_BY_MONTH),
                     Ctrl::Field(ID_EDIT_PURGE),
+                    Ctrl::Btn(ID_BTN_EXPORT_CFG),
+                    Ctrl::Btn(ID_BTN_IMPORT_CFG),
                 ]);
             }
             Panel::Rules => {
@@ -1868,6 +1882,8 @@ impl Settings {
             Ctrl::Btn(ID_BTN_AI_REORGANIZE) => self.reorganize_with_ai(),
             Ctrl::Btn(ID_BTN_CHECK_UPDATES) => self.check_for_updates(),
             Ctrl::Btn(ID_BTN_DOWNLOAD_UPDATE) => self.download_update(),
+            Ctrl::Btn(ID_BTN_EXPORT_CFG) => self.export_config(),
+            Ctrl::Btn(ID_BTN_IMPORT_CFG) => self.import_config(),
             Ctrl::Folder(id) => self.pick_folder(id),
             Ctrl::Btn(ID_BTN_NEW) => self.new_rule(),
             Ctrl::Btn(ID_BTN_DEL) => self.delete_rule(),
@@ -2104,27 +2120,92 @@ impl Settings {
     fn check_for_updates(&self) {
         match crate::updater::check_update() {
             crate::updater::UpdateStatus::UpToDate => {
-                let msg = "ZenDesktop is up to date.";
-                unsafe {
-                    let body = crate::config::wide(msg);
-                    let title = crate::config::wide("ZenDesktop :: Updates");
-                    MessageBoxW(self.hwnd, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
+                // Sin modales: un toast verde confirma que esta al dia.
+                if !self.app.is_null() {
+                    unsafe {
+                        (*self.app).show_toast(self.tr.toast_up_to_date, crate::ui::TOAST_DROP);
+                    }
                 }
             }
-            crate::updater::UpdateStatus::UpdateAvailable { version, size, .. } => {
-                let msg = format!("New version available: v{}\nSize: {} KB\n\nClick 'Download & Install' to update.", version, size / 1024);
-                unsafe {
-                    let body = crate::config::wide(&msg);
-                    let title = crate::config::wide("ZenDesktop :: Update Available");
-                    MessageBoxW(self.hwnd, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
+            crate::updater::UpdateStatus::UpdateAvailable { version, url, sig_url, .. } => {
+                // El toast es clicable: un clic instala la actualizacion.
+                crate::updater::set_pending_update(url, sig_url);
+                if !self.app.is_null() {
+                    let msg = self.tr.toast_update.replacen("{0}", &version, 1);
+                    unsafe {
+                        (*self.app).show_toast_glyph(&msg, crate::ui::TOAST_UPDATE, '\u{2193}');
+                    }
                 }
             }
             crate::updater::UpdateStatus::Error(e) => {
+                // Los errores si son modales: requieren atencion.
                 let msg = format!("Update check failed:\n{}", e);
                 unsafe {
                     let body = crate::config::wide(&msg);
                     let title = crate::config::wide("ZenDesktop :: Update Error");
                     MessageBoxW(self.hwnd, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONWARNING);
+                }
+            }
+        }
+    }
+
+    /// Exporta la configuracion actual a un archivo TOML elegido por el usuario.
+    fn export_config(&mut self) {
+        let Some(path) = save_file_dialog(self.hwnd, self.tr.btn_export_cfg, "zendesktop-config.toml") else {
+            return;
+        };
+        // Exporta lo que hay en pantalla (incluidos los cambios sin guardar).
+        let cfg = self.collect_cfg().unwrap_or_else(|| self.cfg.clone());
+        match cfg.save(&path) {
+            Ok(()) => {
+                if !self.app.is_null() {
+                    unsafe {
+                        (*self.app).show_toast(self.tr.msg_cfg_exported, crate::ui::TOAST_DROP);
+                    }
+                }
+            }
+            Err(e) => {
+                let msg = format!("Export failed:\n{e}");
+                unsafe {
+                    let body = crate::config::wide(&msg);
+                    MessageBoxW(self.hwnd, PCWSTR(body.as_ptr()), w!("ZenDesktop"), MB_OK | MB_ICONERROR);
+                }
+            }
+        }
+    }
+
+    /// Importa una configuracion desde un archivo TOML y la aplica en caliente.
+    fn import_config(&mut self) {
+        let Some(path) = open_file_dialog(self.hwnd, self.tr.btn_import_cfg) else {
+            return;
+        };
+        match Config::reload(&path) {
+            Err(e) => {
+                let msg = self.tr.err_cfg_invalid.replacen("{0}", &format!("{e}"), 1);
+                unsafe {
+                    let body = crate::config::wide(&msg);
+                    MessageBoxW(self.hwnd, PCWSTR(body.as_ptr()), w!("ZenDesktop"), MB_OK | MB_ICONERROR);
+                }
+            }
+            Ok(cfg) => {
+                self.cfg = cfg;
+                self.lang = self.cfg.lang();
+                self.tr = Tr::get(self.lang);
+                self.checks = initial_checks(&self.cfg);
+                self.rules_selected = None;
+                self.rules_scroll = 0;
+                self.rules_sort.clear();
+                self.refresh_rule_fields();
+                seed_edits(self);
+                self.build_focus_order();
+                if !self.app.is_null() {
+                    // Guarda en disco, aplica en caliente y organiza.
+                    unsafe { (*self.app).apply_dialog_cfg(self.cfg.clone()); }
+                }
+                self.invalidate();
+                unsafe {
+                    let body = crate::config::wide(self.tr.msg_cfg_imported);
+                    MessageBoxW(self.hwnd, PCWSTR(body.as_ptr()), w!("ZenDesktop"), MB_OK | MB_ICONINFORMATION);
                 }
             }
         }
@@ -2855,6 +2936,67 @@ fn get_text(hwnd: HWND) -> String {
 fn set_text(hwnd: HWND, text: &str) {
     unsafe {
         let _ = SetWindowTextW(hwnd, PCWSTR(wide(text).as_ptr()));
+    }
+}
+
+/// Dialogo nativo de guardado (GetSaveFileNameW) para exportar la configuracion.
+fn save_file_dialog(owner: HWND, title: &str, default_name: &str) -> Option<PathBuf> {
+    unsafe {
+        // Buffer grande: GetSaveFileNameW necesita espacio para rutas largas.
+        let mut file = vec![0u16; 4096];
+        let default: Vec<u16> = default_name.encode_utf16().collect();
+        let n = default.len().min(4095);
+        file[..n].copy_from_slice(&default[..n]);
+        let filter: Vec<u16> = "ZenDesktop config (*.toml)\0*.toml\0All files (*.*)\0*.*\0\0"
+            .encode_utf16()
+            .collect();
+        let title_w = wide(title);
+        // Vivir fuera del statement: lpstrDefExt se lee tras la llamada.
+        let def_ext = wide("toml");
+        let mut ofn: OPENFILENAMEW = std::mem::zeroed();
+        ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+        ofn.hwndOwner = owner;
+        ofn.lpstrFilter = PCWSTR(filter.as_ptr());
+        ofn.lpstrFile = PWSTR(file.as_mut_ptr());
+        ofn.nMaxFile = file.len() as u32;
+        ofn.lpstrTitle = PCWSTR(title_w.as_ptr());
+        ofn.lpstrDefExt = PCWSTR(def_ext.as_ptr());
+        ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        if GetSaveFileNameW(&mut ofn).as_bool() {
+            let s = String::from_utf16_lossy(&file);
+            let s = s.trim_end_matches('\0').to_string();
+            if !s.is_empty() {
+                return Some(PathBuf::from(s));
+            }
+        }
+        None
+    }
+}
+
+/// Dialogo nativo de apertura (GetOpenFileNameW) para importar la configuracion.
+fn open_file_dialog(owner: HWND, title: &str) -> Option<PathBuf> {
+    unsafe {
+        let mut file = vec![0u16; 4096];
+        let filter: Vec<u16> = "ZenDesktop config (*.toml)\0*.toml\0All files (*.*)\0*.*\0\0"
+            .encode_utf16()
+            .collect();
+        let title_w = wide(title);
+        let mut ofn: OPENFILENAMEW = std::mem::zeroed();
+        ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+        ofn.hwndOwner = owner;
+        ofn.lpstrFilter = PCWSTR(filter.as_ptr());
+        ofn.lpstrFile = PWSTR(file.as_mut_ptr());
+        ofn.nMaxFile = file.len() as u32;
+        ofn.lpstrTitle = PCWSTR(title_w.as_ptr());
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        if GetOpenFileNameW(&mut ofn).as_bool() {
+            let s = String::from_utf16_lossy(&file);
+            let s = s.trim_end_matches('\0').to_string();
+            if !s.is_empty() {
+                return Some(PathBuf::from(s));
+            }
+        }
+        None
     }
 }
 

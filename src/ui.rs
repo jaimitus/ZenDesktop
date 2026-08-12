@@ -27,6 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::Mutex;
 
 use windows::core::{w, GUID, Interface, Result as WinResult, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{
@@ -57,7 +58,8 @@ use windows::Win32::Graphics::Gdi::{
     ReleaseDC, ScreenToClient, SelectObject, SetBkMode, SetTextColor, ValidateRect, AC_SRC_ALPHA,
     AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
     DT_CENTER, DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL, TRANSPARENT, HBITMAP,
-    HDC, HGDIOBJ, NULL_PEN,
+    HDC, HFONT, HGDIOBJ, NULL_PEN, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
+    DEFAULT_PITCH, FF_DONTCARE, OUT_DEFAULT_PRECIS,
 };
 use windows::Win32::System::Com::{
     CoTaskMemFree, DVASPECT_CONTENT, FORMATETC, IDataObject, TYMED_HGLOBAL,
@@ -84,7 +86,7 @@ use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
 };
-use windows::Win32::UI::Controls::{LVHITTESTINFO, LVM_HITTEST};
+use windows::Win32::UI::Controls::{EM_SETSEL, LVHITTESTINFO, LVM_HITTEST};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, RegisterHotKey, ReleaseCapture, SetCapture, SetFocus,
@@ -135,6 +137,14 @@ pub const WM_ZEN_DBLCLICK: u32 = WM_APP + 0x12;    /// Refresco pendiente tras u
     const WM_ZEN_DRAG_DONE: u32 = WM_APP + 0x13;
     /// Resultado del chequeo de updates en segundo plano (hilo de trabajo -> UI).
     pub const WM_ZEN_UPDATE_CHECKED: u32 = WM_APP + 0x14;
+    /// El usuario hizo clic en el toast (p. ej. para instalar una actualizacion).
+    const WM_ZEN_TOAST_CLICK: u32 = WM_APP + 0x15;
+    /// Renombrar en sitio: confirmar el texto del EDIT (Enter / perder foco).
+    const WM_ZEN_RENAME_COMMIT: u32 = WM_APP + 0x16;
+    /// Renombrar en sitio: cancelar (Escape).
+    const WM_ZEN_RENAME_CANCEL: u32 = WM_APP + 0x17;
+    /// ID del EDIT hijo usado para renombrar un elemento.
+    const RENAME_EDIT_ID: u16 = 0x2A01;
 const TIMER_SWEEP: usize = 1;
 const TIMER_PERSIST: usize = 2;
 /// Temporizador de fade-in/fade-out de la miniatura (60 fps).
@@ -177,8 +187,13 @@ const GRIP: i32 = 22; // zona inferior derecha para redimensionar
 const SCROLLBAR_W: f32 = 3.0;
 
 /// Colores del icono del toast segun contexto.
-const TOAST_DROP: COLORREF = COLORREF(0x004CCD3C);      // verde
-const TOAST_ORGANIZE: COLORREF = COLORREF(0x003B82F6);  // azul
+pub(crate) const TOAST_DROP: COLORREF = COLORREF(0x004CCD3C);      // verde
+pub(crate) const TOAST_ORGANIZE: COLORREF = COLORREF(0x003B82F6);  // azul
+pub(crate) const TOAST_UPDATE: COLORREF = COLORREF(0x0044C2F5);    // ambar
+pub(crate) const TOAST_ERROR: COLORREF = COLORREF(0x004E4EB8);     // rojo
+
+/// (edit_hwnd, wndproc_original) del EDIT de renombrado activo (uno global).
+static RENAME_SUBCLASS: Mutex<Option<(usize, isize)>> = Mutex::new(None);
 
 /// Anade un item de texto al menu contextual (el string se copia en el menu).
 fn append_menu(menu: HMENU, id: usize, label: &str) {
@@ -725,6 +740,13 @@ struct Fence {
     sort_mode: Option<String>,
     search_text: String,
     hit_row_h: f32,
+    /// Item en proceso de renombrado (F2) y su EDIT hijo.
+    rename_item: Option<usize>,
+    rename_edit: HWND,
+    rename_font: HFONT,
+    /// Ruta original capturada al pulsar F2: el indice puede cambiar si el
+    /// watcher refresca contenidos mientras se edita.
+    rename_path: Option<PathBuf>,
 }
 
 impl Fence {
@@ -1043,7 +1065,8 @@ impl App {
 
             (*ptr).build_fences()?;
             (*ptr).toast_hwnd = CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+                // Sin WS_EX_TRANSPARENT: el toast debe recibir clics (instalar update).
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 CLASS_TOAST,
                 w!(""),
                 WS_POPUP,
@@ -1052,6 +1075,8 @@ impl App {
                 instance,
                 None,
             )?;
+            // El toast avisa de updates: guarda el controlador para reenviar clics.
+            let _ = SetWindowLongPtrW((*ptr).toast_hwnd, GWLP_USERDATA, (*ptr).controller.0 as isize);
             (*ptr).thumb_hwnd = CreateWindowExW(
                 WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 CLASS_THUMB,
@@ -1146,6 +1171,10 @@ impl App {
                 sort_mode: layout.sort_by.clone(),
                 search_text: String::new(),
                 hit_row_h: self.theme.row,
+                rename_item: None,
+                rename_edit: HWND::default(),
+                rename_font: HFONT::default(),
+                rename_path: None,
             };
             self.fences.push(fence);
 
@@ -2198,7 +2227,13 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
         let _ = SetTimer(self.controller, TIMER_THUMB_FADE, 16, None);
     }
 
-    unsafe fn show_toast(&mut self, message: &str, icon_color: COLORREF) {
+    pub(crate) unsafe fn show_toast(&mut self, message: &str, icon_color: COLORREF) {
+        self.show_toast_glyph(message, icon_color, '\u{2713}');
+    }
+
+    /// Variante con glifo personalizado para el icono del toast: check para
+    /// exito, flecha hacia abajo para updates, cruz para errores.
+    pub(crate) unsafe fn show_toast_glyph(&mut self, message: &str, icon_color: COLORREF, glyph: char) {
         if self.toast_hwnd.is_invalid() {
             return;
         }
@@ -2277,9 +2312,9 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
                 let old_font = SelectObject(surface.dc, HGDIOBJ(check_font.0));
                 let _ = SetBkMode(surface.dc, TRANSPARENT);
                 let _ = SetTextColor(surface.dc, COLORREF(0x00FFFFFF));
-                let mut checkmark: Vec<u16> = "\u{2713}".encode_utf16().collect();
+                let mut glyph_buf: Vec<u16> = glyph.to_string().encode_utf16().collect();
                 let mut crc = RECT { left: icon_cx - icon_r, top: icon_cy - icon_r, right: icon_cx + icon_r, bottom: icon_cy + icon_r };
-                let _ = DrawTextW(surface.dc, &mut checkmark, &mut crc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                let _ = DrawTextW(surface.dc, &mut glyph_buf, &mut crc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 SelectObject(surface.dc, old_font);
                 let _ = DeleteObject(HGDIOBJ(check_font.0));
             }
@@ -2570,6 +2605,231 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
         if !self.zen {
             self.render_all();
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Renombrar en sitio (F2)
+    // -----------------------------------------------------------------------
+
+    /// Rect (px de cliente de la caja) del item indicado, para colocar el EDIT.
+    fn item_rect(&self, fence_idx: usize, item_idx: usize) -> Option<(i32, i32, i32, i32)> {
+        let fence = &self.fences[fence_idx];
+        let l = &fence.layout;
+        if l.collapsed {
+            return None;
+        }
+        let theme = &self.theme;
+        let s = fence.scale;
+        let vis = item_idx as i32 - fence.scroll;
+        if vis < 0 {
+            return None;
+        }
+        let (x, y, w, h) = if theme.grid_mode {
+            let cell = theme.grid_item_size.max(48.0);
+            let w_dip = l.width as f32 / s;
+            let cols = ((w_dip - theme.padding) / cell).floor().max(1.0) as usize;
+            let (row, col) = (vis as usize / cols, vis as usize % cols);
+            (
+                theme.padding * 0.5 + col as f32 * cell,
+                theme.header + row as f32 * cell,
+                cell,
+                cell,
+            )
+        } else {
+            let row_h = if fence.hit_row_h > 0.0 { fence.hit_row_h } else { theme.row };
+            (
+                theme.padding,
+                theme.header + vis as f32 * row_h,
+                (l.width as f32 / s) - 2.0 * theme.padding,
+                row_h,
+            )
+        };
+        Some((
+            (x * s) as i32,
+            (y * s) as i32,
+            ((w * s) as i32).max(40),
+            ((h * s) as i32).max(20),
+        ))
+    }
+
+    /// Abre un EDIT sobre el item para renombrarlo en sitio (Enter confirma,
+    /// Escape cancela, perder el foco tambien confirma).
+    unsafe fn start_rename(&mut self, fence_idx: usize, item_idx: usize) {
+        // Un solo EDIT de renombre activo a la vez.
+        if let Some(active) = self.fences.iter().position(|f| !f.rename_edit.is_invalid()) {
+            self.cancel_rename(active);
+        }
+        let Some(rect) = self.item_rect(fence_idx, item_idx) else { return };
+        let Some(path) = self.fences[fence_idx]
+            .content
+            .items
+            .get(item_idx)
+            .map(|it| it.path.clone())
+        else {
+            return;
+        };
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()).map(String::from) else {
+            return;
+        };
+        // Pre-seleccionar el nombre sin extension (como Explorer).
+        let (initial, sel_len) = if path.is_file() {
+            match path.extension().and_then(|e| e.to_str()) {
+                Some(ext) => {
+                    // strip_suffix: solo quita UNA extension al final (a.txt.txt -> a.txt).
+                    let suffix = format!(".{ext}");
+                    let stem = file_name.strip_suffix(&suffix).unwrap_or(&file_name).to_string();
+                    let sel = stem.encode_utf16().count();
+                    (stem, sel)
+                }
+                None => (file_name.clone(), file_name.encode_utf16().count()),
+            }
+        } else {
+            (file_name.clone(), file_name.encode_utf16().count())
+        };
+
+        let (hwnd, x, y, w, h) = {
+            let fence = &self.fences[fence_idx];
+            (fence.hwnd, rect.0, rect.1, rect.2, rect.3)
+        };
+        let instance: HINSTANCE = GetModuleHandleW(None).map(|h| h.into()).unwrap_or_default();
+        let Ok(edit) = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            w!("EDIT"),
+            w!(""),
+            (WS_CHILD | WS_VISIBLE | WS_TABSTOP) | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+            x,
+            y,
+            w,
+            h,
+            hwnd,
+            HMENU(RENAME_EDIT_ID as isize as *mut c_void),
+            instance,
+            None,
+        ) else {
+            return;
+        };
+        // Fuente acorde al tema (misma familia que las cajas).
+        let font: HFONT = CreateFontW(
+            -16,
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            OUT_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+            PCWSTR(wide("Segoe UI").as_ptr()),
+        );
+        let _ = SendMessageW(edit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        let _ = SendMessageW(edit, WM_SETTEXT, WPARAM(0), LPARAM(wide(&initial).as_ptr() as isize));
+        let _ = SendMessageW(edit, EM_SETSEL, WPARAM(0), LPARAM(sel_len as isize));
+
+        // Subclase: Enter = confirmar, Escape = cancelar, perder foco = confirmar.
+        let old_proc = SetWindowLongPtrW(
+            edit,
+            GWLP_WNDPROC,
+            rename_edit_subclass as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT as isize,
+        );
+        let _ = SetWindowLongPtrW(edit, GWLP_USERDATA, hwnd.0 as isize);
+        *RENAME_SUBCLASS.lock().unwrap_or_else(|p| p.into_inner()) = Some((edit.0 as usize, old_proc));
+
+        let fence = &mut self.fences[fence_idx];
+        fence.rename_item = Some(item_idx);
+        fence.rename_edit = edit;
+        fence.rename_font = font;
+        fence.rename_path = Some(path);
+        let _ = SetFocus(edit);
+    }
+
+    /// Confirma el renombrado: lee el texto del EDIT, lo aplica en disco y refresca.
+    unsafe fn commit_rename(&mut self, fence_idx: usize) {
+        let (edit, font, path) = {
+            let fence = &mut self.fences[fence_idx];
+            if fence.rename_edit.is_invalid() {
+                return;
+            }
+            fence.rename_item = None;
+            (fence.rename_edit, fence.rename_font, fence.rename_path.take())
+        };
+        let len = GetWindowTextLengthW(edit) as usize;
+        let mut buf = vec![0u16; len + 1];
+        let n = GetWindowTextW(edit, &mut buf);
+        buf.truncate(n as usize);
+        let new_name = String::from_utf16_lossy(&buf);
+
+        let _ = DestroyWindow(edit);
+        *RENAME_SUBCLASS.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        {
+            let fence = &mut self.fences[fence_idx];
+            fence.rename_edit = HWND::default();
+            fence.rename_font = HFONT::default();
+        }
+        if !font.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(font.0));
+        }
+
+        let Some(path) = path else { return };
+        let new_name = new_name.trim();
+        if new_name.is_empty() {
+            return; // nombre vacio: se descarta
+        }
+        // Conservar la extension si el usuario escribio solo el nombre base.
+        let mut final_name = new_name.to_string();
+        if path.is_file() && !final_name.contains('.') {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                final_name.push('.');
+                final_name.push_str(ext);
+            }
+        }
+        let Some(parent) = path.parent() else { return };
+        let new_path = parent.join(&final_name);
+        if new_path == path {
+            return; // sin cambios
+        }
+        if new_path.exists() {
+            self.show_toast_glyph(&self.tr.toast_rename_exists, TOAST_ERROR, '\u{2715}');
+            return;
+        }
+        match std::fs::rename(&path, &new_path) {
+            Ok(()) => {
+                // Los indices de seleccion quedan obsoletos tras re-ordenar.
+                self.fences[fence_idx].selected.clear();
+                self.refresh_contents();
+            }
+            Err(e) => {
+                let msg = format!("{} — {e}", self.tr.toast_rename_failed);
+                self.show_toast_glyph(&msg, TOAST_ERROR, '\u{2715}');
+            }
+        }
+    }
+
+    /// Cancela el renombrado en curso (Escape).
+    fn cancel_rename(&mut self, fence_idx: usize) {
+        let (edit, font) = {
+            let fence = &mut self.fences[fence_idx];
+            if fence.rename_edit.is_invalid() {
+                return;
+            }
+            fence.rename_item = None;
+            fence.rename_path = None;
+            (fence.rename_edit, fence.rename_font)
+        };
+        unsafe {
+            let _ = DestroyWindow(edit);
+            *RENAME_SUBCLASS.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            let fence = &mut self.fences[fence_idx];
+            fence.rename_edit = HWND::default();
+            fence.rename_font = HFONT::default();
+            if !font.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(font.0));
+            }
+        }
+        let _ = self.render(fence_idx);
     }
 
     fn reload_config(&mut self) {
@@ -3114,31 +3374,30 @@ extern "system" fn controller_proc(
             WM_ZEN_UPDATE_CHECKED => {
                 // Resultado del chequeo en segundo plano (hilo -> UI). Solo se
                 // avisa si hay una version nueva; los fallos de red son silenciosos.
+                // Aviso NO intrusivo: un toast clicable en vez de un modal.
                 if let Some(updater::UpdateStatus::UpdateAvailable { version, url, sig_url, .. }) =
                     updater::take_last_check()
                 {
-                    let msg = format!(
-                        "ZenDesktop {version} is available.\n\nDownload and install now?"
-                    );
-                    let title = wide("ZenDesktop :: Update Available");
-                    let body = wide(&msg);
-                    let answer = MessageBoxW(
-                        hwnd,
-                        PCWSTR(body.as_ptr()),
-                        PCWSTR(title.as_ptr()),
-                        MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2,
-                    );
-                    if answer == IDYES {
-                        if let Err(e) = updater::download_and_install(&url, &sig_url) {
-                            let err = wide(&format!("Update failed:\n{e}"));
-                            let et = wide("ZenDesktop :: Update Error");
-                            MessageBoxW(
-                                hwnd,
-                                PCWSTR(err.as_ptr()),
-                                PCWSTR(et.as_ptr()),
-                                MB_OK | MB_ICONERROR,
-                            );
-                        }
+                    updater::set_pending_update(url, sig_url);
+                    if let Some(app) = app_from(hwnd) {
+                        let msg = app.tr.toast_update.replacen("{0}", &version, 1);
+                        app.show_toast_glyph(&msg, TOAST_UPDATE, '\u{2193}');
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_ZEN_TOAST_CLICK => {
+                // El usuario hizo clic en el toast de update: descargar e instalar.
+                if let Some((url, sig_url)) = updater::take_pending_update() {
+                    if let Err(e) = updater::download_and_install(&url, &sig_url) {
+                        let err = wide(&format!("Update failed:\n{e}"));
+                        let et = wide("ZenDesktop :: Update Error");
+                        MessageBoxW(
+                            hwnd,
+                            PCWSTR(err.as_ptr()),
+                            PCWSTR(et.as_ptr()),
+                            MB_OK | MB_ICONERROR,
+                        );
                     }
                 }
                 LRESULT(0)
@@ -3400,7 +3659,52 @@ unsafe extern "system" fn toast_proc(
             let _ = ValidateRect(hwnd, None);
             LRESULT(0)
         }
+        // Clic en el toast: se reenvia al controlador. El toast de updates usa
+        // este mensaje para instalar; los demas (drop/organizar) lo ignoran.
+        WM_LBUTTONUP => {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            let controller = HWND(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut c_void);
+            if !controller.is_invalid() {
+                let _ = PostMessageW(controller, WM_ZEN_TOAST_CLICK, WPARAM(0), LPARAM(0));
+            }
+            LRESULT(0)
+        }
         _ => DefWindowProcW(hwnd, message, _wparam, _lparam),
+    }
+}
+
+/// Subclase del EDIT de renombrado: Enter confirma, Escape cancela y perder el
+/// foco confirma (como Explorer). Todo lo demas se reenvia al proc original.
+unsafe extern "system" fn rename_edit_subclass(
+    edit: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if message == WM_KEYDOWN {
+        let vk = wparam.0 as u32;
+        if vk == 0x0D || vk == 0x1B {
+            let fence = HWND(GetWindowLongPtrW(edit, GWLP_USERDATA) as *mut c_void);
+            let msg = if vk == 0x0D { WM_ZEN_RENAME_COMMIT } else { WM_ZEN_RENAME_CANCEL };
+            let _ = PostMessageW(fence, msg, WPARAM(0), LPARAM(0));
+            return LRESULT(0);
+        }
+    }
+    if message == WM_KILLFOCUS {
+        let fence = HWND(GetWindowLongPtrW(edit, GWLP_USERDATA) as *mut c_void);
+        let _ = PostMessageW(fence, WM_ZEN_RENAME_COMMIT, WPARAM(0), LPARAM(0));
+        return LRESULT(0);
+    }
+    let old = RENAME_SUBCLASS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .map(|(_, p)| p)
+        .unwrap_or(0);
+    if old != 0 {
+        let proc: WNDPROC = std::mem::transmute::<isize, WNDPROC>(old);
+        CallWindowProcW(proc, edit, message, wparam, lparam)
+    } else {
+        DefWindowProcW(edit, message, wparam, lparam)
     }
 }
 
@@ -3468,6 +3772,10 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 DefWindowProcW(hwnd, message, wparam, lparam)
             }
             WM_LBUTTONDOWN => {
+                // Renombrado en curso: confirmar antes de procesar el clic.
+                if app.fences[index].rename_item.is_some() {
+                    app.commit_rename(index);
+                }
                 let (x, y) = point_of(lparam);
                 let theme_header = (app.theme.header * app.fences[index].scale) as i32;
 
@@ -3990,6 +4298,21 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                             app.open_item(&path);
                         }
                     }
+                    0x71 => { // VK_F2 (Renombrar el elemento seleccionado)
+                        let target = {
+                            let fence = &app.fences[index];
+                            if fence.rename_edit.is_invalid() && fence.selected.len() == 1 {
+                                fence.selected.iter().next().copied()
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(item) = target {
+                            if app.fences[index].content.items.get(item).is_some() {
+                                app.start_rename(index, item);
+                            }
+                        }
+                    }
                     0x08 => { // VK_BACK
                         if !app.fences[index].search_text.is_empty() {
                             app.fences[index].search_text.pop();
@@ -4028,6 +4351,14 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 } else {
                     app.show_menu(hwnd, Some(index));
                 }
+                LRESULT(0)
+            }
+            WM_ZEN_RENAME_COMMIT => {
+                app.commit_rename(index);
+                LRESULT(0)
+            }
+            WM_ZEN_RENAME_CANCEL => {
+                app.cancel_rename(index);
                 LRESULT(0)
             }
 

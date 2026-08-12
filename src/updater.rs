@@ -29,14 +29,13 @@ struct GitHubRelease {
 struct GitHubAsset {
     name: String,
     browser_download_url: String,
-    size: u64,
 }
 
 /// Resultado de la comprobacion de actualizaciones.
 #[derive(Debug)]
 pub enum UpdateStatus {
     UpToDate,
-    UpdateAvailable { version: String, url: String, sig_url: String, size: u64 },
+    UpdateAvailable { version: String, url: String, sig_url: String },
     Error(String),
 }
 
@@ -53,6 +52,21 @@ pub fn store_last_check(status: UpdateStatus) {
 /// Recupera (y consume) el resultado del chequeo en segundo plano.
 pub fn take_last_check() -> Option<UpdateStatus> {
     LAST_CHECK.lock().ok().and_then(|mut slot| slot.take())
+}
+
+/// Actualizacion pendiente de confirmar por el usuario (toast clicable).
+static PENDING_UPDATE: Mutex<Option<(String, String)>> = Mutex::new(None);
+
+/// Almacena la actualizacion pendiente cuando se avisa con un toast.
+pub fn set_pending_update(url: String, sig_url: String) {
+    if let Ok(mut slot) = PENDING_UPDATE.lock() {
+        *slot = Some((url, sig_url));
+    }
+}
+
+/// Recupera (y consume) la actualizacion pendiente de instalar.
+pub fn take_pending_update() -> Option<(String, String)> {
+    PENDING_UPDATE.lock().ok().and_then(|mut slot| slot.take())
 }
 
 /// Consulta la API de GitHub Releases y compara con la version actual.
@@ -90,7 +104,6 @@ pub fn check_update() -> UpdateStatus {
             version: latest.to_string(),
             url: a.browser_download_url.clone(),
             sig_url: s.browser_download_url.clone(),
-            size: a.size,
         },
         (Some(_), None) => UpdateStatus::Error("No .sig signature found in release".into()),
         (None, _) => UpdateStatus::Error("No .exe asset found".into()),
