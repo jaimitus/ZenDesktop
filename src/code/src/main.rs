@@ -1,0 +1,191 @@
+// ZenDesktop - organizador dinamico de escritorio para Windows.
+// Sin consola: subsistema GUI puro (no aparece ninguna ventana negra).
+#![windows_subsystem = "windows"]
+
+//! ZenDesktop :: main.rs
+//!
+//! Secuencia de arranque (objetivo: < 40 ms hasta el primer frame):
+//!
+//!   1. Mutex nombrado -> instancia unica.
+//!   2. Conciencia de DPI por monitor v2 (sin manifiesto externo).
+//!   3. COM en modo apartamento: lo exige el shell (SHGetKnownFolderPath,
+//!      ShellExecuteW, iconos).
+//!   4. Carga o creacion de config.toml portable.
+//!   5. Creacion del arbol de cajas y clasificacion inicial opcional.
+//!   6. Alta de la interfaz (Direct2D) y del vigilante de disco.
+//!   7. Bucle de mensajes bloqueante: `GetMessageW` deja el hilo dormido en el
+//!      kernel, por lo que en reposo el proceso consume 0 % de CPU.
+
+mod ai;
+mod config;
+mod i18n;
+mod rules;
+mod settings;
+mod ui;
+mod updater;
+mod watcher;
+
+use std::process::ExitCode;
+use std::time::Duration;
+
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
+use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::HiDpi::{
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, GetMessageW, MessageBoxW, TranslateMessage, MB_ICONERROR, MB_OK, MSG,
+};
+
+use crate::config::Config;
+use crate::i18n::{Lang, Tr};
+use crate::ui::App;
+use crate::watcher::{DesktopWatcher, WindowTarget};
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(code) => code,
+        Err(error) => {
+            // Error de arranque: todavia no hay configuracion cargada, asi que
+            // se muestra en el idioma por defecto (ingles).
+            let tr = Tr::get(Lang::En);
+            fatal(&tr.fatal_start.replace("{error}", &error.to_string()));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
+    // ---------------------------------------------------------------- 1. Unicidad
+    let mutex = unsafe { CreateMutexW(None, true, w!("Local\\ZenDesktop.SingleInstance.v1"))? };
+    let already_running = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+    if already_running {
+        // Ya hay una instancia viva: salir en silencio, sin molestar al usuario.
+        unsafe {
+            let _ = CloseHandle(mutex);
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // ------------------------------------------------- 2. DPI y 3. inicializacion COM
+    unsafe {
+        // Ignorable: en Windows 8.1 y anteriores basta con el comportamiento clasico.
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        // OLE en lugar de COM puro: es lo que exige el drag & drop del shell
+        // (RegisterDragDrop) y sigue dando servicio al menu contextual nativo.
+        match OleInitialize(None) {
+            Ok(()) => {}
+            Err(e) => {
+                let msg = format!("OleInitialize failed: {e:?}");
+                let body: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+                MessageBoxW(None, PCWSTR(body.as_ptr()), w!("ZenDesktop"), MB_OK | MB_ICONERROR);
+            }
+        }
+    }
+
+    let result = bootstrap();
+
+    unsafe {
+        OleUninitialize();
+        let _ = CloseHandle(mutex);
+    }
+    result
+}
+
+fn bootstrap() -> Result<ExitCode, Box<dyn std::error::Error>> {
+    // ------------------------------------------------------------ 4. Configuracion
+    let (cfg, cfg_path) = Config::load_or_create()?;
+    if cfg.general.start_with_windows {
+        // Un fallo aqui (politicas de grupo) no debe impedir el arranque.
+        let _ = config::apply_autostart(true);
+    }
+
+    let desktop = config::desktop_dir()?;
+    let mut extra_desktops = Vec::new();
+    if cfg.general.watch_public_desktop {
+        if let Some(public) = config::public_desktop_dir() {
+            if public != desktop {
+                extra_desktops.push(public);
+            }
+        }
+    }
+
+    // ------------------------------------------- 5. Arbol de carpetas y primer barrido
+    rules::ensure_layout(&cfg, &desktop)?;
+    if cfg.general.organize_on_start {
+        let organize = rules::organize(&cfg, &desktop);
+        let sweep = rules::sweep_ephemeral(&cfg, &desktop);
+        debug_assert!(
+            organize.errors.is_empty() && sweep.errors.is_empty(),
+            "incidencias durante el barrido inicial"
+        );
+    }
+
+    // ------------------------------------------------------ 6. Interfaz y vigilante
+    let debounce = Duration::from_millis(cfg.general.debounce_ms);
+    let lang = cfg.lang();
+    let handle = App::launch(cfg, cfg_path, desktop, extra_desktops)?;
+
+    let target = WindowTarget::new(handle.controller(), ui::WM_ZEN_FS);
+    match DesktopWatcher::start(handle.watch_paths(), target, debounce) {
+        Ok(watcher) => handle.attach_watcher(watcher),
+        Err(error) => {
+            // Sin vigilante la app sigue siendo util (menu "Organizar ahora"),
+            // pero conviene avisar: es una degradacion importante.
+            let tr = Tr::get(lang);
+            fatal(&tr.watcher_failed.replace("{error}", &error.to_string()));
+        }
+    }
+
+    // ------------------------------------------------------- 7. Bucle de mensajes
+    let exit_code = pump_messages();
+
+    handle.shutdown();
+    Ok(if exit_code == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// Bucle principal. `GetMessageW` bloquea el hilo dentro del kernel hasta que
+/// llega un mensaje (evento de disco publicado por el vigilante, entrada de
+/// raton, hotkey o temporizador). Cero polling, cero CPU en reposo.
+fn pump_messages() -> i32 {
+    let mut message = MSG::default();
+    loop {
+        let status = unsafe { GetMessageW(&mut message, None, 0, 0) };
+        match status.0 {
+            0 => return message.wParam.0 as i32, // WM_QUIT
+            -1 => return 1,                      // error irrecuperable de la cola
+            _ => unsafe {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            },
+        }
+    }
+}
+
+/// Dialogo modal de ultimo recurso: sin consola no hay stderr donde escribir.
+fn fatal(text: &str) {
+    let body: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(body.as_ptr()),
+            w!("ZenDesktop"),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+/// Comprobacion en tiempo de compilacion: el objetivo del vigilante tiene que
+/// poder cruzar el limite de hilos (contiene un HWND marcado como `Send`).
+#[allow(dead_code)]
+fn assert_thread_contract() {
+    fn require_send<T: Send>() {}
+    require_send::<WindowTarget>();
+    let _: HANDLE = HANDLE::default();
+}

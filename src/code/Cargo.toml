@@ -1,0 +1,92 @@
+[package]
+name          = "zendesktop"
+version       = "1.0.0"
+edition       = "2021"
+rust-version  = "1.75"
+authors       = ["ZenDesktop Core Team"]
+description   = "Organizador dinamico de escritorio ultraligero y nativo para Windows (alternativa a Fences)"
+license       = "MIT"
+readme        = "README.md"
+repository    = "https://github.com/zendesktop/zendesktop"
+categories    = ["gui", "os::windows-apis"]
+keywords      = ["windows", "desktop", "fences", "direct2d", "win32"]
+
+[[bin]]
+name = "zendesktop"
+path = "src/main.rs"
+
+[dependencies]
+# ReadDirectoryChangesW nativo, sin polling, sin hilos ociosos despiertos.
+notify = { version = "6.1.1", default-features = false }
+
+# Configuracion portable en TOML.
+serde = { version = "1.0.210", features = ["derive"] }
+toml  = { version = "0.8.19", default-features = false, features = ["parse", "display"] }
+
+# Auto-update: HTTP ligero para consultar releases de GitHub.
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+serde_json = "1.0"
+
+# Bindings Win32 / Direct2D / DirectWrite generados a partir de metadatos oficiales.
+# Se fija la version exacta: la forma de los handles (HWND, HDC...) cambia entre releases.
+[dependencies.windows]
+version  = "=0.58.0"
+features = [
+    "Foundation_Numerics",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Imaging",   # WIC: thumbnails al vuelo sobre imagenes
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_Xps", # PrintWindow / PW_CLIENTONLY (probe visual)
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage", # IDataObject::GetData (arrastrar a las cajas)
+    "Win32_System_Diagnostics_Debug", # ReadProcessMemory / WriteProcessMemory
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",       # OLE drag & drop: RegisterDragDrop / IDropTarget
+    "Win32_System_Registry",
+    "Win32_System_SystemServices", # MODIFIERKEYS_FLAGS (vtable IDropTarget)
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+# ---------------------------------------------------------------------------
+# Recursos de Windows (iconos + version info) compilados por build.rs desde
+# assets/zendesktop.rc.
+[build-dependencies]
+embed-resource = "2"
+
+# ---------------------------------------------------------------------------
+# Perfil de release: binario minimo, sin runtime extra, sin unwinding.
+# Resultado tipico: ~780 KB (~420 KB tras `upx --best --lzma`).
+# ---------------------------------------------------------------------------
+[profile.release]
+opt-level        = "z"     # optimiza tamano: menos codigo => menos paginas residentes
+lto              = "fat"   # link time optimization global entre crates
+codegen-units    = 1       # una sola unidad => mejor inlining y dead-code elimination
+panic            = "abort" # elimina las tablas de unwinding (~60 KB)
+strip            = "symbols"
+debug            = false
+debug-assertions = false
+overflow-checks  = false
+incremental      = false
+rpath            = false
+
+# Las dependencias tambien se compilan optimizando tamano.
+[profile.release.package."*"]
+opt-level = "z"
+
+# Perfil intermedio para depurar la UI con simbolos pero sin lentitud.
+[profile.dev]
+opt-level = 1

@@ -1,0 +1,65 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.75.0
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/code/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src/code/Cargo.lock') }}
+
+      - name: Build release
+        working-directory: src/code
+        run: cargo build --release
+
+      - name: Get version from tag
+        id: version
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          mkdir -p release
+          V="${{ steps.version.outputs.VERSION }}"
+          cp src/code/target/release/zendesktop.exe "release/ZenDesktop-v${V}.exe"
+          cp src/code/target/release/zendesktop.exe release/ZenDesktop.exe
+          cp src/code/LICENSE release/
+          cp src/code/README.md release/
+          cd release
+          7z a -tzip "ZenDesktop-v${V}-portable.zip" ZenDesktop.exe LICENSE README.md
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "ZenDesktop v${{ steps.version.outputs.VERSION }}"
+          body_path: src/code/CHANGELOG.md
+          files: |
+            release/ZenDesktop.exe
+            release/ZenDesktop-v${{ steps.version.outputs.VERSION }}.exe
+            release/ZenDesktop-v${{ steps.version.outputs.VERSION }}-portable.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

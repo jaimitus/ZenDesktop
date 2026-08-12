@@ -1,0 +1,27 @@
+# Rust
+target/
+*.rs.bk
+*.pdb
+
+# IDE
+.idea/
+.vs/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Build artifacts
+release/
+*.zip
+*.msi
+*.wixobj
+*.wixpdb
+
+# Config local (no versionar configuraciones personales)
+config.toml
