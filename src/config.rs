@@ -162,6 +162,9 @@ pub struct General {
     pub keep_shortcuts: bool,
     /// Volcado de diagnostico a zendesktop.log (desactivado = 0 E/S).
     pub log_enabled: bool,
+    /// Comprobar actualizaciones en segundo plano al arrancar y avisar si hay.
+    #[serde(default = "default_true")]
+    pub auto_check_updates: bool,
     /// Ultima version para la que se mostro el dialogo "What's New".
     /// Se actualiza automaticamente tras mostrar el changelog de una nueva version.
     #[serde(default)]
@@ -351,6 +354,7 @@ impl Default for General {
             ],
             keep_shortcuts: true,
             log_enabled: false,
+            auto_check_updates: true,
             last_seen_version: String::new(),
         }
     }

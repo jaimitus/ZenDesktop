@@ -106,6 +106,7 @@ use crate::config::{parse_color, wide, Config, FenceLayout, String32};
 use crate::i18n::Tr;
 use crate::rules::{self, FenceContent};
 use crate::settings;
+use crate::updater;
 use crate::watcher::DesktopWatcher;
 
 /// Carpetas que debe vigilar el watcher para una configuracion dada:
@@ -129,10 +130,11 @@ pub const WM_ZEN_FS: u32 = WM_APP + 0x10;
 /// Callback del icono de la bandeja del sistema.
 pub const WM_ZEN_TRAY: u32 = WM_APP + 0x11;
 /// Doble clic detectado sobre el escritorio (x en WPARAM, y en LPARAM).
-pub const WM_ZEN_DBLCLICK: u32 = WM_APP + 0x12;
-/// Refresco pendiente tras un DoDragDrop (se postea para que fence_proc retorne
-/// antes de que build_fences destruya la ventana).
-const WM_ZEN_DRAG_DONE: u32 = WM_APP + 0x13;
+pub const WM_ZEN_DBLCLICK: u32 = WM_APP + 0x12;    /// Refresco pendiente tras un DoDragDrop (se postea para que fence_proc retorne
+    /// antes de que build_fences destruya la ventana).
+    const WM_ZEN_DRAG_DONE: u32 = WM_APP + 0x13;
+    /// Resultado del chequeo de updates en segundo plano (hilo de trabajo -> UI).
+    pub const WM_ZEN_UPDATE_CHECKED: u32 = WM_APP + 0x14;
 const TIMER_SWEEP: usize = 1;
 const TIMER_PERSIST: usize = 2;
 /// Temporizador de fade-in/fade-out de la miniatura (60 fps).
@@ -3105,6 +3107,38 @@ extern "system" fn controller_proc(
                         WM_RBUTTONUP | WM_CONTEXTMENU => app.show_menu(hwnd, None),
                         WM_LBUTTONDBLCLK => app.toggle_zen(),
                         _ => {}
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_ZEN_UPDATE_CHECKED => {
+                // Resultado del chequeo en segundo plano (hilo -> UI). Solo se
+                // avisa si hay una version nueva; los fallos de red son silenciosos.
+                if let Some(updater::UpdateStatus::UpdateAvailable { version, url, sig_url, .. }) =
+                    updater::take_last_check()
+                {
+                    let msg = format!(
+                        "ZenDesktop {version} is available.\n\nDownload and install now?"
+                    );
+                    let title = wide("ZenDesktop :: Update Available");
+                    let body = wide(&msg);
+                    let answer = MessageBoxW(
+                        hwnd,
+                        PCWSTR(body.as_ptr()),
+                        PCWSTR(title.as_ptr()),
+                        MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2,
+                    );
+                    if answer == IDYES {
+                        if let Err(e) = updater::download_and_install(&url, &sig_url) {
+                            let err = wide(&format!("Update failed:\n{e}"));
+                            let et = wide("ZenDesktop :: Update Error");
+                            MessageBoxW(
+                                hwnd,
+                                PCWSTR(err.as_ptr()),
+                                PCWSTR(et.as_ptr()),
+                                MB_OK | MB_ICONERROR,
+                            );
+                        }
                     }
                 }
                 LRESULT(0)

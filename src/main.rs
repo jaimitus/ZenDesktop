@@ -26,19 +26,22 @@ mod ui;
 mod updater;
 mod watcher;
 
+use std::ffi::c_void;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, WPARAM,
+};
 use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MessageBoxW, TranslateMessage, MB_ICONINFORMATION, MB_ICONERROR,
-    MB_OK, MSG,
+    DispatchMessageW, GetMessageW, MessageBoxW, PostMessageW, TranslateMessage, MB_ICONINFORMATION,
+    MB_ICONERROR, MB_OK, MSG,
 };
 
 use crate::config::Config;
@@ -143,7 +146,29 @@ fn bootstrap() -> Result<ExitCode, Box<dyn std::error::Error>> {
     // ------------------------------------------------------ 6. Interfaz y vigilante
     let debounce = Duration::from_millis(cfg.general.debounce_ms);
     let lang = cfg.lang();
+    let auto_check_updates = cfg.general.auto_check_updates;
     let handle = App::launch(cfg, cfg_path, desktop, extra_desktops)?;
+
+    // Chequeo de updates en segundo plano: no bloquea el arranque. El hilo
+    // consulta GitHub y postea el resultado a la ventana de control.
+    if auto_check_updates {
+        // HWND no es Send: se cruza el limite de hilos como usize (isize crudo).
+        let controller_raw = handle.controller().0 as usize;
+        std::thread::spawn(move || {
+            let status = crate::updater::check_update();
+            if matches!(status, crate::updater::UpdateStatus::UpdateAvailable { .. }) {
+                crate::updater::store_last_check(status);
+                unsafe {
+                    let _ = PostMessageW(
+                        HWND(controller_raw as *mut c_void),
+                        ui::WM_ZEN_UPDATE_CHECKED,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+            }
+        });
+    }
 
     let target = WindowTarget::new(handle.controller(), ui::WM_ZEN_FS);
     match DesktopWatcher::start(handle.watch_paths(), target, debounce) {

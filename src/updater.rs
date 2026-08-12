@@ -5,6 +5,7 @@
 
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use serde::Deserialize;
 
 const GITHUB_API: &str = "https://api.github.com/repos/jaimitus/ZenDesktop/releases/latest";
@@ -38,6 +39,21 @@ pub enum UpdateStatus {
     UpToDate,
     UpdateAvailable { version: String, url: String, sig_url: String, size: u64 },
     Error(String),
+}
+
+/// Resultado del chequeo en segundo plano, leido por el hilo de UI.
+static LAST_CHECK: Mutex<Option<UpdateStatus>> = Mutex::new(None);
+
+/// Almacena el resultado del ultimo chequeo en segundo plano.
+pub fn store_last_check(status: UpdateStatus) {
+    if let Ok(mut slot) = LAST_CHECK.lock() {
+        *slot = Some(status);
+    }
+}
+
+/// Recupera (y consume) el resultado del chequeo en segundo plano.
+pub fn take_last_check() -> Option<UpdateStatus> {
+    LAST_CHECK.lock().ok().and_then(|mut slot| slot.take())
 }
 
 /// Consulta la API de GitHub Releases y compara con la version actual.

@@ -113,6 +113,7 @@ const ID_CHECK_A_COUNTER: u16 = 152;
 const ID_CHECK_A_SEARCH: u16 = 153;
 const ID_CHECK_A_GRID: u16 = 154;
 const ID_CHECK_AI_ENABLE: u16 = 160;
+const ID_CHECK_AUTO_UPDATE: u16 = 161;
 
 const ID_BTN_NEW: u16 = 201;
 const ID_BTN_DEL: u16 = 202;
@@ -1228,6 +1229,8 @@ impl Settings {
         let ver_label = format!("v{}", ver);
         y = self.field_row(y, cx, cw, 0, self.tr.lbl_version, &ver_label, true);
 
+        y = self.check(y, cx, cw, ID_CHECK_AUTO_UPDATE, self.tr.chk_auto_check_updates);
+
         let bx0 = cx + 16.0;
         y += 8.0;
         self.icon_button(bx0, y, 220.0, 32.0, self.tr.btn_check_updates, ID_BTN_CHECK_UPDATES, true);
@@ -1785,6 +1788,7 @@ impl Settings {
             }
             Panel::Updates => {
                 order.extend([
+                    Ctrl::Check(ID_CHECK_AUTO_UPDATE),
                     Ctrl::Btn(ID_BTN_CHECK_UPDATES),
                     Ctrl::Btn(ID_BTN_DOWNLOAD_UPDATE),
                 ]);
@@ -2297,6 +2301,7 @@ impl Settings {
         cfg.general.watch_public_desktop = self.checked(ID_CHECK_PUBLIC);
         cfg.general.keep_shortcuts = self.checked(ID_CHECK_SHORTCUTS);
         cfg.general.start_with_windows = self.checked(ID_CHECK_STARTUP);
+        cfg.general.auto_check_updates = self.checked(ID_CHECK_AUTO_UPDATE);
         cfg.general.zen_double_click = self.checked(ID_CHECK_ZEN_DBL);
         cfg.general.zen_hotkey = self.checked(ID_CHECK_ZEN_HOTKEY);
         cfg.general.zen_hides_desktop_icons = self.checked(ID_CHECK_ZEN_HIDE);
@@ -2982,6 +2987,7 @@ fn initial_checks(cfg: &Config) -> HashMap<u16, bool> {
     m.insert(ID_CHECK_PUBLIC, cfg.general.watch_public_desktop);
     m.insert(ID_CHECK_SHORTCUTS, cfg.general.keep_shortcuts);
     m.insert(ID_CHECK_STARTUP, cfg.general.start_with_windows);
+    m.insert(ID_CHECK_AUTO_UPDATE, cfg.general.auto_check_updates);
     m.insert(ID_CHECK_ZEN_DBL, cfg.general.zen_double_click);
     m.insert(ID_CHECK_ZEN_HOTKEY, cfg.general.zen_hotkey);
     m.insert(ID_CHECK_ZEN_HIDE, cfg.general.zen_hides_desktop_icons);
