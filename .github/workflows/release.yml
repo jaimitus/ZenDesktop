@@ -127,7 +127,7 @@ jobs:
         shell: bash
         run: |
           V="${{ steps.version.outputs.VERSION }}"
-          awk "/^## \\\[$V\\\]/ {flag=1; print; next} /^## \\\[/ {if (flag) {flag=0; exit}} flag {print}" CHANGELOG.md > RELEASE_NOTES.md
+          awk -v ver="$V" 'index($0, "## [" ver "]") == 1 {flag=1; print; next} flag && index($0, "## [") == 1 {exit} flag {print}' CHANGELOG.md > RELEASE_NOTES.md
           
       - name: Create Release
         uses: softprops/action-gh-release@v2
