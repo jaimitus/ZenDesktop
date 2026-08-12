@@ -25,17 +25,20 @@
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="ZenDesktop">
         <!-- Main executable component -->
-        <Component Id="MainExe" Guid="*">
+        <Component Id="MainExe" Guid="A1B2C3D4-0001-4E5F-8A9B-0C1D2E3F4A5B">
           <File Id="ZenDesktopExe"
                 Source="$(var.SrcDir)\ZenDesktop.exe"
                 KeyPath="yes"
                 Checksum="yes" />
+        </Component>
+
+        <Component Id="AppIcon" Guid="A1B2C3D4-0002-4E5F-8A9B-0C1D2E3F4A5B">
           <File Id="ZenDesktopIco"
                 Source="$(var.SrcDir)\zendesktop.ico" />
         </Component>
 
         <!-- LICENSE and README -->
-        <Component Id="Docs" Guid="*">
+        <Component Id="Docs" Guid="A1B2C3D4-0003-4E5F-8A9B-0C1D2E3F4A5B">
           <File Id="LicenseFile" Source="$(var.SrcDir)\LICENSE" />
           <File Id="ReadmeFile" Source="$(var.SrcDir)\README.md" />
         </Component>
@@ -44,7 +47,7 @@
 
     <!-- Start Menu shortcut -->
     <StandardDirectory Id="ProgramMenuFolder">
-      <Component Id="StartMenuShortcut" Guid="*">
+      <Component Id="StartMenuShortcut" Guid="A1B2C3D4-0004-4E5F-8A9B-0C1D2E3F4A5B">
         <Shortcut Id="ZenDesktopShortcut"
                   Name="ZenDesktop"
                   Description="Ultra-lightweight desktop organizer"
@@ -62,7 +65,7 @@
 
     <!-- Desktop shortcut (optional, off by default) -->
     <StandardDirectory Id="DesktopFolder">
-      <Component Id="DesktopShortcut" Guid="*" Condition="INSTALLDESKTOPSHORTCUT">
+      <Component Id="DesktopShortcut" Guid="A1B2C3D4-0005-4E5F-8A9B-0C1D2E3F4A5B" Condition="INSTALLDESKTOPSHORTCUT">
         <Shortcut Id="DesktopZenShortcut"
                   Name="ZenDesktop"
                   Description="Ultra-lightweight desktop organizer"
@@ -82,6 +85,7 @@
              Description="Ultra-lightweight native desktop organizer for Windows"
              ConfigurableDirectory="INSTALLFOLDER">
       <ComponentRef Id="MainExe" />
+      <ComponentRef Id="AppIcon" />
       <ComponentRef Id="Docs" />
       <ComponentRef Id="StartMenuShortcut" />
       <ComponentRef Id="DesktopShortcut" />
