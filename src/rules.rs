@@ -709,6 +709,11 @@ pub fn move_into(src: &Path, dir: &Path) -> io::Result<bool> {
         Some(n) => n.to_os_string(),
         None => return Ok(false),
     };
+    // Si el archivo ya esta en la carpeta destino, no hacer nada.
+    // Evita duplicados (2) por doble drop o por arrastrar un archivo a su propia carpeta.
+    if src.parent() == Some(dir) {
+        return Ok(false);
+    }
     let dest = unique_path(dir, &name);
 
     match fs::rename(src, &dest) {
@@ -739,6 +744,10 @@ pub fn move_into_dir(src: &Path, dir: &Path) -> io::Result<bool> {
         Some(n) => n.to_os_string(),
         None => return Ok(false),
     };
+    // Si la carpeta ya esta en el destino, no hacer nada.
+    if src.parent() == Some(dir) {
+        return Ok(false);
+    }
     let dest = unique_path(dir, &name);
 
     match fs::rename(src, &dest) {

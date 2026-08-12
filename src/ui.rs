@@ -77,8 +77,8 @@ use windows::Win32::System::Memory::{
     PAGE_READWRITE,
 };
 use windows::Win32::System::Ole::{
-    RegisterDragDrop, ReleaseStgMedium, RevokeDragDrop, CF_HDROP, DROPEFFECT, DROPEFFECT_MOVE,
-    DROPEFFECT_NONE, IDropTarget,
+    DoDragDrop, RegisterDragDrop, ReleaseStgMedium, RevokeDragDrop, CF_HDROP, DROPEFFECT,
+    DROPEFFECT_COPY, DROPEFFECT_MOVE, DROPEFFECT_NONE, IDropSource, IDropTarget,
 };
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::System::Threading::{
@@ -93,8 +93,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    DragAcceptFiles, DragFinish, DragQueryFileW, HDROP, ShellExecuteW, Shell_NotifyIconW,
-    SHBindToParent, SHGetFileInfoW, SHParseDisplayName,
+    BHID_DataObject, DragAcceptFiles, DragFinish, DragQueryFileW, HDROP,
+    SHCreateShellItemArrayFromIDLists, ShellExecuteW,
+    Shell_NotifyIconW, SHBindToParent, SHGetFileInfoW, SHParseDisplayName,
     CMINVOKECOMMANDINFO, CMF_NORMAL,
     IContextMenu, IContextMenu3, IShellFolder, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
     NOTIFYICONDATAW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SMALLICON,
@@ -130,9 +131,10 @@ pub const WM_ZEN_FS: u32 = WM_APP + 0x10;
 /// Callback del icono de la bandeja del sistema.
 pub const WM_ZEN_TRAY: u32 = WM_APP + 0x11;
 /// Doble clic detectado sobre el escritorio (x en WPARAM, y en LPARAM).
-pub const WM_ZEN_DBLCLICK: u32 = WM_APP + 0x12;    /// Refresco pendiente tras un DoDragDrop (se postea para que fence_proc retorne
-    /// antes de que build_fences destruya la ventana).
-    const WM_ZEN_DRAG_DONE: u32 = WM_APP + 0x13;
+pub const WM_ZEN_DBLCLICK: u32 = WM_APP + 0x12;
+/// Refresco pendiente tras un DoDragDrop (se postea para que fence_proc retorne
+/// antes de que build_fences destruya la ventana).
+const WM_ZEN_DRAG_DONE: u32 = WM_APP + 0x13;
     /// Resultado del chequeo de updates en segundo plano (hilo de trabajo -> UI).
     pub const WM_ZEN_UPDATE_CHECKED: u32 = WM_APP + 0x14;
     /// El usuario hizo clic en el toast (p. ej. para instalar una actualizacion).
@@ -144,8 +146,9 @@ const TIMER_THUMB_FADE: usize = 3;
 const TIMER_TOAST: usize = 4;
 /// Temporizador de animaciones suaves (colapsar/expandir, Zen mode).
 const TIMER_ANIM: usize = 5;
+const TIMER_SCROLL: usize = 6;
 /// Pasos de interpolacion por animacion (8 pasos a 10ms = 80ms).
-const ANIM_STEPS: u8 = 8;
+const ANIM_STEPS: u8 = 16;
 /// Identificador del atajo global Ctrl+Alt+Z ("ZE" en ASCII).
 const HOTKEY_ID: i32 = 0x5A45;
 /// Identificador unico del icono de bandeja ("ZD" en ASCII).
@@ -706,41 +709,65 @@ enum DragMode {
     Resize,
     Select { start_x: f32, start_y: f32, curr_x: f32, curr_y: f32 },
     ItemDrag { item_idx: usize, start_x: i32, start_y: i32 },
-    ManualDrag { paths: Vec<PathBuf>, source_fence: usize },
+}
+
+struct FenceTab {
+    _rule_id: String,
+    _target_dir: Option<PathBuf>,
+    content: FenceContent,
+    selected: HashSet<usize>,
+    scroll: i32,
+    smooth_scroll: f32,
+    search_focused: bool,
+    search_text: String,
+    rename_item: Option<usize>,
+    rename_text: String,
+    rename_path: Option<PathBuf>,
 }
 
 struct Fence {
     hwnd: HWND,
-    content: FenceContent,
+    tabs: Vec<FenceTab>,
+    active_tab: usize,
     layout: FenceLayout,
     accent: D2D1_COLOR_F,
     surface: Option<Surface>,
-    scroll: i32,
     hover: i32,
     hover_lock: bool,
-    selected: HashSet<usize>,
+    pub is_mouse_over: bool,
     rubberband: Option<(f32, f32, f32, f32)>,
-    search_focused: bool,
     drag: DragMode,
     anchor: POINT,
     origin: FenceLayout,
     scale: f32,
     reorder_drop: Option<usize>,
     sort_mode: Option<String>,
-    search_text: String,
     hit_row_h: f32,
-    /// Item en proceso de renombrado (F2) y su texto en edicion.
-    rename_item: Option<usize>,
-    rename_text: String,
-    /// Ruta original capturada al pulsar F2: el indice puede cambiar si el
-    /// watcher refresca contenidos mientras se edita.
-    rename_path: Option<PathBuf>,
+    pub anim_step: u8,
+    pub anim_kind: u8,
 }
 
 impl Fence {
+    fn tab(&self) -> &FenceTab {
+        &self.tabs[self.active_tab]
+    }
+
+    fn tab_mut(&mut self) -> &mut FenceTab {
+        &mut self.tabs[self.active_tab]
+    }
+
+    
+    fn header_h(&self, theme: &Theme) -> f32 {
+        if self.tabs.len() > 1 {
+            theme.header + 26.0
+        } else {
+            theme.header
+        }
+    }
+
     fn visible_height(&self, theme: &Theme) -> i32 {
-        if self.layout.collapsed {
-            ((theme.header + theme.padding) * self.scale) as i32
+        if self.layout.collapsed && !self.is_mouse_over {
+            ((self.header_h(theme) + theme.padding) * self.scale) as i32
         } else {
             self.layout.height
         }
@@ -752,33 +779,35 @@ impl Fence {
     }
 
     fn max_scroll(&self, theme: &Theme) -> i32 {
-        (self.content.items.len() as i32 - self.rows_visible(theme)).max(0)
+        let tab = &self.tabs[self.active_tab];
+        (tab.content.items.len() as i32 - self.rows_visible(theme)).max(0)
     }
 
     fn item_at(&self, theme: &Theme, x: i32, y: i32) -> Option<usize> {
         let fy = y as f32 / self.scale;
         let fx = x as f32 / self.scale;
-        if fy < theme.header || fx < 0.0 {
+        if fy < self.header_h(theme) || fx < 0.0 {
             return None;
         }
+        let tab = &self.tabs[self.active_tab];
         if theme.grid_mode {
             let cell = theme.grid_item_size.max(48.0);
             let pad = theme.padding;
             let w_dip = self.layout.width as f32 / self.scale;
             let grid_cols = ((w_dip - pad) / cell).floor().max(1.0) as usize;
-            let row = ((fy - theme.header) / cell).floor() as i32 + self.scroll;
+            let row = ((fy - self.header_h(theme)) / cell + tab.smooth_scroll).floor() as i32;
             let col = ((fx - pad * 0.5) / cell).floor() as i32;
             if col >= 0 && col < grid_cols as i32 && row >= 0 {
                 let index = row as usize * grid_cols + col as usize;
-                if index < self.content.items.len() {
+                if index < tab.content.items.len() {
                     return Some(index);
                 }
             }
             None
         } else {
             let row_h = if self.hit_row_h > 0.0 { self.hit_row_h } else { theme.row };
-            let index = ((fy - theme.header) / row_h).floor() as i32 + self.scroll;
-            if index >= 0 && (index as usize) < self.content.items.len() {
+            let index = ((fy - self.header_h(theme)) / row_h + tab.smooth_scroll).floor() as i32;
+            if index >= 0 && (index as usize) < tab.content.items.len() {
                 Some(index as usize)
             } else {
                 None
@@ -837,20 +866,17 @@ pub struct App {
     toast_alpha: u8,
     toast_fading_out: bool,
     toast_hold: u32,
-    anim_kind: u8,
-    anim_step: u8,
-    anim_fence: usize,
+    zen_anim_kind: u8,
+    zen_anim_step: u8,
     anim_zen_alpha: u8,
     /// true mientras DoDragDrop esta en curso (suprime refrescos de UI anidados).
     dragging: bool,
     /// Toast pendiente de mostrar al terminar un DoDragDrop interno.
     pending_toast: Option<String>,
-    /// Archivos devueltos al escritorio manualmente: saltar el proximo organize.
+    /// Configuracion recibida durante el bucle modal OLE.
+    deferred_config: Option<Config>,
+    /// Archivos devueltos al escritorio: saltar el proximo organize.
     skip_next_organize: bool,
-    /// Superficie para la imagen de arrastre manual.
-    drag_image_surface: Option<SurfaceDib>,
-    /// (fence_idx, item_idx) resaltado durante un drag manual (subcarpeta destino).
-    drag_hover_target: Option<(usize, i32)>,
 }
 
 /// Puntero estable a la aplicacion, propiedad del hilo de interfaz.
@@ -1009,15 +1035,13 @@ impl App {
                 toast_alpha: 255,
                 toast_fading_out: false,
                 toast_hold: 0,
-                anim_kind: 0,
-                anim_step: 0,
-                anim_fence: 0,
+                zen_anim_kind: 0,
+                zen_anim_step: 0,
                 anim_zen_alpha: 255,
                 dragging: false,
                 pending_toast: None,
+                deferred_config: None,
                 skip_next_organize: false,
-                drag_image_surface: None,
-                drag_hover_target: None,
             });
             // Objetivo OLE de arrastrar y soltar, compartido por todas las
             // cajas: vive con la aplicacion (Box::leak) y guarda el puntero a
@@ -1099,28 +1123,100 @@ impl App {
         }
 
         let contents = rules::collect_fences(&self.cfg, &self.desktop, &std::collections::HashMap::new());
+        let mut unassigned: Vec<Option<rules::FenceContent>> = contents.into_iter().map(Some).collect();
+        let mut grouped_fences: Vec<(FenceLayout, Vec<FenceTab>)> = Vec::new();
+
+        for layout in &self.cfg.fences {
+            let mut tabs = Vec::new();
+            if !layout.tabs.is_empty() {
+                for tab_id in &layout.tabs {
+                    if let Some(idx) = unassigned.iter().position(|c| c.as_ref().map_or(false, |content| &content.id == tab_id)) {
+                        if let Some(content) = unassigned[idx].take() {
+                            tabs.push(FenceTab {
+                                _rule_id: content.id.clone(),
+                                _target_dir: content.folder.clone(),
+                                content,
+                                selected: HashSet::new(),
+                                scroll: 0,
+                                smooth_scroll: 0.0,
+                                search_focused: false,
+                                search_text: String::new(),
+                                rename_item: None,
+                                rename_text: String::new(),
+                                rename_path: None,
+                            });
+                        }
+                    }
+                }
+            } else {
+                let target_id = layout.id.as_str();
+                if let Some(idx) = unassigned.iter().position(|c| c.as_ref().map_or(false, |content| content.id == target_id)) {
+                    if let Some(content) = unassigned[idx].take() {
+                        tabs.push(FenceTab {
+                            _rule_id: content.id.clone(),
+                            _target_dir: content.folder.clone(),
+                            content,
+                            selected: HashSet::new(),
+                            scroll: 0,
+                            smooth_scroll: 0.0,
+                            search_focused: false,
+                            search_text: String::new(),
+                            rename_item: None,
+                            rename_text: String::new(),
+                            rename_path: None,
+                        });
+                    }
+                }
+            }
+
+            if !tabs.is_empty() {
+                grouped_fences.push((layout.clone(), tabs));
+            }
+        }
+
         let work = work_area();
         let mut cursor_y = work.top + 32;
 
-        for (index, content) in contents.into_iter().enumerate() {
-            let layout = self.cfg.layout_of(&content.id).unwrap_or(FenceLayout {
-                id: String32::new(&content.id),
-                x: work.left + 32,
-                y: {
-                    let y = cursor_y;
-                    cursor_y += 260;
-                    if cursor_y > work.bottom - 80 {
-                        cursor_y = work.top + 32;
-                    }
-                    y
-                },
-                width: 320,
-                height: 240,
-                collapsed: false,
-                hidden: false,
-                locked: false,
-                sort_by: None,
-            });
+        for maybe_content in unassigned {
+            if let Some(content) = maybe_content {
+                let layout = FenceLayout {
+                    id: String32::new(&content.id),
+                    x: work.left + 32,
+                    y: {
+                        let y = cursor_y;
+                        cursor_y += 260;
+                        if cursor_y > work.bottom - 80 {
+                            cursor_y = work.top + 32;
+                        }
+                        y
+                    },
+                    width: 320,
+                    height: 240,
+                    collapsed: false,
+                    hidden: false,
+                    locked: false,
+                    sort_by: None,
+                    tabs: Vec::new(),
+                    group_title: None,
+                };
+                let tabs = vec![FenceTab {
+                    _rule_id: content.id.clone(),
+                    _target_dir: content.folder.clone(),
+                    content,
+                    selected: HashSet::new(),
+                    scroll: 0,
+                    smooth_scroll: 0.0,
+                    search_focused: false,
+                    search_text: String::new(),
+                    rename_item: None,
+                    rename_text: String::new(),
+                    rename_path: None,
+                }];
+                grouped_fences.push((layout, tabs));
+            }
+        }
+
+        for (index, (layout, tabs)) in grouped_fences.into_iter().enumerate() {
             let _ = index;
 
             let hwnd = CreateWindowExW(
@@ -1139,29 +1235,28 @@ impl App {
             )?;
 
             let dpi = GetDpiForWindow(hwnd) as f32;
+            let accent = color(&tabs[0].content.color);
+            
             let fence = Fence {
                 hwnd,
-                accent: color(&content.color),
-                content,
+                tabs,
+                active_tab: 0,
+                accent,
                 layout: layout.clone(),
                 surface: None,
-                scroll: 0,
                 hover: -1,
                 hover_lock: false,
-                selected: HashSet::new(),
+            is_mouse_over: false,
                 rubberband: None,
-                search_focused: false,
                 drag: DragMode::None,
                 anchor: POINT::default(),
                 origin: layout.clone(),
                 scale: if dpi > 0.0 { dpi / 96.0 } else { 1.0 },
                 reorder_drop: None,
                 sort_mode: layout.sort_by.clone(),
-                search_text: String::new(),
                 hit_row_h: self.theme.row,
-                rename_item: None,
-                rename_text: String::new(),
-                rename_path: None,
+                anim_step: 0,
+                anim_kind: 0,
             };
             self.fences.push(fence);
 
@@ -1215,7 +1310,7 @@ impl App {
     /// Mueve rutas soltadas a la carpeta fisica de la caja `index` y refresca
     /// el contenido si algo se movio. Devuelve cuantos ficheros se movieron.
     unsafe fn accept_drop(&mut self, index: usize, paths: Vec<PathBuf>) -> usize {
-        let folder = match self.fences.get(index).and_then(|f| f.content.folder.clone()) {
+        let folder = match self.fences.get(index).and_then(|f| f.tab().content.folder.clone()) {
             Some(f) => f,
             None => return 0,
         };
@@ -1227,13 +1322,13 @@ impl App {
         }
         if moved > 0 {
             if self.dragging {
-                let fname = self.fences[index].content.title.clone();
+                let fname = self.fences[index].tab_mut().content.title.clone();
                 self.pending_toast = Some(format!("{} {} → {}", moved, self.tr.toast_dropped, fname));
             } else {
-                let fname = self.fences[index].content.title.clone();
+                let fname = self.fences[index].tab_mut().content.title.clone();
                 let msg = format!("{} {} → {}", moved, self.tr.toast_dropped, fname);
                 self.show_toast(&msg, TOAST_DROP);
-                self.refresh_contents();
+                self.refresh_one_fence(index);
                 let _ = SetTimer(self.controller, TIMER_PERSIST, 800, None);
             }
         }
@@ -1325,30 +1420,39 @@ impl App {
     }
 
     fn refresh_contents(&mut self) {
-        // No refrescar contenidos durante DoDragDrop: build_fences
-        // destruye/crea ventanas y corrompe OLE.
+        // No reconstruir la lista mientras el drag OLE conserva activas
+        // las ventanas y el IDataObject del Shell.
         if self.dragging { return; }
         let mut sort_overrides: std::collections::HashMap<String, Option<String>> = std::collections::HashMap::new();
+        let mut total_tabs = 0;
         for fence in &self.fences {
-            sort_overrides.insert(fence.content.id.clone(), fence.sort_mode.clone());
+            for tab in &fence.tabs {
+                sort_overrides.insert(tab.content.id.clone(), fence.sort_mode.clone());
+                total_tabs += 1;
+            }
         }
         let contents = rules::collect_fences(&self.cfg, &self.desktop, &sort_overrides);
-        let same_shape = contents.len() == self.fences.len()
-            && contents
-                .iter()
-                .zip(self.fences.iter())
-                .all(|(c, f)| c.id == f.content.id);
-
-        if !same_shape {
-            unsafe {
-                let _ = self.build_fences();
-            }
+        
+        // Si el numero total de reglas no coincide, se agregaron/quitaron reglas del config.
+        if contents.len() != total_tabs {
+            unsafe { let _ = self.build_fences(); }
             return;
         }
-        for (fence, content) in self.fences.iter_mut().zip(contents.into_iter()) {
-            fence.content = content;
+
+        // Actualizar el contenido de cada pestana usando su ID, sin destruir las ventanas (evita parpadeos / flicker).
+        let mut content_map = std::collections::HashMap::new();
+        for c in contents {
+            content_map.insert(c.id.clone(), c);
+        }
+        for fence in &mut self.fences {
+            for tab in &mut fence.tabs {
+                if let Some(c) = content_map.remove(&tab.content.id) {
+                    tab.content = c;
+                }
+            }
+            let active = fence.active_tab;
             let max = fence.max_scroll(&self.theme);
-            fence.scroll = fence.scroll.min(max).max(0);
+            fence.tabs[active].scroll = fence.tabs[active].scroll.min(max).max(0);
         }
         self.render_all();
     }
@@ -1359,16 +1463,28 @@ impl App {
         }
     }
 
-    fn index_of(&self, hwnd: HWND) -> Option<usize> {
-        self.fences.iter().position(|f| f.hwnd == hwnd)
+    /// Refresca el contenido de una sola fence y la repinta, sin tocar las demas.
+    fn refresh_one_fence(&mut self, index: usize) {
+        if self.dragging { return; }
+        if index >= self.fences.len() { return; }
+        let fence_id = self.fences[index].tabs[self.fences[index].active_tab].content.id.clone();
+        let sort_override = self.fences[index].sort_mode.clone();
+        let contents = rules::collect_fences(&self.cfg, &self.desktop, &{
+            let mut m = std::collections::HashMap::new();
+            m.insert(fence_id.clone(), sort_override);
+            m
+        });
+        if let Some(content) = contents.into_iter().find(|c| c.id == fence_id) {
+            let fence = &mut self.fences[index];
+            fence.tabs[fence.active_tab].content = content;
+            let max = fence.max_scroll(&self.theme);
+            fence.tabs[fence.active_tab].scroll = fence.tabs[fence.active_tab].scroll.min(max).max(0);
+        }
+        let _ = self.render(index);
     }
 
-    /// Limpia el highlight de subcarpeta destino al terminar un drag.
-    fn clear_drag_hover(&mut self) {
-        if let Some((fi, _)) = self.drag_hover_target.take() {
-            self.fences[fi].hover = -1;
-            let _ = self.render(fi);
-        }
+    fn index_of(&self, hwnd: HWND) -> Option<usize> {
+        self.fences.iter().position(|f| f.hwnd == hwnd)
     }
 
     // -- renderizado --------------------------------------------------------
@@ -1388,16 +1504,17 @@ impl App {
         let fence = &mut self.fences[index];
 
         let width = fence.layout.width.max(80);
-        let height = fence.visible_height(theme).max(28);
+        let visual_height = fence.visible_height(theme).max(28);
+        let surface_height = if fence.anim_step > 0 { fence.layout.height.max(28) } else { visual_height };
         let scale = fence.scale;
 
         unsafe {
             let recreate = match &fence.surface {
-                Some(s) => s.width != width || s.height != height,
+                Some(s) => s.width != width || s.height != surface_height,
                 None => true,
             };
             if recreate {
-                fence.surface = Some(Surface::new(gfx, width, height)?);
+                fence.surface = Some(Surface::new(gfx, width, surface_height)?);
             }
             let surface = match fence.surface.as_ref() {
                 Some(s) => s,
@@ -1408,7 +1525,7 @@ impl App {
                 left: 0,
                 top: 0,
                 right: width,
-                bottom: height,
+                bottom: surface_height,
             };
             surface.target.BindDC(surface.dc, &bounds)?;
             surface.target.BeginDraw();
@@ -1420,7 +1537,7 @@ impl App {
             }));
 
             let w = width as f32 / scale;
-            let h = height as f32 / scale;
+            let h = surface_height as f32 / scale;
             let radius = theme.radius;
             let brush = &surface.brush;
 
@@ -1452,7 +1569,8 @@ impl App {
                 .DrawRoundedRectangle(&body, brush, theme.border_width * scale, None);
 
             // Fondo de la cabecera (Header Backdrop Bar)
-            let header_h = theme.header * scale;
+            let header_h = fence.header_h(theme) * scale;
+            let base_h = theme.header * scale;
             brush.SetColor(&with_alpha(theme.text, 0.035));
             surface.target.FillRoundedRectangle(
                 &D2D1_ROUNDED_RECT {
@@ -1477,7 +1595,7 @@ impl App {
             // Pill de acento vertical brillante
             let pill_h = 14.0 * scale;
             let pill_w = 3.5 * scale;
-            let pill_y = (header_h - pill_h) * 0.5;
+            let pill_y = (base_h - pill_h) * 0.5;
             
             brush.SetColor(&with_alpha(fence.accent, 0.25));
             surface.target.FillRoundedRectangle(
@@ -1498,7 +1616,7 @@ impl App {
                 brush,
             );
 
-            let item_cnt = fence.content.items.len();
+            let item_cnt = fence.tabs[fence.active_tab].content.items.len();
             let title_right = if self.cfg.appearance.show_search {
                 if let Some(sr) = search_rect(w, theme, theme.show_counter, item_cnt) {
                     sr.left - 8.0
@@ -1509,7 +1627,20 @@ impl App {
                 lock_rect(w, theme, theme.show_counter, item_cnt).left - 8.0
             };
 
-            let title = wide_str(&fence.content.title);
+            let title_str = if fence.tabs.len() > 1 {
+                if let Some(gt) = &fence.layout.group_title {
+                    if !gt.trim().is_empty() {
+                        gt.clone()
+                    } else {
+                        fence.tabs[0].content.title.clone()
+                    }
+                } else {
+                    fence.tabs[0].content.title.clone()
+                }
+            } else {
+                fence.tabs[fence.active_tab].content.title.clone()
+            };
+            let title = wide_str(&title_str);
             brush.SetColor(&theme.title);
             surface.target.DrawText(
                 &title,
@@ -1518,7 +1649,7 @@ impl App {
                     pad + 10.0 * scale,
                     0.0,
                     title_right.max(pad + 20.0) * scale,
-                    header_h,
+                    base_h,
                 ),
                 brush,
                 D2D1_DRAW_TEXT_OPTIONS_CLIP,
@@ -1533,7 +1664,7 @@ impl App {
                 let badge_h = 16.0 * scale;
                 let badge_right = (w - theme.padding) * scale;
                 let badge_left = badge_right - badge_w;
-                let badge_top = (header_h - badge_h) * 0.5;
+                let badge_top = (base_h - badge_h) * 0.5;
 
                 brush.SetColor(&with_alpha(theme.text, 0.08));
                 surface.target.FillRoundedRectangle(
@@ -1574,7 +1705,7 @@ impl App {
                     let search_y = sr.top * scale;
                     let search_w = (sr.right - sr.left) * scale;
                     let search_h = (sr.bottom - sr.top) * scale;
-                    let is_focused = fence.search_focused;
+                    let is_focused = fence.tabs[fence.active_tab].search_focused;
 
                     let bg_color = if is_focused {
                         with_alpha(theme.background, 0.90)
@@ -1604,7 +1735,7 @@ impl App {
                         None,
                     );
 
-                    let label = if fence.search_text.is_empty() {
+                    let label = if fence.tabs[fence.active_tab].search_text.is_empty() {
                         "🔍 Buscar…"
                     } else {
                         ""
@@ -1625,9 +1756,9 @@ impl App {
                             D2D1_DRAW_TEXT_OPTIONS_CLIP,
                             DWRITE_MEASURING_MODE_NATURAL,
                         );
-                    } else if !fence.search_text.is_empty() {
+                    } else if !fence.tabs[fence.active_tab].search_text.is_empty() {
                         brush.SetColor(&theme.text);
-                        let stext = wide_str(&fence.search_text);
+                        let stext = wide_str(&fence.tabs[fence.active_tab].search_text);
                         surface.target.DrawText(
                             &stext,
                             &gfx.text_format,
@@ -1659,6 +1790,46 @@ impl App {
                             DWRITE_MEASURING_MODE_NATURAL,
                         );
                     }
+                }
+            }
+
+            // Dibujar pestanas si hay mas de una
+            if fence.tabs.len() > 1 {
+                let tab_h = 24.0 * scale;
+                let tab_y = theme.header * scale;
+                let mut tab_x = pad;
+                for (i, tab) in fence.tabs.iter().enumerate() {
+                    let title = wide_str(&tab.content.title);
+                    let tab_w = (40.0 + title.len() as f32 * 7.0) * scale;
+                    let is_active = i == fence.active_tab;
+
+                    let bg_color = if is_active {
+                        with_alpha(fence.accent, 0.4)
+                    } else {
+                        with_alpha(theme.background, 0.2)
+                    };
+                    brush.SetColor(&bg_color);
+                    surface.target.FillRoundedRectangle(
+                        &D2D1_ROUNDED_RECT {
+                            rect: rect(tab_x, tab_y, tab_x + tab_w, tab_y + tab_h),
+                            radiusX: 4.0 * scale,
+                            radiusY: 4.0 * scale,
+                        },
+                        brush,
+                    );
+                    
+                    let text_color = if is_active { theme.text } else { theme.muted };
+                    brush.SetColor(&text_color);
+                    surface.target.DrawText(
+                        &title,
+                        &gfx.center_meta_format,
+                        &rect(tab_x, tab_y, tab_x + tab_w, tab_y + tab_h),
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                    
+                    tab_x += tab_w + 4.0 * scale;
                 }
             }
 
@@ -1715,8 +1886,8 @@ impl App {
 
             let mut icon_jobs: Vec<(i32, i32, HICON)> = Vec::new();
 
-            if !fence.layout.collapsed {
-                let content_rect = rect(0.0, theme.header * scale, w * scale, h * scale);
+            if !fence.layout.collapsed || fence.is_mouse_over {
+                let content_rect = rect(0.0, fence.header_h(theme) * scale, w * scale, h * scale);
                 surface
                     .target
                     .PushAxisAlignedClip(&content_rect, D2D1_ANTIALIAS_MODE_ALIASED);
@@ -1724,43 +1895,43 @@ impl App {
                 let rows = fence.rows_visible(theme);
                 let icon_px = if scale > 1.25 { 20.0 } else { 16.0 };
                 // Filtro de busqueda: si hay texto, solo mostrar items que lo contengan.
-                let filtered: Vec<usize> = if fence.search_text.is_empty() {
-                    (0..fence.content.items.len()).collect()
+                let filtered: Vec<usize> = if fence.tabs[fence.active_tab].search_text.is_empty() {
+                    (0..fence.tabs[fence.active_tab].content.items.len()).collect()
                 } else {
-                    let q = fence.search_text.to_lowercase();
-                    fence.content.items.iter().enumerate()
+                    let q = fence.tabs[fence.active_tab].search_text.to_lowercase();
+                    fence.tabs[fence.active_tab].content.items.iter().enumerate()
                         .filter(|(_, item)| item.name.to_lowercase().contains(&q))
                         .map(|(i, _)| i)
                         .collect()
                 };
-                let first = fence.scroll.max(0) as usize;
-                let _last = (first + rows.max(0) as usize + 1).min(fence.content.items.len());
+                let first = fence.tabs[fence.active_tab].smooth_scroll.max(0.0) as usize;
+                let _last = (first + rows.max(0) as usize + 1).min(fence.tabs[fence.active_tab].content.items.len());
 
                 let grid_mode = self.cfg.appearance.grid_mode;
                 let cell = (self.cfg.appearance.grid_item_size * scale).max(48.0);
                 let grid_cols = ((w * scale - pad * 2.0) / cell).floor().max(1.0) as usize;
 
-                if grid_mode && !fence.content.items.is_empty() {
+                if grid_mode && !fence.tabs[fence.active_tab].content.items.is_empty() {
                     fence.hit_row_h = cell / scale;
                     // Calcular scroll en modo cuadricula.
-                    let grid_rows = (fence.content.items.len() + grid_cols - 1) / grid_cols;
-                    let visible_rows = ((h * scale - theme.header * scale) / cell).floor().max(1.0) as usize;
+                    let grid_rows = (fence.tabs[fence.active_tab].content.items.len() + grid_cols - 1) / grid_cols;
+                    let visible_rows = ((h * scale - fence.header_h(theme) * scale) / cell).floor().max(1.0) as usize;
                     let max_grid_scroll = grid_rows.saturating_sub(visible_rows);
-                    fence.scroll = fence.scroll.min(max_grid_scroll as i32).max(0);
-                    let scroll_off = fence.scroll as f32 * cell;
-                    let first_row = fence.scroll as usize;
+                    fence.tabs[fence.active_tab].scroll = fence.tabs[fence.active_tab].scroll.min(max_grid_scroll as i32).max(0);
+                    let scroll_off = fence.tabs[fence.active_tab].smooth_scroll * cell;
+                    let first_row = fence.tabs[fence.active_tab].smooth_scroll.floor().max(0.0) as usize;
                     let last_row = (first_row + visible_rows + 1).min(grid_rows);
                     let cell_pad = 4.0 * scale;
                     let icon_size = (cell * 0.48).min(32.0 * scale).max(20.0 * scale);
                     for row in first_row..last_row {
                         for col in 0..grid_cols {
                             let idx = row * grid_cols + col;
-                            if idx >= fence.content.items.len() { break; }
-                            let item = &fence.content.items[idx];
+                            if idx >= fence.tabs[fence.active_tab].content.items.len() { break; }
+                            let item = &fence.tabs[fence.active_tab].content.items[idx];
                             let cx = pad * 0.5 + col as f32 * cell;
-                            let cy_val = theme.header * scale + (row as f32 * cell) - scroll_off;
+                            let cy_val = fence.header_h(theme) * scale + (row as f32 * cell) - scroll_off;
                             if cy_val + cell > h * scale { break; }
-                            let is_sel = fence.selected.contains(&idx);
+                            let is_sel = fence.tabs[fence.active_tab].selected.contains(&idx);
                             let is_hov = fence.hover == idx as i32;
                             if is_sel || is_hov {
                                 let bg = if is_sel { with_alpha(fence.accent, 0.28) } else { theme.hover };
@@ -1797,14 +1968,14 @@ impl App {
                         }
                     }
                     // Scrollbar en modo cuadricula.
-                    let _grid_rows = (fence.content.items.len() + grid_cols - 1) / grid_cols;
-                    let _visible_rows = ((h * scale - theme.header * scale) / cell).floor().max(1.0) as usize;
+                    let _grid_rows = (fence.tabs[fence.active_tab].content.items.len() + grid_cols - 1) / grid_cols;
+                    let _visible_rows = ((h * scale - fence.header_h(theme) * scale) / cell).floor().max(1.0) as usize;
                     let _max_grid = _grid_rows.saturating_sub(_visible_rows);
                     if _max_grid > 0 {
                         let track = (h - theme.header - theme.padding) * scale;
                         let thumb = (track * (_visible_rows as f32 / _grid_rows as f32)).max(18.0 * scale);
-                        let progress = fence.scroll as f32 / _max_grid as f32;
-                        let top = theme.header * scale + (track - thumb) * progress;
+                        let progress = fence.tabs[fence.active_tab].scroll as f32 / _max_grid as f32;
+                        let top = fence.header_h(theme) * scale + (track - thumb) * progress;
                         brush.SetColor(&theme.muted);
                         surface.target.FillRoundedRectangle(
                             &D2D1_ROUNDED_RECT {
@@ -1813,7 +1984,7 @@ impl App {
                             }, brush,
                         );
                     }
-                } else if fence.content.items.is_empty() {
+                } else if fence.tabs[fence.active_tab].content.items.is_empty() {
                     brush.SetColor(&theme.muted);
                     let empty = wide_str(self.tr.fence_empty);
                     surface.target.DrawText(
@@ -1821,7 +1992,7 @@ impl App {
                         &gfx.text_format,
                         &rect(
                             pad,
-                            theme.header * scale,
+                            fence.header_h(theme) * scale,
                             (w - theme.padding) * scale,
                             (theme.header + theme.row) * scale,
                         ),
@@ -1837,16 +2008,17 @@ impl App {
                 let visible_filtered = (rows as usize + 1).min(total_filtered.saturating_sub(first));
                 for offset in 0..visible_filtered {
                     let mapped = filtered[first + offset];
-                    if mapped >= fence.content.items.len() { break; }
-                    let item = &fence.content.items[mapped];
+                    if mapped >= fence.tabs[fence.active_tab].content.items.len() { break; }
+                    let item = &fence.tabs[fence.active_tab].content.items[mapped];
                     let index_abs = mapped;
-                    let top = (theme.header + offset as f32 * theme.row) * scale;
+                    let fractional = fence.tabs[fence.active_tab].smooth_scroll - first as f32;
+                    let top = (fence.header_h(theme) + (offset as f32 - fractional) * theme.row) * scale;
                     let bottom = top + theme.row * scale;
                     if top > h * scale {
                         break;
                     }
 
-                    let is_sel = fence.selected.contains(&index_abs);
+                    let is_sel = fence.tabs[fence.active_tab].selected.contains(&index_abs);
                     let is_hov = fence.hover == index_abs as i32;
                     if is_sel || is_hov {
                         let bg = if is_sel { with_alpha(fence.accent, 0.28) } else { theme.hover };
@@ -1933,9 +2105,9 @@ impl App {
 
                 // Indicador de reordenacion: linea de acento en la posicion de insercion.
                 if let Some(drop) = fence.reorder_drop {
-                    let effective = if drop > fence.content.items.len() { fence.content.items.len() } else { drop };
-                    let y_pos = (theme.header + (effective as f32 - fence.scroll as f32) * theme.row) * scale;
-                    let y_pos = y_pos.clamp(theme.header * scale, (h - 1.0) * scale);
+                    let effective = if drop > fence.tabs[fence.active_tab].content.items.len() { fence.tabs[fence.active_tab].content.items.len() } else { drop };
+                    let y_pos = (fence.header_h(theme) + (effective as f32 - fence.tabs[fence.active_tab].smooth_scroll) * theme.row) * scale;
+                    let y_pos = y_pos.clamp(fence.header_h(theme) * scale, (h - 1.0) * scale);
                     brush.SetColor(&fence.accent);
                     surface.target.DrawLine(
                         D2D_POINT_2F { x: pad, y: y_pos },
@@ -1948,18 +2120,18 @@ impl App {
 
                 // Indicador de desplazamiento.
                 // Indicador de desplazamiento (usa el numero de items filtrados).
-                let max_scroll = if fence.search_text.is_empty() {
+                let max_scroll = if fence.tabs[fence.active_tab].search_text.is_empty() {
                     fence.max_scroll(theme)
                 } else {
                     (total_filtered as i32 - rows).max(0)
                 };
                 if max_scroll > 0 {
-                    let total = fence.content.items.len() as f32;
+                    let total = fence.tabs[fence.active_tab].content.items.len() as f32;
                     let visible = rows as f32;
                     let track = (h - theme.header - theme.padding) * scale;
                     let thumb = (track * (visible / total)).max(18.0 * scale);
-                    let progress = fence.scroll as f32 / max_scroll as f32;
-                    let top = theme.header * scale + (track - thumb) * progress;
+                    let progress = fence.tabs[fence.active_tab].scroll as f32 / max_scroll as f32;
+                    let top = fence.header_h(theme) * scale + (track - thumb) * progress;
                     brush.SetColor(&theme.muted);
                     surface.target.FillRoundedRectangle(
                         &D2D1_ROUNDED_RECT {
@@ -2024,10 +2196,10 @@ impl App {
             }
 
             // Overlay de renombrado en sitio (F2): caja destacada + texto + caret.
-            if let Some(ri) = fence.rename_item {
+            if let Some(ri) = fence.tabs[fence.active_tab].rename_item {
                 let l = &fence.layout;
                 if !l.collapsed {
-                    let vis = ri as i32 - fence.scroll;
+                    let vis = ri as i32 - fence.tabs[fence.active_tab].smooth_scroll.round() as i32;
                     if vis >= 0 {
                         let (bx, by, bw, bh) = if theme.grid_mode {
                             let cell = theme.grid_item_size.max(48.0);
@@ -2036,7 +2208,7 @@ impl App {
                             let (row, col) = (vis as usize / cols, vis as usize % cols);
                             (
                                 (theme.padding * 0.5 + col as f32 * cell) * scale,
-                                (theme.header + row as f32 * cell) * scale,
+                                (fence.header_h(theme) + row as f32 * cell) * scale,
                                 cell * scale,
                                 cell * scale,
                             )
@@ -2044,7 +2216,7 @@ impl App {
                             let row_h = if fence.hit_row_h > 0.0 { fence.hit_row_h } else { theme.row };
                             (
                                 theme.padding * 0.5 * scale,
-                                (theme.header + vis as f32 * row_h) * scale,
+                                (fence.header_h(theme) + vis as f32 * row_h) * scale,
                                 width as f32 - theme.padding * scale,
                                 row_h * scale,
                             )
@@ -2060,7 +2232,7 @@ impl App {
                         brush.SetColor(&fence.accent);
                         surface.target.DrawRoundedRectangle(&rrect, brush, 1.4 * scale, None);
                         // Texto en edicion.
-                        let rtext = wide_str(&fence.rename_text);
+                        let rtext = wide_str(&fence.tabs[fence.active_tab].rename_text);
                         brush.SetColor(&theme.text);
                         let text_left = bx + 7.0 * scale;
                         surface.target.DrawText(
@@ -2072,7 +2244,7 @@ impl App {
                             DWRITE_MEASURING_MODE_NATURAL,
                         );
                         // Caret (barra vertical tras el texto).
-                        let caret_x = text_left + fence.rename_text.chars().count() as f32 * 6.4 * scale;
+                        let caret_x = text_left + fence.tabs[fence.active_tab].rename_text.chars().count() as f32 * 6.4 * scale;
                         brush.SetColor(&fence.accent);
                         surface.target.FillRectangle(
                             &rect(caret_x, by + bh * 0.22, caret_x + 1.5 * scale, by + bh * 0.78),
@@ -2093,13 +2265,17 @@ impl App {
 
             // Publicacion atomica del frame con alfa por pixel.
             let screen = GetDC(None);
+            let mut win_rect = RECT::default();
+            let _ = GetWindowRect(fence.hwnd, &mut win_rect);
+            let cur_h = win_rect.bottom - win_rect.top;
+            
             let position = POINT {
                 x: fence.layout.x,
                 y: fence.layout.y,
             };
             let size = SIZE {
                 cx: width,
-                cy: height,
+                cy: if fence.anim_step > 0 { cur_h } else { visual_height },
             };
             let source = POINT { x: 0, y: 0 };
             let blend = BLENDFUNCTION {
@@ -2300,10 +2476,10 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
         let _ = DeleteObject(HGDIOBJ(font.0));
 
         let icon_w: i32 = 16;
-        let pad_x: i32 = 28 + icon_w; // espacio para icono + padding
-        let pad_y: i32 = 14;
-        let tw = (text_sz.cx + pad_x).clamp(170, 600);
-        let th = (text_sz.cy + pad_y).max(36);
+        let pad_x: i32 = 44 + icon_w; // espacio para icono + padding generoso
+        let pad_y: i32 = 20;
+        let tw = (text_sz.cx + pad_x).clamp(200, 640);
+        let th = (text_sz.cy + pad_y).max(40);
         // --- Crear superficie al tamano medido ---
         let surface = match SurfaceDib::new(tw, th) {
             Some(s) => s,
@@ -2375,8 +2551,8 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
                 let _ = SetBkMode(surface.dc, TRANSPARENT);
                 let _ = SetTextColor(surface.dc, COLORREF(0x00FFFFFF));
                 let mut text: Vec<u16> = message.encode_utf16().collect();
-                let text_left = pad_x / 2 + icon_w + 4;
-                let mut rc = RECT { left: text_left, top: 0, right: tw - 8, bottom: th };
+                let text_left = 16 + icon_w + 12; // icono (x=16, w=16) + gap
+                let mut rc = RECT { left: text_left, top: 0, right: tw - 12, bottom: th };
                 let _ = DrawTextW(surface.dc, &mut text, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 SelectObject(surface.dc, old_font);
                 let _ = DeleteObject(HGDIOBJ(font2.0));
@@ -2441,16 +2617,86 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
         if index >= self.fences.len() { return; }
         let fence = &mut self.fences[index];
         fence.layout.collapsed = !fence.layout.collapsed;
-        self.anim_fence = index;
-        self.anim_kind = if fence.layout.collapsed { 1 } else { 2 };
-        self.anim_step = ANIM_STEPS;
+        fence.anim_kind = if fence.layout.collapsed { 1 } else { 2 };
+        fence.anim_step = ANIM_STEPS;
         unsafe { let _ = SetTimer(self.controller, TIMER_ANIM, 10, None); }
     }
 
+    fn start_anim_hover(&mut self, index: usize, kind: u8) {
+        if index >= self.fences.len() { return; }
+        let fence = &mut self.fences[index];
+        if !fence.layout.collapsed { return; } // Solo animar hover si esta plegada por defecto.
+        fence.anim_kind = kind; // 1 = collapse, 2 = expand
+        fence.anim_step = ANIM_STEPS;
+        unsafe { let _ = SetTimer(self.controller, TIMER_ANIM, 10, None); }
+    }
+
+    fn scroll_tick(&mut self) {
+        let mut animating = false;
+        for i in 0..self.fences.len() {
+            let active = self.fences[i].active_tab;
+            let target = self.fences[i].tabs[active].scroll as f32;
+            let current = self.fences[i].tabs[active].smooth_scroll;
+            let diff = target - current;
+            if diff.abs() > 0.01 {
+                // smooth ease-out interpolation (mas lento para que se note)
+                self.fences[i].tabs[active].smooth_scroll = current + diff * 0.15;
+                let _ = self.render(i);
+                animating = true;
+            } else if diff.abs() > 0.0 {
+                self.fences[i].tabs[active].smooth_scroll = target;
+                let _ = self.render(i);
+            }
+        }
+        if !animating {
+            unsafe { let _ = KillTimer(self.controller, TIMER_SCROLL); }
+        }
+    }
+
     fn anim_tick(&mut self) {
-        if self.anim_step == 0 {
-            unsafe { let _ = KillTimer(self.controller, TIMER_ANIM); }
-            if self.anim_kind == 3 {
+        let mut any_animating = false;
+
+        for i in 0..self.fences.len() {
+            if self.fences[i].anim_step > 0 {
+                self.fences[i].anim_step -= 1;
+                let p = (ANIM_STEPS - self.fences[i].anim_step) as f32 / ANIM_STEPS as f32;
+                let progress = 1.0 - (1.0 - p).powi(3);
+                
+                let fence = &self.fences[i];
+                let hwnd = fence.hwnd;
+                let full_h = fence.layout.height;
+                let collapsed_h = ((fence.scale * (fence.header_h(&self.theme) + self.theme.padding)) as i32).max(28);
+                let (from, to) = if fence.anim_kind == 1 { (full_h, collapsed_h) } else { (collapsed_h, full_h) };
+                let cur = from + ((to - from) as f32 * progress) as i32;
+                let _ = unsafe { SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, fence.layout.width, cur, SWP_NOMOVE | SWP_NOACTIVATE) };
+                let _ = self.render(i);
+                
+                if self.fences[i].anim_step == 0 {
+                    self.persist_layout();
+                } else {
+                    any_animating = true;
+                }
+            }
+        }
+
+        if self.zen_anim_step > 0 {
+            self.zen_anim_step -= 1;
+            let p = (ANIM_STEPS - self.zen_anim_step) as f32 / ANIM_STEPS as f32;
+            let progress = 1.0 - (1.0 - p).powi(3);
+            
+            match self.zen_anim_kind {
+                3 => {
+                    self.anim_zen_alpha = ((1.0 - progress) * 255.0) as u8;
+                    self.render_all();
+                }
+                4 => {
+                    self.anim_zen_alpha = (progress * 255.0) as u8;
+                    self.render_all();
+                }
+                _ => {}
+            }
+            
+            if self.zen_anim_step == 0 && self.zen_anim_kind == 3 {
                 unsafe {
                     for fence in &self.fences {
                         let _ = ShowWindow(fence.hwnd, SW_HIDE);
@@ -2461,95 +2707,18 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
                         }
                     }
                 }
+                self.zen_anim_kind = 0;
             }
-            self.anim_kind = 0;
-            return;
+            if self.zen_anim_step > 0 {
+                any_animating = true;
+            } else {
+                self.zen_anim_kind = 0;
+            }
         }
-        self.anim_step -= 1;
-        let progress = (ANIM_STEPS - self.anim_step) as f32 / ANIM_STEPS as f32;
-        match self.anim_kind {
-            1 | 2 => {
-                let idx = self.anim_fence;
-                if idx >= self.fences.len() { self.anim_step = 0; return; }
-                let fence = &self.fences[idx];
-                let hwnd = fence.hwnd;
-                let full_h = fence.layout.height;
-                let collapsed_h = ((fence.scale * (self.theme.header + self.theme.padding)) as i32).max(28);
-                let (from, to) = if self.anim_kind == 1 { (full_h, collapsed_h) } else { (collapsed_h, full_h) };
-                let cur = from + ((to - from) as f32 * progress) as i32;
-                let _ = unsafe { SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, fence.layout.width, cur, SWP_NOMOVE | SWP_NOACTIVATE) };
-                let _ = self.render(idx);
-                if self.anim_step == 0 {
-                    self.persist_layout();
-                }
-            }
-            3 => {
-                self.anim_zen_alpha = ((1.0 - progress) * 255.0) as u8;
-                self.render_all();
-            }
-            4 => {
-                self.anim_zen_alpha = (progress * 255.0) as u8;
-                self.render_all();
-            }
-            _ => { self.anim_step = 0; }
-        }
-    }
 
-    /// Muestra el icono de arrastre (sin fade, para drag manual).
-    unsafe fn show_drag_image(&mut self, path: &Path) {
-        // Cargar icono del archivo (32x32).
-        let mut info = SHFILEINFOW::default();
-        let flags = SHGFI_ICON | SHGFI_LARGEICON;
-        if SHGetFileInfoW(PCWSTR(wide(&path.to_string_lossy()).as_ptr()), windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0), Some(&mut info), std::mem::size_of::<SHFILEINFOW>() as u32, flags) == 0 {
-            return;
+        if !any_animating {
+            unsafe { let _ = KillTimer(self.controller, TIMER_ANIM); }
         }
-        if info.hIcon.is_invalid() { return; }
-        // Crear DIB 32x32 y pintar el icono.
-        let tw: i32 = 32; let th: i32 = 32;
-        let surface = match SurfaceDib::new(tw, th) { Some(s) => s, None => return };
-        if !surface.bits.is_null() {
-            let bits = std::slice::from_raw_parts_mut(surface.bits, (tw * th) as usize);
-            bits.fill(0);
-            // Dibujar icono sobre el DC.
-            let _ = DrawIconEx(surface.dc, 0, 0, info.hIcon, tw, th, 0, None, DI_NORMAL);
-            let _ = DestroyIcon(info.hIcon);
-        }
-        self.drag_image_surface = Some(surface);
-        // Posicionar en el cursor.
-        let mut cursor = POINT::default();
-        let _ = GetCursorPos(&mut cursor);
-        let x = cursor.x + 12;
-        let y = cursor.y + 12;
-        let screen = GetDC(None);
-        let position = POINT { x, y };
-        let size = SIZE { cx: tw, cy: th };
-        let source = POINT { x: 0, y: 0 };
-        let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 200, AlphaFormat: AC_SRC_ALPHA as u8 };
-        let s = self.drag_image_surface.as_ref().unwrap();
-        let _ = SetWindowPos(self.thumb_hwnd, HWND_TOPMOST, x, y, tw, th, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        let _ = UpdateLayeredWindow(self.thumb_hwnd, screen, Some(&position), Some(&size), s.dc, Some(&source), COLORREF(0), Some(&blend), ULW_ALPHA);
-        let _ = ReleaseDC(None, screen);
-    }
-
-    unsafe fn update_drag_image_position(&mut self) {
-        if self.drag_image_surface.is_none() { return; }
-        let mut cursor = POINT::default();
-        let _ = GetCursorPos(&mut cursor);
-        let x = cursor.x + 12;
-        let y = cursor.y + 12;
-        let screen = GetDC(None);
-        let position = POINT { x, y };
-        let size = SIZE { cx: 32, cy: 32 };
-        let source = POINT { x: 0, y: 0 };
-        let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 200, AlphaFormat: AC_SRC_ALPHA as u8 };
-        let s = self.drag_image_surface.as_ref().unwrap();
-        let _ = UpdateLayeredWindow(self.thumb_hwnd, screen, Some(&position), Some(&size), s.dc, Some(&source), COLORREF(0), Some(&blend), ULW_ALPHA);
-        let _ = ReleaseDC(None, screen);
-    }
-
-    unsafe fn hide_drag_image(&mut self) {
-        self.drag_image_surface = None;
-        let _ = ShowWindow(self.thumb_hwnd, SW_HIDE);
     }
 
     unsafe fn hide_thumb(&mut self) {
@@ -2624,9 +2793,7 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
     }
 
     fn sweep_now(&mut self) {
-        // No barrer durante un DoDragDrop: el bombeo de mensajes
-        // puede disparar WM_TIMER y build_fences destruiria cajas
-        // mientras el drag esta activo.
+        // No barrer mientras el drag OLE conserva activas las ventanas.
         if self.dragging { return; }
         let report = rules::sweep_ephemeral(&self.cfg, &self.desktop);
         if report.archived > 0 {
@@ -2664,10 +2831,11 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
     /// pintada con UpdateLayeredWindow (no recibe el foco de teclado).
     unsafe fn start_rename(&mut self, fence_idx: usize, item_idx: usize) {
         // Un solo renombrado activo a la vez.
-        if let Some(active) = self.fences.iter().position(|f| f.rename_item.is_some()) {
+        if let Some(active) = self.fences.iter().position(|f| f.tabs[f.active_tab].rename_item.is_some()) {
             self.cancel_rename(active);
         }
         let Some(path) = self.fences[fence_idx]
+            .tabs[self.fences[fence_idx].active_tab]
             .content
             .items
             .get(item_idx)
@@ -2693,9 +2861,9 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
         };
         let hwnd = self.fences[fence_idx].hwnd;
         let fence = &mut self.fences[fence_idx];
-        fence.rename_item = Some(item_idx);
-        fence.rename_path = Some(path);
-        fence.rename_text = base;
+        fence.tabs[fence.active_tab].rename_item = Some(item_idx);
+        fence.tabs[fence.active_tab].rename_path = Some(path);
+        fence.tabs[fence.active_tab].rename_text = base;
         // Misma via de teclado que el buscador: foco programatico a la caja.
         let _ = SetForegroundWindow(hwnd);
         let _ = SetFocus(hwnd);
@@ -2706,11 +2874,11 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
     unsafe fn commit_rename(&mut self, fence_idx: usize) {
         let (text, path) = {
             let fence = &mut self.fences[fence_idx];
-            if fence.rename_item.is_none() {
+            if fence.tabs[fence.active_tab].rename_item.is_none() {
                 return;
             }
-            fence.rename_item = None;
-            (fence.rename_text.clone(), fence.rename_path.take())
+            fence.tabs[fence.active_tab].rename_item = None;
+            (fence.tabs[fence.active_tab].rename_text.clone(), fence.tabs[fence.active_tab].rename_path.take())
         };
         let Some(path) = path else { return };
         let new_name = text.trim();
@@ -2737,12 +2905,12 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
         match std::fs::rename(&path, &new_path) {
             Ok(()) => {
                 // Los indices de seleccion quedan obsoletos tras re-ordenar.
-                self.fences[fence_idx].selected.clear();
-                self.fences[fence_idx].rename_text.clear();
+                self.fences[fence_idx].tab_mut().selected.clear();
+                self.fences[fence_idx].tab_mut().rename_text.clear();
                 self.refresh_contents();
             }
             Err(e) => {
-                self.fences[fence_idx].rename_text.clear();
+                self.fences[fence_idx].tab_mut().rename_text.clear();
                 let msg = format!("{} — {e}", self.tr.toast_rename_failed);
                 self.show_toast_glyph(&msg, TOAST_ERROR, '\u{2715}');
             }
@@ -2752,12 +2920,12 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
     /// Cancela el renombrado en curso (Escape).
     fn cancel_rename(&mut self, fence_idx: usize) {
         let fence = &mut self.fences[fence_idx];
-        if fence.rename_item.is_none() {
+        if fence.tabs[fence.active_tab].rename_item.is_none() {
             return;
         }
-        fence.rename_item = None;
-        fence.rename_path = None;
-        fence.rename_text.clear();
+        fence.tabs[fence.active_tab].rename_item = None;
+        fence.tabs[fence.active_tab].rename_path = None;
+        fence.tabs[fence.active_tab].rename_text.clear();
         let _ = self.render(fence_idx);
     }
 
@@ -2772,6 +2940,12 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
     /// con las carpetas fisicas (nuevas reglas con `move_files` se vigilan ya,
     /// sin esperar a reiniciar).
     pub(crate) fn apply_config(&mut self, cfg: Config) {
+        if self.dragging {
+            // DoDragDrop bombea mensajes en este mismo hilo; no destruir las
+            // ventanas OLE hasta que el mensaje de fin confirme que termino.
+            self.deferred_config = Some(cfg);
+            return;
+        }
         let old_paths = self.watch_paths();
         let new_paths = watch_paths_for(&cfg, &self.desktop, &self.extra_desktops);
 
@@ -2957,7 +3131,7 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
 
         let mut cursor = POINT::default();
         let _ = GetCursorPos(&mut cursor);
-        let _ = SetForegroundWindow(owner);
+        let _ = SetForegroundWindow(self.controller);
         self.shell_menu = Some(menu.clone());
         let choice = TrackPopupMenu(
             hmenu,
@@ -2965,11 +3139,21 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
             cursor.x,
             cursor.y,
             0,
-            owner,
+            self.controller,
             None,
         );
         self.shell_menu = None;
-        let _ = PostMessageW(owner, WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = PostMessageW(self.controller, WM_NULL, WPARAM(0), LPARAM(0));
+        
+        // Re-evaluar mouseleave tras cerrar menu
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let mut rc = RECT::default();
+        let _ = GetWindowRect(owner, &mut rc);
+        let in_rect = pt.x >= rc.left && pt.x <= rc.right && pt.y >= rc.top && pt.y <= rc.bottom;
+        if !in_rect {
+            let _ = PostMessageW(owner, 0x02A3, WPARAM(0), LPARAM(0)); // Fake MOUSELEAVE
+        }
         let _ = DestroyMenu(hmenu);
 
         if choice.0 != 0 && choice.0 as u32 >= first {
@@ -3002,7 +3186,7 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
         append_menu(menu, CMD_REFRESH, self.tr.menu_refresh);
         if let Some(index) = fence_index {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-            if self.fences[index].content.folder.is_some() {
+            if self.fences[index].tab_mut().content.folder.is_some() {
                 append_menu(menu, CMD_OPEN_FOLDER, self.tr.menu_open_folder);
             }
             let label = if self.fences[index].layout.collapsed {
@@ -3055,7 +3239,7 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
             CMD_REFRESH => self.refresh_contents(),
             CMD_OPEN_FOLDER => {
                 if let Some(index) = fence_index {
-                    if let Some(folder) = self.fences[index].content.folder.clone() {
+                    if let Some(folder) = self.fences[index].tab_mut().content.folder.clone() {
                         self.open_item(&folder);
                     }
                 }
@@ -3098,8 +3282,8 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
                         _ => "custom",
                     };
                     self.fences[index].sort_mode = Some(mode.to_string());
-                    rules::sort_items_slice(&mut self.fences[index].content.items, mode);
-                    self.fences[index].scroll = 0;
+                    rules::sort_items_slice(&mut self.fences[index].tab_mut().content.items, mode);
+                    self.fences[index].tab_mut().scroll = 0;
                     let _ = self.render(index);
                     self.persist_layout();
                 }
@@ -3261,6 +3445,12 @@ extern "system" fn controller_proc(
             }
             WM_ZEN_DRAG_DONE => {
                 if let Some(app) = app_from(hwnd) {
+                    // El bucle OLE ya termino; a partir de aqui es seguro
+                    // procesar cambios de disco y reconstruir las fences.
+                    app.dragging = false;
+                    if let Some(cfg) = app.deferred_config.take() {
+                        app.apply_config(cfg);
+                    }
                     app.refresh_contents();
                     rules::notify_shell();
                     if let Some(msg) = app.pending_toast.take() {
@@ -3331,8 +3521,24 @@ extern "system" fn controller_proc(
                 }
                 LRESULT(0)
             }
+            WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM => {
+                if let Some(app) = app_from(hwnd) {
+                    if let Some(menu) = &app.shell_menu {
+                        if let Ok(menu3) = menu.cast::<IContextMenu3>() {
+                            let _ = menu3.HandleMenuMsg(message, wparam, lparam);
+                        }
+                    }
+                }
+                LRESULT(0)
+            }
             WM_TIMER => {
                 if let Some(app) = app_from(hwnd) {
+                    // No ejecutar animaciones, persistencia ni barridos dentro
+                    // del bucle modal OLE; algunos de ellos pueden renderizar o
+                    // destruir ventanas que el Shell aún está usando.
+                    if app.dragging {
+                        return LRESULT(0);
+                    }
                     match wparam.0 {
                         TIMER_SWEEP => app.sweep_now(),
                         TIMER_PERSIST => {
@@ -3347,6 +3553,9 @@ extern "system" fn controller_proc(
                         }
                         TIMER_ANIM => {
                             app.anim_tick();
+                        }
+                        TIMER_SCROLL => {
+                            app.scroll_tick();
                         }
                         _ => {}
                     }
@@ -3370,12 +3579,20 @@ extern "system" fn controller_proc(
             }
             WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
                 if let Some(app) = app_from(hwnd) {
-                    app.render_all();
+                    if !app.dragging {
+                        app.render_all();
+                    }
                 }
                 LRESULT(0)
             }
             WM_CLOSE => {
                 if let Some(app) = app_from(hwnd) {
+                    // El Shell todavía puede estar usando las ventanas durante
+                    // DoDragDrop. El cierre se procesa al terminar mediante el
+                    // flujo normal de mensajes.
+                    if app.dragging {
+                        return LRESULT(0);
+                    }
                     app.persist_layout();
                     // El escritorio vuelve a su estado original en el momento
                     // del cierre (y no solo al soltar la ultima referencia):
@@ -3489,9 +3706,12 @@ unsafe extern "system" fn drop_target_drag_enter(
     pdweffect: *mut DROPEFFECT,
 ) -> windows::core::HRESULT {
     let target = &*(this as *const FenceDropTarget);
-    let _app = &*target.app;
-    // Solo se aceptan arrastres de ficheros: preguntar al IDataObject si
-    // puede entregar CF_HDROP (evita el cursor de "mover" sobre texto, etc.).
+    // Durante un drag saliente (DoDragDrop en curso), no aceptar drops
+    // entrantes en ninguna fence — evitamos access violation.
+    if (*target.app).dragging {
+        if !pdweffect.is_null() { *pdweffect = DROPEFFECT_NONE; }
+        return windows::core::HRESULT(0);
+    }
     let files = if pdataobj.is_null() {
         false
     } else {
@@ -3507,11 +3727,7 @@ unsafe extern "system" fn drop_target_drag_enter(
     };
     target.accepts_files.set(files);
     if !pdweffect.is_null() {
-        *pdweffect = if files {
-            DROPEFFECT_MOVE
-        } else {
-            DROPEFFECT_NONE
-        };
+        *pdweffect = if files { DROPEFFECT_MOVE } else { DROPEFFECT_NONE };
     }
     windows::core::HRESULT(0)
 }
@@ -3545,13 +3761,32 @@ unsafe extern "system" fn drop_target_drop(
     pdweffect: *mut DROPEFFECT,
 ) -> windows::core::HRESULT {
     let app = &mut *(*(this as *const FenceDropTarget)).app;
+    // Durante un drag saliente, ignorar drops entrantes.
+    if app.dragging {
+        if !pdweffect.is_null() { *pdweffect = DROPEFFECT_NONE; }
+        return windows::core::HRESULT(0);
+    }
     let hwnd = WindowFromPoint(POINT { x: pt.x, y: pt.y });
     let mut moved = 0usize;
     if !pdataobj.is_null() {
         let data = &*(pdataobj as *const IDataObject);
         let paths = App::paths_from_idata(data);
         if let Some(index) = app.index_of(hwnd) {
-            moved = app.accept_drop(index, paths);
+            // Un drop OLE interno puede caer sobre una subcarpeta dibujada
+            // dentro de la fence, no solo sobre su raiz. Resolverlo aqui evita
+            // que el origen se interprete como un drop al escritorio.
+            let target = app.fences.get(index).and_then(|f| {
+                let local = POINT { x: pt.x - f.layout.x, y: pt.y - f.layout.y };
+                f.item_at(&app.theme, local.x, local.y)
+                    .and_then(|item_idx| f.tab().content.items.get(item_idx))
+                    .filter(|item| item.is_dir)
+                    .map(|item| (item.path.clone(), item.name.clone()))
+            });
+            if let Some((dest, name)) = target {
+                moved = app.move_paths_to(&dest, &name, paths);
+            } else {
+                moved = app.accept_drop(index, paths);
+            }
         } else {
             moved = app.drop_to_desktop(paths);
         }
@@ -3633,9 +3868,9 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 let _ = GetCursorPos(&mut pt);
                 let _ = ScreenToClient(hwnd, &mut pt);
                 let theme_header = (app.theme.header * app.fences[index].scale) as i32;
-                let fence = &app.fences[index];
+                let fence = &mut app.fences[index];
                 let w_dip = fence.layout.width as f32 / fence.scale;
-                let item_cnt = fence.content.items.len();
+                let item_cnt = fence.tabs[fence.active_tab].content.items.len();
                 if app.cfg.appearance.show_search && pt.y <= theme_header {
                     if let Some(sr) = search_rect(w_dip, &app.theme, app.theme.show_counter, item_cnt) {
                         let s = fence.scale;
@@ -3654,7 +3889,7 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
                 let _ = ScreenToClient(hwnd, &mut pt);
-                let fence = &app.fences[index];
+                let fence = &mut app.fences[index];
                 let in_grip = pt.x > fence.layout.width - GRIP
                     && pt.y > fence.visible_height(&app.theme) - GRIP
                     && !fence.layout.collapsed
@@ -3667,25 +3902,50 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
             }
             WM_KILLFOCUS => {
                 // Perder el foco confirma el renombrado (como Explorer).
-                if app.fences[index].rename_item.is_some() {
+                if app.fences[index].tab_mut().rename_item.is_some() {
                     app.commit_rename(index);
                 }
                 LRESULT(0)
             }
             WM_LBUTTONDOWN => {
+                // No aceptar otra interacción mientras un drag OLE activo
+                // puede estar bombeando mensajes.
+                if app.dragging {
+                    return LRESULT(0);
+                }
                 // Renombrado en curso: confirmar antes de procesar el clic.
-                if app.fences[index].rename_item.is_some() {
+                if app.fences[index].tab_mut().rename_item.is_some() {
                     app.commit_rename(index);
                 }
                 let (x, y) = point_of(lparam);
                 let theme_header = (app.theme.header * app.fences[index].scale) as i32;
+
+                // Clic en pestanas
+                if y >= theme_header && y <= (app.fences[index].header_h(&app.theme) * app.fences[index].scale) as i32 {
+                    let fence = &mut app.fences[index];
+                    if fence.tabs.len() > 1 {
+                        let scale = fence.scale;
+                        let pad = app.theme.padding * scale;
+                        let mut tab_x = pad;
+                        for (i, tab) in fence.tabs.iter().enumerate() {
+                            let title = wide_str(&tab.content.title);
+                            let tab_w = (40.0 + title.len() as f32 * 7.0) * scale;
+                            if (x as f32) >= tab_x && (x as f32) <= tab_x + tab_w {
+                                fence.active_tab = i;
+                                let _ = app.render(index);
+                                return LRESULT(0);
+                            }
+                            tab_x += tab_w + 4.0 * scale;
+                        }
+                    }
+                }
 
                 // Clic sobre la barra de busqueda: dar foco para escribir texto.
                 if app.cfg.appearance.show_search && y <= theme_header {
                     let fence = &mut app.fences[index];
                     let s = fence.scale;
                     let w_dip = fence.layout.width as f32 / s;
-                    let item_cnt = fence.content.items.len();
+                    let item_cnt = fence.tabs[fence.active_tab].content.items.len();
                     if let Some(sr) = search_rect(w_dip, &app.theme, app.theme.show_counter, item_cnt) {
                         let sx1 = (sr.left * s) as i32;
                         let sx2 = (sr.right * s) as i32;
@@ -3693,11 +3953,11 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                         let sy2 = (sr.bottom * s) as i32;
                         if x >= sx1 && x <= sx2 && y >= sy1 && y <= sy2 {
                             let clear_x = (sr.right - 18.0) * s;
-                            if !fence.search_text.is_empty() && x as f32 >= clear_x {
-                                fence.search_text.clear();
-                                fence.scroll = 0;
+                            if !fence.tabs[fence.active_tab].search_text.is_empty() && x as f32 >= clear_x {
+                                fence.tabs[fence.active_tab].search_text.clear();
+                                fence.tabs[fence.active_tab].scroll = 0;
                             } else {
-                                fence.search_focused = true;
+                                fence.tabs[fence.active_tab].search_focused = true;
                                 let _ = SetForegroundWindow(hwnd);
                                 let _ = SetFocus(hwnd);
                             }
@@ -3708,11 +3968,31 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 }
 
                 // Clic sobre el candado de la cabecera: anclar / desanclar.
+                                let mut clicked_tab = false;
                 {
                     let fence = &mut app.fences[index];
                     let w_dip = fence.layout.width as f32 / fence.scale;
-                    let item_cnt = fence.content.items.len();
+                    let item_cnt = fence.tabs[fence.active_tab].content.items.len();
                     let lr = lock_rect(w_dip, &app.theme, app.theme.show_counter, item_cnt);
+                    
+                    if y >= theme_header && y <= (fence.header_h(&app.theme) * fence.scale) as i32 {
+                        if fence.tabs.len() > 1 {
+                            let scale = fence.scale;
+                            let pad = app.theme.padding * scale;
+                            let mut tab_x = pad;
+                            for (i, tab) in fence.tabs.iter().enumerate() {
+                                let title = wide_str(&tab.content.title);
+                                let tab_w = (40.0 + title.len() as f32 * 7.0) * scale;
+                                if (x as f32) >= tab_x && (x as f32) <= tab_x + tab_w {
+                                    fence.active_tab = i;
+                                    clicked_tab = true;
+                                    break;
+                                }
+                                tab_x += tab_w + 4.0 * scale;
+                            }
+                        }
+                    }
+
                     let in_lock = y <= theme_header
                         && x >= (lr.left * fence.scale) as i32
                         && x <= (lr.right * fence.scale) as i32;
@@ -3729,6 +4009,11 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                         return LRESULT(0);
                     }
                 }
+                if clicked_tab {
+                    let _ = app.render(index);
+                    return LRESULT(0);
+                }
+
 
                 // 1. Redimensionado de la caja (esquina inferior derecha - GRIP): prioridad absoluta.
                 {
@@ -3746,7 +4031,8 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 }
 
                 // 2. Arrastrar cabecera para mover la caja.
-                if y <= theme_header {
+                let full_header_h = (app.fences[index].header_h(&app.theme) * app.fences[index].scale) as i32;
+                if y <= full_header_h {
                     let fence = &mut app.fences[index];
                     fence.anchor = screen_cursor();
                     fence.origin = fence.layout.clone();
@@ -3762,37 +4048,38 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
 
                 if let Some(idx) = item_idx {
                     let fence = &mut app.fences[index];
-                    fence.search_focused = false;
+                    fence.tabs[fence.active_tab].search_focused = false;
                     if ctrl_down {
-                        if fence.selected.contains(&idx) {
-                            fence.selected.remove(&idx);
+                        if fence.tabs[fence.active_tab].selected.contains(&idx) {
+                            fence.tabs[fence.active_tab].selected.remove(&idx);
                         } else {
-                            fence.selected.insert(idx);
+                            fence.tabs[fence.active_tab].selected.insert(idx);
                         }
                     } else if shift_down {
-                        if let Some(&first_sel) = fence.selected.iter().next() {
+                        if let Some(&first_sel) = fence.tabs[fence.active_tab].selected.iter().next() {
                             let min_i = first_sel.min(idx);
                             let max_i = first_sel.max(idx);
                             for i in min_i..=max_i {
-                                fence.selected.insert(i);
+                                fence.tabs[fence.active_tab].selected.insert(i);
                             }
                         } else {
-                            fence.selected.insert(idx);
+                            fence.tabs[fence.active_tab].selected.insert(idx);
                         }
                     } else {
-                        if !fence.selected.contains(&idx) {
-                            fence.selected.clear();
-                            fence.selected.insert(idx);
+                        if !fence.tabs[fence.active_tab].selected.contains(&idx) {
+                            fence.tabs[fence.active_tab].selected.clear();
+                            fence.tabs[fence.active_tab].selected.insert(idx);
                         }
                     }
                     fence.drag = DragMode::ItemDrag { item_idx: idx, start_x: x, start_y: y };
+                    let _ = SetCapture(hwnd);
                     let _ = app.render(index);
                 } else {
                     // Clic en zona vacia dentro del cuerpo: iniciar seleccion por caja (Rubberband).
                     let fence = &mut app.fences[index];
-                    fence.search_focused = false;
+                    fence.tabs[fence.active_tab].search_focused = false;
                     if !ctrl_down && !shift_down {
-                        fence.selected.clear();
+                        fence.tabs[fence.active_tab].selected.clear();
                     }
                     let fx = x as f32 / fence.scale;
                     let fy = y as f32 / fence.scale;
@@ -3803,7 +4090,48 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 }
                 LRESULT(0)
             }
+            0x02A3 => { // WM_MOUSELEAVE
+                // OLE bombea WM_MOUSELEAVE mientras el cursor sale de la
+                // fence. No renderizar ni tocar el estado durante DoDragDrop.
+                if app.dragging {
+                    return LRESULT(0);
+                }
+                let mut needs_update = false;
+                if app.fences[index].hover != -1 {
+                    app.fences[index].hover = -1;
+                    app.hide_thumb();
+                    needs_update = true;
+                }
+                // Si el menu contextual esta abierto, ignoramos el mouseleave para no plegar la caja.
+                if app.fences[index].is_mouse_over && app.shell_menu.is_none() {
+                    app.fences[index].is_mouse_over = false;
+                    app.start_anim_hover(index, 1); // 1 = collapse
+                    needs_update = true;
+                }
+                if needs_update {
+                    let _ = app.render(index);
+                }
+                LRESULT(0)
+            }
             WM_MOUSEMOVE => {
+                // Durante el drag OLE los mensajes de raton pertenecen al
+                // bucle modal de OLE, no al estado interactivo de la fence.
+                if app.dragging {
+                    return LRESULT(0);
+                }
+                if !app.fences[index].is_mouse_over {
+                    app.fences[index].is_mouse_over = true;
+                    if app.fences[index].layout.collapsed {
+                        app.start_anim_hover(index, 2); // 2 = expand
+                    }
+                    let mut track = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    unsafe { let _ = TrackMouseEvent(&mut track); }
+                }
                 let (x, y) = point_of(lparam);
                 let mode = app.fences[index].drag.clone();
 
@@ -3812,13 +4140,26 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                         let dx = (x - start_x).abs();
                         let dy = (y - start_y).abs();
                         if dx > 4 || dy > 4 {
-                            let paths: Vec<PathBuf> = app.fences[index].selected.iter().filter_map(|&i| app.fences[index].content.items.get(i).map(|item| item.path.clone())).collect();
-                            let first_path = paths.first().cloned();
-                            app.fences[index].drag = DragMode::ManualDrag { paths, source_fence: index };
-                            SetCapture(hwnd);
-                            SetCursor(LoadCursorW(None, IDC_HAND).unwrap_or_default());
-                            if let Some(ref p) = first_path {
-                                app.show_drag_image(p);
+                            let active = app.fences[index].active_tab;
+                            let tab = &app.fences[index].tabs[active];
+                            let paths: Vec<PathBuf> = tab.selected.iter().filter_map(|&i| tab.content.items.get(i).map(|item| item.path.clone())).collect();
+                            if !paths.is_empty() {
+                                let _ = ReleaseCapture();
+                                app.fences[index].drag = DragMode::None;
+                                app.dragging = true;
+
+                                start_ole_drag(&paths);
+
+                                if PostMessageW(
+                                    app.controller,
+                                    WM_ZEN_DRAG_DONE,
+                                    WPARAM(0),
+                                    LPARAM(0),
+                                ).is_err() {
+                                    app.dragging = false;
+                                }
+                            } else {
+                                app.fences[index].drag = DragMode::None;
                             }
                             return LRESULT(0);
                         }
@@ -3830,56 +4171,15 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 // Comprobar hover sobre el candado
                 let w_dip = app.fences[index].layout.width as f32 / app.fences[index].scale;
                 let theme_header = (app.theme.header * app.fences[index].scale) as i32;
-                let item_cnt = app.fences[index].content.items.len();
+                let item_cnt = app.fences[index].tab_mut().content.items.len();
                 let lr = lock_rect(w_dip, &app.theme, app.theme.show_counter, item_cnt);
+                
                 let in_lock = y <= theme_header
                     && x >= (lr.left * app.fences[index].scale) as i32
                     && x <= (lr.right * app.fences[index].scale) as i32;
                 if in_lock != app.fences[index].hover_lock {
                     app.fences[index].hover_lock = in_lock;
                     let _ = app.render(index);
-                }
-
-                // Durante drag manual: actualizar miniatura + highlight de subcarpeta destino.
-                if let DragMode::ManualDrag { source_fence, .. } = mode {
-                    app.update_drag_image_position();
-                    // Detectar si el cursor esta sobre una subcarpeta de otra caja.
-                    let mut cursor = POINT::default();
-                    let _ = GetCursorPos(&mut cursor);
-                    let mut new_target: Option<(usize, i32)> = None;
-                    for (fi, f) in app.fences.iter().enumerate() {
-                        if fi == source_fence { continue; }
-                        let fx = f.layout.x;
-                        let fy = f.layout.y;
-                        let fw = f.layout.width;
-                        let fh = f.visible_height(&app.theme);
-                        if cursor.x >= fx && cursor.x < fx + fw && cursor.y >= fy && cursor.y < fy + fh {
-                            let local_x = cursor.x - fx;
-                            let local_y = cursor.y - fy;
-                            if let Some(idx) = f.item_at(&app.theme, local_x, local_y) {
-                                if let Some(item) = f.content.items.get(idx) {
-                                    if item.is_dir {
-                                        new_target = Some((fi, idx as i32));
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                    }
-                    // Aplicar o limpiar el highlight.
-                    if new_target != app.drag_hover_target {
-                        // Limpiar anterior.
-                        if let Some((prev_fi, _)) = app.drag_hover_target {
-                            app.fences[prev_fi].hover = -1;
-                            let _ = app.render(prev_fi);
-                        }
-                        // Aplicar nuevo.
-                        if let Some((fi, item_idx)) = new_target {
-                            app.fences[fi].hover = item_idx;
-                            let _ = app.render(fi);
-                        }
-                        app.drag_hover_target = new_target;
-                    }
                 }
 
                 if mode == DragMode::None {
@@ -3891,11 +4191,11 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                         // Miniatura emergente para imagenes.
                         if let Some(idx) = hover_idx {
                             let is_img = {
-                                let item = &app.fences[index].content.items[idx];
+                                let item = &app.fences[index].tab_mut().content.items[idx];
                                 rules::is_image(&item.ext) && item.path.is_file()
                             };
                             if is_img {
-                                let path = app.fences[index].content.items[idx].path.clone();
+                                let path = app.fences[index].tab_mut().content.items[idx].path.clone();
                                 app.show_thumb(&path);
                             } else {
                                 app.hide_thumb();
@@ -3903,13 +4203,7 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                         } else {
                             app.hide_thumb();
                         }
-                        let mut track = TRACKMOUSEEVENT {
-                            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                            dwFlags: TME_LEAVE,
-                            hwndTrack: hwnd,
-                            dwHoverTime: 0,
-                        };
-                        let _ = TrackMouseEvent(&mut track);
+
                         let _ = app.render(index);
                     }
                     return LRESULT(0);
@@ -3934,22 +4228,25 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                         let cell = theme.grid_item_size.max(48.0);
                         let w_dip = fence.layout.width as f32 / scale;
                         let grid_cols = ((w_dip - pad) / cell).floor().max(1.0) as usize;
-                        let scroll_off = fence.scroll as f32 * cell;
-                        for (idx, _) in fence.content.items.iter().enumerate() {
+                        let scroll_off = fence.tabs[fence.active_tab].smooth_scroll * cell;
+                        let items_len = fence.tabs[fence.active_tab].content.items.len();
+                        for idx in 0..items_len {
                             let row = idx / grid_cols;
                             let col = idx % grid_cols;
                             let cx = pad * 0.5 + col as f32 * cell;
-                            let cy_val = theme.header + (row as f32 * cell) - scroll_off;
+                            let cy_val = fence.header_h(theme) + (row as f32 * cell) - scroll_off;
                             if cx + cell >= x1 && cx <= x2 && cy_val + cell >= y1 && cy_val <= y2 {
-                                fence.selected.insert(idx);
+                                fence.tabs[fence.active_tab].selected.insert(idx);
                             }
                         }
                     } else {
-                        for (idx, _) in fence.content.items.iter().enumerate() {
-                            let top = theme.header + (idx as f32 - fence.scroll as f32) * theme.row;
+                        let items_len = fence.tabs[fence.active_tab].content.items.len();
+                        let scroll = fence.tabs[fence.active_tab].scroll;
+                        for idx in 0..items_len {
+                            let top = theme.header + (idx as f32 - scroll as f32) * theme.row;
                             let bottom = top + theme.row;
                             if top <= y2 && bottom >= y1 {
-                                fence.selected.insert(idx);
+                                fence.tabs[fence.active_tab].selected.insert(idx);
                             }
                         }
                     }
@@ -4014,55 +4311,15 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
-                let drag_state = app.fences[index].drag.clone();
-                if let DragMode::ItemDrag { .. } = drag_state {
-                    app.fences[index].drag = DragMode::None;
+                // DoDragDrop consume el boton; no dejar que la reentrada
+                // procese este WM_LBUTTONUP como un drag local.
+                if app.dragging {
                     return LRESULT(0);
                 }
-                if let DragMode::ManualDrag { paths, source_fence } = drag_state {
+                let drag_state = app.fences[index].drag.clone();
+                if let DragMode::ItemDrag { .. } = drag_state {
                     let _ = ReleaseCapture();
-                    // Limpiar highlight de subcarpeta destino.
-                    app.clear_drag_hover();
-                    SetCursor(LoadCursorW(None, IDC_ARROW).unwrap_or_default());
-                    app.hide_drag_image();
                     app.fences[index].drag = DragMode::None;
-                    let mut pt = POINT::default();
-                    GetCursorPos(&mut pt).expect("GetCursorPos");
-                    // Comprobar si el cursor esta sobre OTRA caja (no la de origen).
-                    // Recolectamos (fence_idx, optional_subfolder) dentro del
-                    // bucle y actuamos fuera para no chocar con el borrow checker.
-                    let mut dropped_on_other = false;
-                    let mut drop_target: Option<(usize, Option<(PathBuf, String)>)> = None;
-                    for (fi, f) in app.fences.iter().enumerate() {
-                        if fi == source_fence { continue; }
-                        let fx = f.layout.x;
-                        let fy = f.layout.y;
-                        let fw = f.layout.width;
-                        let fh = f.visible_height(&app.theme);
-                        if pt.x >= fx && pt.x < fx + fw && pt.y >= fy && pt.y < fy + fh {
-                            let local_x = pt.x - fx;
-                            let local_y = pt.y - fy;
-                            let subfolder = f.item_at(&app.theme, local_x, local_y)
-                                .and_then(|idx| f.content.items.get(idx))
-                                .filter(|item| item.is_dir)
-                                .map(|item| (item.path.clone(), item.name.clone()));
-                            drop_target = Some((fi, subfolder));
-                            break;
-                        }
-                    }
-                    if let Some((fi, subfolder)) = drop_target {
-                        dropped_on_other = true;
-                        if let Some((dest_path, dest_name)) = subfolder {
-                            let _ = app.move_paths_to(&dest_path, &dest_name, paths.clone());
-                        } else {
-                            let _ = app.accept_drop(fi, paths.clone());
-                        }
-                    }
-                    if !dropped_on_other {
-                        app.drop_to_desktop(paths);
-                    }
-                    let _ = app.render(index);
-                    let _ = SetTimer(app.controller, TIMER_PERSIST, 800, None);
                     return LRESULT(0);
                 }
                 if let DragMode::Select { .. } = drag_state {
@@ -4099,10 +4356,10 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
             }
             WM_LBUTTONDBLCLK => {
                 let (x, y) = point_of(lparam);
-                let header = (app.theme.header * app.fences[index].scale) as i32;
+                let header = (app.fences[index].header_h(&app.theme) * app.fences[index].scale) as i32;
                 let w_dip = app.fences[index].layout.width as f32 / app.fences[index].scale;
                 let s = app.fences[index].scale;
-                let item_cnt = app.fences[index].content.items.len();
+                let item_cnt = app.fences[index].tab_mut().content.items.len();
                 let lr = lock_rect(w_dip, &app.theme, app.theme.show_counter, item_cnt);
                 let in_lock = y <= header
                     && x >= (lr.left * s) as i32
@@ -4113,10 +4370,11 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 if in_lock || in_search {
                     return LRESULT(0);
                 }
-                if y <= header {
+                let theme_header = (app.theme.header * s) as i32;
+                if y <= theme_header {
                     app.start_collapse_anim(index);
                 } else if let Some(item) = app.fences[index].item_at(&app.theme, x, y) {
-                    let path = app.fences[index].content.items[item].path.clone();
+                    let path = app.fences[index].tab_mut().content.items[item].path.clone();
                     app.open_item(&path);
                 }
                 LRESULT(0)
@@ -4128,47 +4386,47 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                     let w_dip = app.fences[index].layout.width as f32 / app.fences[index].scale;
                     let pad = app.theme.padding;
                     let grid_cols = ((w_dip * app.fences[index].scale - pad * 2.0) / cell).floor().max(1.0) as usize;
-                    let grid_rows = (app.fences[index].content.items.len() + grid_cols - 1) / grid_cols;
+                    let grid_rows = (app.fences[index].tab_mut().content.items.len() + grid_cols - 1) / grid_cols;
                     let h_dip = app.fences[index].visible_height(&app.theme) as f32 / app.fences[index].scale;
-                    let visible_rows = ((h_dip * app.fences[index].scale - app.theme.header * app.fences[index].scale) / cell).floor().max(1.0) as usize;
+                    let visible_rows = ((h_dip * app.fences[index].scale - app.fences[index].header_h(&app.theme) * app.fences[index].scale) / cell).floor().max(1.0) as usize;
                     grid_rows.saturating_sub(visible_rows) as i32
                 } else {
                     app.fences[index].max_scroll(&app.theme)
                 };
-                let next = (app.fences[index].scroll - delta * 3).clamp(0, max);
-                if next != app.fences[index].scroll {
-                    app.fences[index].scroll = next;
-                    let _ = app.render(index);
+                let next = (app.fences[index].tab_mut().scroll - delta * 3).clamp(0, max);
+                if next != app.fences[index].tab_mut().scroll {
+                    app.fences[index].tab_mut().scroll = next;
+                    unsafe { let _ = SetTimer(app.controller, TIMER_SCROLL, 16, None); }
                 }
                 LRESULT(0)
             }
             WM_CHAR => {
                 let ch_val = wparam.0 as u32;
                 // Modo renombrado: el texto se acumula en rename_text.
-                if app.fences[index].rename_item.is_some() {
+                if app.fences[index].tab_mut().rename_item.is_some() {
                     if ch_val >= 32 && ch_val != 127 {
                         if let Some(ch) = char::from_u32(ch_val) {
-                            app.fences[index].rename_text.push(ch);
+                            app.fences[index].tab_mut().rename_text.push(ch);
                             let _ = app.render(index);
                         }
                     }
                     return LRESULT(0);
                 }
                 if ch_val == 0x08 { // Backspace
-                    if !app.fences[index].search_text.is_empty() {
-                        app.fences[index].search_text.pop();
-                        app.fences[index].scroll = 0;
+                    if !app.fences[index].tab_mut().search_text.is_empty() {
+                        app.fences[index].tab_mut().search_text.pop();
+                        app.fences[index].tab_mut().scroll = 0;
                         let _ = app.render(index);
                     }
                 } else if ch_val == 0x1B { // Escape
-                    app.fences[index].search_text.clear();
-                    app.fences[index].search_focused = false;
-                    app.fences[index].scroll = 0;
+                    app.fences[index].tab_mut().search_text.clear();
+                    app.fences[index].tab_mut().search_focused = false;
+                    app.fences[index].tab_mut().scroll = 0;
                     let _ = app.render(index);
                 } else if ch_val >= 32 && ch_val != 127 {
                     if let Some(ch) = char::from_u32(ch_val) {
-                        app.fences[index].search_text.push(ch);
-                        app.fences[index].scroll = 0;
+                        app.fences[index].tab_mut().search_text.push(ch);
+                        app.fences[index].tab_mut().scroll = 0;
                         let _ = app.render(index);
                     }
                 }
@@ -4177,12 +4435,12 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
             WM_KEYDOWN => {
                 let vk = wparam.0 as u32;
                 // Modo renombrado: Enter/Escape/Backspace gestionan el texto.
-                if app.fences[index].rename_item.is_some() {
+                if app.fences[index].tab_mut().rename_item.is_some() {
                     match vk {
                         0x0D => app.commit_rename(index),
                         0x1B => app.cancel_rename(index),
                         0x08 => {
-                            app.fences[index].rename_text.pop();
+                            app.fences[index].tab_mut().rename_text.pop();
                             let _ = app.render(index);
                         }
                         _ => {}
@@ -4193,30 +4451,34 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 match vk {
                     0x41 if ctrl => { // Ctrl + A (Seleccionar todo)
                         let fence = &mut app.fences[index];
-                        fence.selected = (0..fence.content.items.len()).collect();
+                        fence.tabs[fence.active_tab].selected = (0..fence.tabs[fence.active_tab].content.items.len()).collect();
                         let _ = app.render(index);
                     }
                     0x46 if ctrl => { // Ctrl + F (Foco en el buscador)
                         let fence = &mut app.fences[index];
-                        fence.search_focused = true;
+                        fence.tabs[fence.active_tab].search_focused = true;
                         let _ = SetForegroundWindow(hwnd);
                         let _ = SetFocus(hwnd);
                         let _ = app.render(index);
                     }
                     0x2E => { // VK_DELETE (Enviar a la papelera de reciclaje)
-                        let paths: Vec<PathBuf> = app.fences[index].selected.iter()
-                            .filter_map(|&idx| app.fences[index].content.items.get(idx).map(|it| it.path.clone()))
+                        let active = app.fences[index].active_tab;
+                        let tab = &app.fences[index].tabs[active];
+                        let paths: Vec<PathBuf> = tab.selected.iter()
+                            .filter_map(|&idx| tab.content.items.get(idx).map(|it| it.path.clone()))
                             .collect();
                         if !paths.is_empty() {
                             app.delete_to_recycle_bin(hwnd, &paths);
-                            app.fences[index].selected.clear();
+                            app.fences[index].tab_mut().selected.clear();
                             app.refresh_contents();
                         }
                     }
                     0x0D => { // VK_RETURN (Abrir elementos seleccionados)
-                        let fence = &app.fences[index];
-                        let paths: Vec<PathBuf> = fence.selected.iter()
-                            .filter_map(|&idx| fence.content.items.get(idx).map(|it| it.path.clone()))
+                        let fence = &mut app.fences[index];
+                        let active = fence.active_tab;
+                        let tab = &fence.tabs[active];
+                        let paths: Vec<PathBuf> = tab.selected.iter()
+                            .filter_map(|&idx| tab.content.items.get(idx).map(|it| it.path.clone()))
                             .collect();
                         for path in paths {
                             app.open_item(&path);
@@ -4224,31 +4486,31 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                     }
                     0x71 => { // VK_F2 (Renombrar el elemento seleccionado)
                         let target = {
-                            let fence = &app.fences[index];
-                            if fence.rename_item.is_none() && fence.selected.len() == 1 {
-                                fence.selected.iter().next().copied()
+                            let fence = &mut app.fences[index];
+                            if fence.tabs[fence.active_tab].rename_item.is_none() && fence.tabs[fence.active_tab].selected.len() == 1 {
+                                fence.tabs[fence.active_tab].selected.iter().next().copied()
                             } else {
                                 None
                             }
                         };
                         if let Some(item) = target {
-                            if app.fences[index].content.items.get(item).is_some() {
+                            if app.fences[index].tab_mut().content.items.get(item).is_some() {
                                 app.start_rename(index, item);
                             }
                         }
                     }
                     0x08 => { // VK_BACK
-                        if !app.fences[index].search_text.is_empty() {
-                            app.fences[index].search_text.pop();
+                        if !app.fences[index].tab_mut().search_text.is_empty() {
+                            app.fences[index].tab_mut().search_text.pop();
                             let _ = app.render(index);
                         }
                     }
                     0x1B => { // VK_ESCAPE
                         let fence = &mut app.fences[index];
-                        fence.search_text.clear();
-                        fence.search_focused = false;
-                        fence.selected.clear();
-                        fence.scroll = 0;
+                        fence.tabs[fence.active_tab].search_text.clear();
+                        fence.tabs[fence.active_tab].search_focused = false;
+                        fence.tabs[fence.active_tab].selected.clear();
+                        fence.tabs[fence.active_tab].scroll = 0;
                         let _ = app.render(index);
                     }
                     _ => {}
@@ -4259,15 +4521,17 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 let (x, y) = point_of(lparam);
                 if let Some(item) = app.fences[index].item_at(&app.theme, x, y) {
                     let fence = &mut app.fences[index];
-                    if !fence.selected.contains(&item) {
+                    if !fence.tabs[fence.active_tab].selected.contains(&item) {
                         let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u32) & 0x8000 != 0;
                         if !ctrl {
-                            fence.selected.clear();
+                            fence.tabs[fence.active_tab].selected.clear();
                         }
-                        fence.selected.insert(item);
+                        fence.tabs[fence.active_tab].selected.insert(item);
                     }
-                    let paths: Vec<PathBuf> = fence.selected.iter()
-                        .filter_map(|&idx| fence.content.items.get(idx).map(|it| it.path.clone()))
+                    let active = fence.active_tab;
+                    let tab = &fence.tabs[active];
+                    let paths: Vec<PathBuf> = tab.selected.iter()
+                        .filter_map(|&idx| tab.content.items.get(idx).map(|it| it.path.clone()))
                         .collect();
                     if !paths.is_empty() {
                         app.show_shell_menu_for_paths(hwnd, &paths);
@@ -4494,7 +4758,7 @@ fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
     }
 }
 
-fn wide_str(text: &str) -> Vec<u16> {
+pub fn wide_str(text: &str) -> Vec<u16> {
     text.encode_utf16().collect()
 }
 
@@ -5003,3 +5267,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+
+
+include!("dropsource.rs");
+
+
+
+include!("draghelper_test.rs");

@@ -7,6 +7,21 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.1] - 2026-08-12
+
+### Added
+- **Tabbed Fences**: Group multiple fences or rules under tabs within a single floating window. Navigate between tabs with a single click.
+- **Roll-up Fences**: Double click on the title bar of any fence to instantly roll it up, leaving only the title visible to save desktop space.
+- **Smooth Scrolling**: Mouse wheel scrolling on fences with many icons now uses smooth inertia-based interpolation instead of chunky steps.
+- **F2 Rename**: Press `F2` on a selected item to directly rename it in place.
+
+### Fixed
+- **Drag & Drop Flicker**: Drastically reduced flickering when dragging items in and out of fences by updating the UI in-place instead of rebuilding it.
+- **Drag & Drop Crash**: Fixed a crash (`0xc0000005` access violation) when dragging items out to Explorer that occurred during the OLE modal loop.
+- **Animation Glitches**: Fixed several issues with hover animations getting stuck or snapping instantly to the end state, including the `TrackMouseEvent` bugs and Direct2D visual clipping conflicts.
+
+---
+
 ## [1.0.0] - 2026-08-12
 
 ### Initial Release
@@ -52,4 +67,5 @@ desktop organizer built from scratch in Rust.
 
 ---
 
+[1.0.1]: https://github.com/jaimitus/ZenDesktop/releases/tag/v1.0.1
 [1.0.0]: https://github.com/jaimitus/ZenDesktop/releases/tag/v1.0.0

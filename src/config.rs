@@ -261,6 +261,8 @@ pub struct FenceLayout {
     /// Orden de los items: "name" | "size" | "type" | "modified" | "custom"
     /// None => hereda el orden global de `appearance.sort_by`.
     pub sort_by: Option<String>,
+    pub group_title: Option<String>,
+    pub tabs: Vec<String>,
 }
 
 /// Cadena corta de tamano fijo: evita una asignacion por caja y mantiene
@@ -323,6 +325,8 @@ impl Default for FenceLayout {
             hidden: false,
             locked: false,
             sort_by: None,
+            tabs: Vec::new(),
+            group_title: None,
         }
     }
 }
@@ -627,10 +631,6 @@ impl Config {
     }
 
 
-
-    pub fn layout_of(&self, id: &str) -> Option<FenceLayout> {
-        self.fences.iter().find(|f| f.id.as_str() == id).cloned()
-    }
 
     pub fn set_layout(&mut self, layout: FenceLayout) {
         match self

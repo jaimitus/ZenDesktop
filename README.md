@@ -13,11 +13,14 @@
 ## ✨ Features
 
 - **🪟 Floating translucent fences** — Group desktop files into elegant boxes with real alpha transparency
-- **🎯 Smart Drag & Drop** — Drag files between fences, to subfolders, or to the desktop with visual feedback (highlight + icon)
+- **📑 Tabbed fences** — Group multiple fences under tabs within a single window to save desktop space
+- **🔼 Roll-up fences** — Double click a fence's title bar to instantly roll it up, leaving only the title visible
+- **🎯 Smart Drag & Drop** — Drag files between fences, to subfolders, or to the desktop with visual feedback
+- **📝 F2 Rename** — Press F2 on any item to directly rename it in place
 - **🤖 Auto-organization** — Rules by extension, name, pattern, or local AI (Ollama) for automatic file classification
 - **📦 Explorer drop** — Drop files from any folder directly into fences (native OLE drag & drop)
 - **🔍 Integrated search** — Filter files within each fence in real time
-- **📐 Grid + List view** — Grid or list mode, sortable by name, size, type, or date
+- **📐 Grid + List view** — Grid or list mode, sortable by name, size, type, or date (with smooth scrolling)
 - **🎨 Full customization** — Colors, borders, corner radius, font, icons, item counter
 - **📂 Multi-desktop support** — Public desktop, OneDrive, and any additional folders
 - **⏱️ Auto-archiving** — Move old files to an archive folder with configurable age
@@ -31,29 +34,29 @@
 
 | Format | File | Best for |
 |---|---|---|
-| 🖥️ **Installer (EXE)** | `ZenDesktop-1.0.0-setup.exe` | Most users — wizard installer with Start Menu shortcut |
-| 📦 **Installer (MSI)** | `ZenDesktop-v1.0.0-x64.msi` | Enterprises / system-wide installs with clean uninstall |
-| 💾 **Portable** | `ZenDesktop-v1.0.0-portable.zip` | USB drives, custom paths, no installation |
+| 🖥️ **Installer (EXE)** | `ZenDesktop-1.0.1-setup.exe` | Most users — wizard installer with Start Menu shortcut |
+| 📦 **Installer (MSI)** | `ZenDesktop-v1.0.1-x64.msi` | Enterprises / system-wide installs with clean uninstall |
+| 💾 **Portable** | `ZenDesktop-v1.0.1-portable.zip` | USB drives, custom paths, no installation |
 
 All downloads are available at **[Releases](https://github.com/jaimitus/ZenDesktop/releases)**.
 
 ### 🖥️ EXE Installer (recommended)
 
-1. Download `ZenDesktop-1.0.0-setup.exe` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+1. Download `ZenDesktop-1.0.1-setup.exe` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Run the installer — accepts the license, installs to `Program Files\ZenDesktop`
 3. Start Menu shortcut is created automatically
 4. Uninstall via Windows Settings → Apps, or re-run the installer
 
 ### 📦 MSI Installer
 
-1. Download `ZenDesktop-v1.0.0-x64.msi` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+1. Download `ZenDesktop-v1.0.1-x64.msi` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Run the installer — it installs to `Program Files\ZenDesktop` for all users
 3. Start Menu shortcut is created automatically
 4. Uninstall via Windows Settings → Apps, or re-run the MSI
 
 ### 💾 Portable (for USB drives / custom paths)
 
-1. Download `ZenDesktop-v1.0.0-portable.zip` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+1. Download `ZenDesktop-v1.0.1-portable.zip` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Extract to any folder (e.g. `%APPDATA%\ZenDesktop\`)
 3. Run `ZenDesktop.exe` — it minimizes to the system tray
 4. **Optional**: Add a shortcut to `shell:startup` for auto-start with Windows
