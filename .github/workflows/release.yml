@@ -26,11 +26,10 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            src/code/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('src/code/Cargo.lock') }}
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
 
       - name: Build release
-        working-directory: src/code
         run: cargo build --release
 
       - name: Get version from tag
@@ -43,8 +42,8 @@ jobs:
         run: |
           mkdir -p release
           V="${{ steps.version.outputs.VERSION }}"
-          cp src/code/target/release/zendesktop.exe "release/ZenDesktop-v${V}.exe"
-          cp src/code/target/release/zendesktop.exe release/ZenDesktop.exe
+          cp target/release/zendesktop.exe "release/ZenDesktop-v${V}.exe"
+          cp target/release/zendesktop.exe release/ZenDesktop.exe
           cp LICENSE release/
           cp README.md release/
           cd release
@@ -59,12 +58,11 @@ jobs:
         run: |
           V="${{ steps.version.outputs.VERSION }}"
           mkdir -p installer/staging
-          cp src/code/target/release/zendesktop.exe installer/staging/ZenDesktop.exe
-          cp src/code/assets/icons/zendesktop.ico installer/staging/zendesktop.ico
+          cp target/release/zendesktop.exe installer/staging/ZenDesktop.exe
+          cp assets/icons/zendesktop.ico installer/staging/zendesktop.ico
           cp LICENSE installer/staging/LICENSE
           cp README.md installer/staging/README.md
           cd installer
-          # Set version in the .wxs before building
           sed -i "s/Version=\"1.0.0\"/Version=\"${V}\"/" zendesktop.wxs 2>/dev/null || \
             powershell -Command "(Get-Content zendesktop.wxs) -replace 'Version=\"[0-9.]+\"', 'Version=\"$env:V\"' | Set-Content zendesktop.wxs"
           ~/.dotnet/tools/wix build -bf staging zendesktop.wxs -o "../release/ZenDesktop-v${V}-x64.msi"

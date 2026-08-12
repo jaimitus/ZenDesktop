@@ -7,8 +7,8 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 $Target = "$Root\target\release"
-$ReleaseDir = "$Root\..\..\release\$Version"
-$InstallerDir = "$Root\..\..\installer"
+$ReleaseDir = "$Root\release\$Version"
+$InstallerDir = "$Root\installer"
 
 Write-Host "=== ZenDesktop Release Builder v$Version ===" -ForegroundColor Cyan
 
@@ -34,8 +34,8 @@ Copy-Item "$Target\zendesktop.exe" "$ReleaseDir\ZenDesktop.exe" -Force
 $zipDir = "$ReleaseDir\portable-tmp"
 New-Item -ItemType Directory -Force -Path $zipDir | Out-Null
 Copy-Item "$Target\zendesktop.exe" "$zipDir\ZenDesktop.exe" -Force
-Copy-Item "$Root\..\..\LICENSE" "$zipDir\" -Force
-Copy-Item "$Root\..\..\README.md" "$zipDir\" -Force
+Copy-Item "$Root\LICENSE" "$zipDir\" -Force
+Copy-Item "$Root\README.md" "$zipDir\" -Force
 Compress-Archive -Path "$zipDir\*" `
     -DestinationPath "$ReleaseDir\ZenDesktop-v$Version-portable.zip" -Force
 Remove-Item -Recurse -Force $zipDir
@@ -60,8 +60,8 @@ if ($wixExe) {
     New-Item -ItemType Directory -Force -Path $staging | Out-Null
     Copy-Item "$Target\zendesktop.exe" "$staging\ZenDesktop.exe" -Force
     Copy-Item "$Root\assets\icons\zendesktop.ico" "$staging\zendesktop.ico" -Force
-    Copy-Item "$Root\..\..\LICENSE" "$staging\LICENSE" -Force
-    Copy-Item "$Root\..\..\README.md" "$staging\README.md" -Force
+    Copy-Item "$Root\LICENSE" "$staging\LICENSE" -Force
+    Copy-Item "$Root\README.md" "$staging\README.md" -Force
 
     # Set version in .wxs
     $wxsContent = Get-Content "$InstallerDir\zendesktop.wxs" -Raw

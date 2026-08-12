@@ -49,7 +49,7 @@
 
 ```bash
 git clone https://github.com/jaimitus/ZenDesktop.git
-cd ZenDesktop/src/code
+cd ZenDesktop
 cargo build --release
 # Binary at target/release/zendesktop.exe
 ```
@@ -100,21 +100,27 @@ enabled = true
 ## 📁 Project Structure
 
 ```
-src/code/
-├── Cargo.toml          # Dependencies & release profile
-├── build.rs            # Windows resource compiler (.rc)
+├── Cargo.toml             # Dependencies & release profile
+├── build.rs               # Windows resource compiler (.rc)
 ├── assets/
-│   └── zendesktop.rc   # EXE icon & metadata
-└── src/
-    ├── main.rs         # Entry point & message loop
-    ├── config.rs       # config.toml load/save (serde)
-    ├── rules.rs        # Rule engine & organization
-    ├── ui.rs           # Windows, rendering, drag & drop
-    ├── settings.rs     # Settings window
-    ├── watcher.rs      # File system watcher
-    ├── ai.rs           # HTTP client for Ollama
-    ├── updater.rs      # Auto-update via GitHub Releases
-    └── i18n.rs         # Translations (6 languages)
+│   ├── zendesktop.rc      # EXE icon & metadata
+│   └── icons/             # App & tray icons
+├── src/
+│   ├── main.rs            # Entry point & message loop
+│   ├── config.rs          # config.toml load/save (serde)
+│   ├── rules.rs           # Rule engine & organization
+│   ├── ui.rs              # Windows, rendering, drag & drop
+│   ├── settings.rs        # Settings window
+│   ├── watcher.rs         # File system watcher
+│   ├── ai.rs              # HTTP client for Ollama
+│   ├── updater.rs         # Auto-update via GitHub Releases
+│   └── i18n.rs            # Translations (6 languages)
+├── scripts/
+│   └── build-release.ps1  # Local release builder
+├── installer/
+│   └── zendesktop.wxs     # WiX v4 MSI installer source
+└── .github/workflows/
+    └── release.yml        # CI/CD release automation
 ```
 
 ## 🤝 Contributing
