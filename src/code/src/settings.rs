@@ -2099,7 +2099,7 @@ impl Settings {
     fn check_for_updates(&self) {
         match crate::updater::check_update() {
             crate::updater::UpdateStatus::UpToDate => {
-                let msg = "ZenDesktop esta actualizado.";
+                let msg = "ZenDesktop is up to date.";
                 unsafe {
                     let body = crate::config::wide(msg);
                     let title = crate::config::wide("ZenDesktop :: Updates");
@@ -2107,7 +2107,7 @@ impl Settings {
                 }
             }
             crate::updater::UpdateStatus::UpdateAvailable { version, size, url: _ } => {
-                let msg = format!("Nueva version disponible: v{}\nTamano: {} KB\n\nUsa el boton 'Download & Install' para actualizar.", version, size / 1024);
+                let msg = format!("New version available: v{}\nSize: {} KB\n\nClick 'Download & Install' to update.", version, size / 1024);
                 unsafe {
                     let body = crate::config::wide(&msg);
                     let title = crate::config::wide("ZenDesktop :: Update Available");
@@ -2115,7 +2115,7 @@ impl Settings {
                 }
             }
             crate::updater::UpdateStatus::Error(e) => {
-                let msg = format!("Error al comprobar actualizaciones:\n{}", e);
+                let msg = format!("Update check failed:\n{}", e);
                 unsafe {
                     let body = crate::config::wide(&msg);
                     let title = crate::config::wide("ZenDesktop :: Update Error");
@@ -2130,20 +2130,19 @@ impl Settings {
         match crate::updater::check_update() {
             crate::updater::UpdateStatus::UpdateAvailable { url, .. } => {
                 match crate::updater::download_and_install(&url) {
-                    Ok(path) => {
-                        let msg = format!("Actualizacion descargada.\n\nLa aplicacion se reiniciara.\nNueva ruta: {}", path.display());
+                    Ok(_path) => {
+                        let msg = "Update installed successfully!\n\nThe new version is now running. The old window will close.";
                         unsafe {
-                            let body = crate::config::wide(&msg);
-                            let title = crate::config::wide("ZenDesktop :: Update Ready");
+                            let body = crate::config::wide(msg);
+                            let title = crate::config::wide("ZenDesktop :: Update Complete");
                             MessageBoxW(self.hwnd, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
                         }
-                        // Cerrar la app para que el usuario la reinicie manualmente
                         unsafe {
                             let _ = PostMessageW(self.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
                         }
                     }
                     Err(e) => {
-                        let msg = format!("Error al descargar:\n{}", e);
+                        let msg = format!("Download failed:\n{}", e);
                         unsafe {
                             let body = crate::config::wide(&msg);
                             let title = crate::config::wide("ZenDesktop :: Download Error");
@@ -2154,7 +2153,7 @@ impl Settings {
             }
             crate::updater::UpdateStatus::UpToDate => {
                 unsafe {
-                    let body = crate::config::wide("Ya tienes la ultima version.");
+                    let body = crate::config::wide("You already have the latest version.");
                     let title = crate::config::wide("ZenDesktop :: Updates");
                     MessageBoxW(self.hwnd, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
                 }

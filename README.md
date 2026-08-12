@@ -29,8 +29,11 @@
 
 ### Portable (recommended)
 1. Download `ZenDesktop.exe` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
-2. Run it — it minimizes to the system tray
-3. Config is saved to `%APPDATA%\ZenDesktop\config.toml`
+2. Place it in a permanent location (e.g. `%APPDATA%\ZenDesktop\`)
+3. Run it — it minimizes to the system tray
+4. **Optional**: Add a shortcut to `shell:startup` for auto-start with Windows
+
+> 💡 **Auto-update** works with the portable version too. When you click "Download & Install" in Settings → Updates, the new version replaces the current .exe and restarts automatically.
 
 ### From source
 ```bash

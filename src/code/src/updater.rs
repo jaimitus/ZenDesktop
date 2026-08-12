@@ -72,8 +72,8 @@ pub fn check_update() -> UpdateStatus {
     }
 }
 
-/// Descarga e instala la actualizacion.
-/// Devuelve la ruta al nuevo ejecutable.
+/// Downloads and installs the update, then auto-restarts the app.
+/// Returns the path to the new executable.
 pub fn download_and_install(url: &str) -> Result<PathBuf, String> {
     let current = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let backup = current.with_extension("exe.bak");
@@ -109,6 +109,9 @@ pub fn download_and_install(url: &str) -> Result<PathBuf, String> {
 
     // Limpiar backup
     let _ = std::fs::remove_file(&backup);
+
+    // Auto-restart the new exe before this process exits.
+    let _ = std::process::Command::new(&current).spawn();
 
     Ok(current)
 }
