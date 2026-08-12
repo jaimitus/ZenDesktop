@@ -62,8 +62,7 @@
 
     <!-- Desktop shortcut (optional, off by default) -->
     <StandardDirectory Id="DesktopFolder">
-      <Component Id="DesktopShortcut" Guid="*">
-        <Condition>INSTALLDESKTOPSHORTCUT</Condition>
+      <Component Id="DesktopShortcut" Guid="*" Condition="INSTALLDESKTOPSHORTCUT">
         <Shortcut Id="DesktopZenShortcut"
                   Name="ZenDesktop"
                   Description="Ultra-lightweight desktop organizer"
