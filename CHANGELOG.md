@@ -7,6 +7,12 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.7] - 2026-08-12
+
+### Changed
+- Test release to verify the end-to-end automatic update flow from an
+  installed build (1.0.6 -> 1.0.7, including the UAC elevation path).
+
 ## [1.0.6] - 2026-08-12
 
 ### Changed

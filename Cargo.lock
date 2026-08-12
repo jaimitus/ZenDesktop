@@ -1187,7 +1187,7 @@ dependencies = [
 
 [[package]]
 name = "zendesktop"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "ed25519-dalek",
  "embed-resource",
