@@ -1,53 +1,57 @@
 # Changelog
 
-Todas las versiones notables de ZenDesktop están documentadas aquí.
+All notable changes to ZenDesktop are documented here.
 
-El formato sigue [Keep a Changelog](https://keepachangelog.com/es/1.0.0/),
-y el versionado sigue [SemVer](https://semver.org/lang/es/).
+Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and versioning follows [SemVer](https://semver.org/).
 
 ---
 
 ## [1.0.0] - 2026-08-12
 
-### 🎉 Primera versión estable
+### 🎉 First stable release
 
-Tras meses de desarrollo, ZenDesktop 1.0.0 está listo para producción.
+After months of development, ZenDesktop 1.0.0 is production-ready.
 
-### ✨ Funcionalidades
+### ✨ Features
 
-- **Cajas flotantes translúcidas** con renderizado Direct2D + DirectWrite
-- **Drag & Drop manual** entre cajas, subcarpetas y al escritorio
-- **Highlight visual** al arrastrar sobre subcarpetas destino
-- **Drop desde Explorer** vía OLE `IDropTarget` (RegisterDragDrop)
-- **Organización automática** por reglas (extensión, nombre, patrón)
-- **Clasificación con IA** vía Ollama (local)
-- **Modo Zen** con doble clic en escritorio o `Ctrl+Alt+Z`
-- **6 idiomas**: Español, Inglés, Alemán, Francés, Portugués, Italiano
-- **Toast notifications** con icono contextual (🟢 verde drops, 🔵 azul organize)
-- **Búsqueda integrada** en cada caja
-- **Modo cuadrícula** y lista
-- **Ordenación** por nombre, tamaño, tipo, fecha o personalizada
-- **Temas** personalizables: colores, bordes, tipografía, iconos
-- **Archivado automático** por antigüedad
-- **Soporte multi-escritorio** (OneDrive, público, etc.)
-- **Bandera del sistema** con menú contextual
-- **Binario ultraligero**: ~780 KB, ~4 MB RAM en reposo
+- **Floating translucent fences** with Direct2D + DirectWrite rendering
+- **Manual Drag & Drop** between fences, subfolders, and to the desktop
+- **Visual highlight** when dragging over target subfolders
+- **Explorer drop** via OLE `IDropTarget` (RegisterDragDrop)
+- **Auto-organization** by rules (extension, name, pattern)
+- **AI classification** via Ollama (local)
+- **Zen Mode** with double-click on desktop or `Ctrl+Alt+Z`
+- **6 languages**: English, Spanish, German, French, Portuguese, Italian
+- **Toast notifications** with contextual icon (🟢 green for drops, 🔵 blue for organize)
+- **Integrated search** in each fence
+- **Grid and list** view modes
+- **Sorting** by name, size, type, date, or custom
+- **Customizable themes**: colors, borders, typography, icons
+- **Auto-archiving** by file age
+- **Multi-desktop support** (OneDrive, Public, etc.)
+- **System tray** with context menu
+- **Ultralight binary**: ~780 KB, ~4 MB RAM idle
+- **Auto-update** via GitHub Releases API
+- **6-language i18n** with static translation system
 
-### 🔧 Mejoras
+### 🔧 Improvements
 
-- Toast con fuente GDI `DrawTextW` para soporte Unicode completo
-- Ancho del toast calculado dinámicamente con `GetTextExtentPoint32W`
-- Icono de checkmark verde en toast de drops
-- Código muerto eliminado (COM drag, bitmap font, imports)
-- 0 warnings de compilación
+- Toast uses GDI `DrawTextW` for full Unicode support
+- Toast width dynamically measured with `GetTextExtentPoint32W`
+- Green checkmark icon on drop toasts
+- Blue icon for organization toasts
+- Dead code removed (COM drag fallback, bitmap font, unused imports)
+- Zero compiler warnings
 
-### 🐛 Correcciones
+### 🐛 Fixes
 
-- Crash al hacer drag solucionado (drag manual sin COM)
-- Archivos devueltos al escritorio no se reorganizan automáticamente
-- Toast vacío solucionado (ahora usa GDI DrawTextW)
-- Cursor cambia a manito + icono de archivo durante el arrastre
-- Código de auto-organize no revierte drops manuales al escritorio
+- Drag crash fixed (manual capture without COM)
+- Desktop drops no longer auto-reorganized
+- Empty toast fixed (now uses GDI DrawTextW)
+- Cursor changes to hand + file icon during drag
+- Auto-organizer no longer reverts manual desktop drops
+- Subfolder detection during drag-and-drop
 
 ---
 
