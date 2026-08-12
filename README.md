@@ -3,6 +3,8 @@
 > Dynamic desktop organizer for Windows. Ultralight, native, and free.
 > A modern open-source alternative to Stardock Fences.
 
+![ZenDesktop](screenshot.png)
+
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -25,20 +27,33 @@
 - **🔔 Toast notifications** — Visual feedback with contextual icons (🟢 drops, 🔵 organization)
 - **🤖 Local AI (Ollama)** — Semantic classification and automatic fence creation via local LLM
 
-## 📥 Installation
+## 📥 Download
 
-### MSI Installer (recommended for most users)
+| Format | File | Best for |
+|---|---|---|
+| 🖥️ **Installer (EXE)** | `ZenDesktop-1.0.0-setup.exe` | Most users — wizard installer with Start Menu shortcut |
+| 📦 **Installer (MSI)** | `ZenDesktop-v1.0.0-x64.msi` | Enterprises / system-wide installs with clean uninstall |
+| 💾 **Portable** | `ZenDesktop-v1.0.0-portable.zip` | USB drives, custom paths, no installation |
 
-1. Download `ZenDesktop-vX.X.X-x64.msi` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+All downloads are available at **[Releases](https://github.com/jaimitus/ZenDesktop/releases)**.
+
+### 🖥️ EXE Installer (recommended)
+
+1. Download `ZenDesktop-1.0.0-setup.exe` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+2. Run the installer — accepts the license, installs to `Program Files\ZenDesktop`
+3. Start Menu shortcut is created automatically
+4. Uninstall via Windows Settings → Apps, or re-run the installer
+
+### 📦 MSI Installer
+
+1. Download `ZenDesktop-v1.0.0-x64.msi` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Run the installer — it installs to `Program Files\ZenDesktop` for all users
 3. Start Menu shortcut is created automatically
 4. Uninstall via Windows Settings → Apps, or re-run the MSI
 
-> ✅ The MSI installs system-wide, creates shortcuts, and supports clean uninstall.
+### 💾 Portable (for USB drives / custom paths)
 
-### Portable (for USB drives / custom paths)
-
-1. Download `ZenDesktop-vX.X.X-portable.zip` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+1. Download `ZenDesktop-v1.0.0-portable.zip` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Extract to any folder (e.g. `%APPDATA%\ZenDesktop\`)
 3. Run `ZenDesktop.exe` — it minimizes to the system tray
 4. **Optional**: Add a shortcut to `shell:startup` for auto-start with Windows
