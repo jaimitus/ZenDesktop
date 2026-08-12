@@ -7,6 +7,11 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.5] - 2026-08-12
+
+### Changed
+- Release to verify the end-to-end automatic update flow (1.0.4 -> 1.0.5).
+
 ## [1.0.4] - 2026-08-12
 
 ### Fixed
@@ -102,6 +107,7 @@ desktop organizer built from scratch in Rust.
 
 ---
 
+[1.0.5]: https://github.com/jaimitus/ZenDesktop/releases/tag/v1.0.5
 [1.0.4]: https://github.com/jaimitus/ZenDesktop/releases/tag/v1.0.4
 [1.0.3]: https://github.com/jaimitus/ZenDesktop/releases/tag/v1.0.3
 [1.0.2]: https://github.com/jaimitus/ZenDesktop/releases/tag/v1.0.2
