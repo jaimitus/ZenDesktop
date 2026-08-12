@@ -3,7 +3,10 @@
 > Dynamic desktop organizer for Windows. Ultralight, native, and free.
 > A modern open-source alternative to Stardock Fences.
 
-![ZenDesktop](screenshot.png)
+<p align="center">
+  <img src="screenshot.png" alt="ZenDesktop" width="49%">
+  <img src="screenshot-2.png" alt="ZenDesktop" width="49%">
+</p>
 
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue.svg)]()
