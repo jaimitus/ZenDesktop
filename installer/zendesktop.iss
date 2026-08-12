@@ -1,9 +1,9 @@
-﻿; ZenDesktop Installer (Inno Setup)
-; Build: ISCC.exe /DMyAppVersion=1.0.2 zendesktop.iss
-; Produces: ..\release\ZenDesktop-1.0.2-setup.exe
+; ZenDesktop Installer (Inno Setup)
+; Build: ISCC.exe /DMyAppVersion=1.0.3 zendesktop.iss
+; Produces: ..\release\ZenDesktop-1.0.3-setup.exe
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.2"
+  #define MyAppVersion "1.0.3"
 #endif
 
 [Setup]

@@ -191,11 +191,13 @@ pub fn download_and_install(url: &str, sig_url: &str) -> Result<PathBuf, String>
         return Err(format!("Replace error: {e} (original restored)"));
     }
 
-    // Clean up backup
-    let _ = std::fs::remove_file(&backup);
+    // El .bak (el ejecutable antiguo, todavia en uso) no se puede borrar
+    // ahora: lo limpiara el proceso nuevo al arrancar (ver main.rs).
 
-    // Auto-restart the new exe before this process exits
-    let _ = std::process::Command::new(&current).spawn();
+    // Lanza la nueva version en modo "relevo": esperara a que este proceso
+    // cierre y suelte el mutex de instancia unica antes de tomar el control.
+    // El caller debe cerrar la aplicacion inmediatamente despues.
+    let _ = std::process::Command::new(&current).arg("--update-restart").spawn();
 
     Ok(current)
 }

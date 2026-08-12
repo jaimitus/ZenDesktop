@@ -33,15 +33,16 @@ use std::time::Duration;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, WPARAM,
+    WAIT_ABANDONED, WAIT_OBJECT_0,
 };
 use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MessageBoxW, PostMessageW, TranslateMessage,
-    MB_ICONERROR, MB_OK, MSG,
+    DispatchMessageW, FindWindowW, GetMessageW, MessageBoxW, PostMessageW, TranslateMessage,
+    MB_ICONERROR, MB_OK, MSG, WM_CLOSE,
 };
 
 use crate::config::Config;
@@ -67,12 +68,36 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let mutex = unsafe { CreateMutexW(None, true, w!("Local\\ZenDesktop.SingleInstance.v1"))? };
     let already_running = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
     if already_running {
-        // Ya hay una instancia viva: salir en silencio, sin molestar al usuario.
-        unsafe {
-            let _ = CloseHandle(mutex);
+        if update_restart_requested() {
+            // Reinicio tras actualizacion: pedir el cierre de la instancia
+            // anterior y esperar a que libere el mutex antes de continuar.
+            unsafe {
+                if let Ok(old) = FindWindowW(w!("ZenDesktop.Controller"), None) {
+                    if !old.is_invalid() {
+                        let _ = PostMessageW(old, WM_CLOSE, WPARAM(0), LPARAM(0));
+                    }
+                }
+                let wait = WaitForSingleObject(mutex, 8000);
+                // WAIT_OBJECT_0 = liberado; WAIT_ABANDONED = la instancia
+                // anterior murio sin liberar el mutex: ambos nos dejan como
+                // unica instancia viva.
+                if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
+                    let _ = CloseHandle(mutex);
+                    return Ok(ExitCode::SUCCESS);
+                }
+            }
+        } else {
+            // Ya hay una instancia viva: salir en silencio, sin molestar al usuario.
+            unsafe {
+                let _ = CloseHandle(mutex);
+            }
+            return Ok(ExitCode::SUCCESS);
         }
-        return Ok(ExitCode::SUCCESS);
     }
+
+    // Limpia el .bak que dejo una actualizacion previa (ya no esta en uso:
+    // esta ejecucion es la unica instancia viva).
+    cleanup_stale_backup();
 
     // ------------------------------------------------- 2. DPI y 3. inicializacion COM
     unsafe {
@@ -245,4 +270,36 @@ fn assert_thread_contract() {
     fn require_send<T: Send>() {}
     require_send::<WindowTarget>();
     let _: HANDLE = HANDLE::default();
+}
+
+/// True si esta ejecucion es el "relevo" de una actualizacion: se lanzo con
+/// `--update-restart`, o acaba de aparecer un `.bak` junto al ejecutable (las
+/// versiones antiguas no pasaban el argumento, pero si dejan el `.bak`).
+fn update_restart_requested() -> bool {
+    if std::env::args().any(|a| a == "--update-restart") {
+        return true;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let bak = exe.with_extension("exe.bak");
+        if let Ok(meta) = std::fs::metadata(&bak) {
+            if let Ok(modified) = meta.modified() {
+                if let Ok(age) = modified.elapsed() {
+                    return age.as_secs() < 60;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Borra el `.bak` que deja una actualizacion (el ejecutable antiguo). Solo se
+/// llama cuando esta ejecucion ya es la unica instancia, asi que el archivo no
+/// esta en uso y se puede borrar sin riesgo.
+fn cleanup_stale_backup() {
+    if let Ok(exe) = std::env::current_exe() {
+        let bak = exe.with_extension("exe.bak");
+        if bak.exists() {
+            let _ = std::fs::remove_file(&bak);
+        }
+    }
 }

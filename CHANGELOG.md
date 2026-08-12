@@ -7,6 +7,17 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.3] - 2026-08-12
+
+### Fixed
+- **Auto-update now really applies**: after downloading and verifying the new
+  build, ZenDesktop closes the old instance, waits for it to release the
+  single-instance mutex, and hands over to the new version — no more
+  "update installed" that never restarts.
+- **Upgrade path from v1.0.2**: builds already running the previous (broken)
+  updater can still update, since the new binary detects the leftover backup
+  and takes over the running instance.
+
 ## [1.0.2] - 2026-08-12
 
 ### Added
@@ -84,6 +95,7 @@ desktop organizer built from scratch in Rust.
 
 ---
 
+[1.0.3]: https://github.com/jaimitus/ZenDesktop/releases/tag/v1.0.3
 [1.0.2]: https://github.com/jaimitus/ZenDesktop/releases/tag/v1.0.2
 [1.0.1]: https://github.com/jaimitus/ZenDesktop/releases/tag/v1.0.1
 [1.0.0]: https://github.com/jaimitus/ZenDesktop/releases/tag/v1.0.0

@@ -1464,7 +1464,7 @@ impl Settings {
         }
         // Pie de la barra lateral: version.
         self.text(
-            "v1.0.2",
+            "v1.0.3",
             Fmt::Small,
             D2D_RECT_F {
                 left: 12.0,
@@ -2374,14 +2374,14 @@ impl Settings {
             crate::updater::UpdateStatus::UpdateAvailable { url, sig_url, .. } => {
                 match crate::updater::download_and_install(&url, &sig_url) {
                     Ok(_path) => {
-                        let msg = "Update installed successfully!\n\nThe new version is now running. The old window will close.";
-                        unsafe {
-                            let body = crate::config::wide(msg);
-                            let title = crate::config::wide("ZenDesktop :: Update Complete");
-                            MessageBoxW(self.hwnd, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
-                        }
-                        unsafe {
-                            let _ = PostMessageW(self.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+                        // El ejecutable ya esta reemplazado y la nueva version
+                        // lanzada. Cerrar el dialogo y salir: al soltar el mutex
+                        // de instancia unica, la nueva toma el relevo.
+                        if !self.app.is_null() {
+                            unsafe {
+                                (*self.app).request_exit_after_settings();
+                                let _ = PostMessageW(self.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+                            }
                         }
                     }
                     Err(e) => {

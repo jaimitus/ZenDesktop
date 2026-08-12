@@ -1032,6 +1032,9 @@ pub struct App {
     deferred_config: Option<Config>,
     /// Archivos devueltos al escritorio: saltar el proximo organize.
     skip_next_organize: bool,
+    /// Salir al cerrar el dialogo de configuracion (tras instalar una
+    /// actualizacion desde el panel de Updates).
+    quit_after_settings: bool,
 }
 
 /// Puntero estable a la aplicacion, propiedad del hilo de interfaz.
@@ -1197,6 +1200,7 @@ impl App {
                 pending_toast: None,
                 deferred_config: None,
                 skip_next_organize: false,
+                quit_after_settings: false,
             });
             // Objetivo OLE de arrastrar y soltar, compartido por todas las
             // cajas: vive con la aplicacion (Box::leak) y guarda el puntero a
@@ -2646,6 +2650,13 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
         let _ = SetTimer(self.controller, TIMER_THUMB_FADE, 16, None);
     }
 
+    /// Marca la app para salir al cerrar el dialogo de configuracion (se usa
+    /// tras instalar una actualizacion desde el panel de Updates, que no puede
+    /// cerrar la app desde dentro del bucle modal del dialogo).
+    pub(crate) fn request_exit_after_settings(&mut self) {
+        self.quit_after_settings = true;
+    }
+
     pub(crate) unsafe fn show_toast(&mut self, message: &str, icon_color: COLORREF) {
         self.show_toast_glyph(message, icon_color, '\u{2713}');
     }
@@ -3186,6 +3197,13 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
         let app_ptr = self as *mut App;
         let chosen = settings::open_dialog(&self.cfg, app_ptr);
         self.settings_open = false;
+        if self.quit_after_settings {
+            // Actualizacion aplicada: cerrar la app para que la nueva version
+            // (ya lanzada) tome el relevo al soltar el mutex de instancia unica.
+            self.quit_after_settings = false;
+            let _ = unsafe { PostMessageW(self.controller, WM_CLOSE, WPARAM(0), LPARAM(0)) };
+            return;
+        }
         let Some(mut cfg) = chosen else {
             return; // cancelado
         };
@@ -3713,15 +3731,23 @@ extern "system" fn controller_proc(
             WM_ZEN_TOAST_CLICK => {
                 // El usuario hizo clic en el toast de update: descargar e instalar.
                 if let Some((url, sig_url)) = updater::take_pending_update() {
-                    if let Err(e) = updater::download_and_install(&url, &sig_url) {
-                        let err = wide(&format!("Update failed:\n{e}"));
-                        let et = wide("ZenDesktop :: Update Error");
-                        MessageBoxW(
-                            hwnd,
-                            PCWSTR(err.as_ptr()),
-                            PCWSTR(et.as_ptr()),
-                            MB_OK | MB_ICONERROR,
-                        );
+                    match updater::download_and_install(&url, &sig_url) {
+                        Ok(_) => {
+                            // El ejecutable ya esta reemplazado y la nueva
+                            // version lanzada: cerrar para soltar el mutex y
+                            // que la nueva instancia tome el relevo.
+                            let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+                        }
+                        Err(e) => {
+                            let err = wide(&format!("Update failed:\n{e}"));
+                            let et = wide("ZenDesktop :: Update Error");
+                            MessageBoxW(
+                                hwnd,
+                                PCWSTR(err.as_ptr()),
+                                PCWSTR(et.as_ptr()),
+                                MB_OK | MB_ICONERROR,
+                            );
+                        }
                     }
                 }
                 LRESULT(0)
