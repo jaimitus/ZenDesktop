@@ -37,6 +37,15 @@ jobs:
         shell: bash
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
+      - name: Sign portable EXE (Ed25519)
+        if: env.SIGNING_KEY != ''
+        shell: bash
+        run: |
+          cargo run --release --bin sign-release -- target/release/zendesktop.exe
+          cp target/release/zendesktop.exe.sig target/release/zendesktop.exe.sig
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+
       - name: Collect portable artifacts
         shell: bash
         run: |
@@ -44,6 +53,10 @@ jobs:
           V="${{ steps.version.outputs.VERSION }}"
           cp target/release/zendesktop.exe "release/ZenDesktop-v${V}.exe"
           cp target/release/zendesktop.exe release/ZenDesktop.exe
+          # Copy .sig if it exists (from signing step)
+          if [ -f target/release/zendesktop.exe.sig ]; then
+            cp target/release/zendesktop.exe.sig release/ZenDesktop.exe.sig
+          fi
           cp LICENSE release/
           cp README.md release/
           cd release
@@ -74,6 +87,7 @@ jobs:
           body_path: CHANGELOG.md
           files: |
             release/ZenDesktop.exe
+            release/ZenDesktop.exe.sig
             release/ZenDesktop-v${{ steps.version.outputs.VERSION }}.exe
             release/ZenDesktop-v${{ steps.version.outputs.VERSION }}-portable.zip
             release/ZenDesktop-v${{ steps.version.outputs.VERSION }}-x64.msi

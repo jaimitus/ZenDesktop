@@ -2106,7 +2106,7 @@ impl Settings {
                     MessageBoxW(self.hwnd, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
                 }
             }
-            crate::updater::UpdateStatus::UpdateAvailable { version, size, url: _ } => {
+            crate::updater::UpdateStatus::UpdateAvailable { version, size, .. } => {
                 let msg = format!("New version available: v{}\nSize: {} KB\n\nClick 'Download & Install' to update.", version, size / 1024);
                 unsafe {
                     let body = crate::config::wide(&msg);
@@ -2128,8 +2128,8 @@ impl Settings {
     fn download_update(&self) {
         // Primero comprobar que hay update disponible
         match crate::updater::check_update() {
-            crate::updater::UpdateStatus::UpdateAvailable { url, .. } => {
-                match crate::updater::download_and_install(&url) {
+            crate::updater::UpdateStatus::UpdateAvailable { url, sig_url, .. } => {
+                match crate::updater::download_and_install(&url, &sig_url) {
                     Ok(_path) => {
                         let msg = "Update installed successfully!\n\nThe new version is now running. The old window will close.";
                         unsafe {

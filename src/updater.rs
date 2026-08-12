@@ -1,13 +1,19 @@
 //! ZenDesktop :: updater.rs
 //!
-//! Auto-actualizacion via GitHub Releases API.
-//! Sin dependencias pesadas: solo ureq + serde_json.
+//! Auto-update via GitHub Releases API with Ed25519 signature verification.
+//! No heavy dependencies: just ureq + serde_json + ed25519-dalek.
 
+use std::io::Read;
 use std::path::PathBuf;
 use serde::Deserialize;
 
 const GITHUB_API: &str = "https://api.github.com/repos/jaimitus/ZenDesktop/releases/latest";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// Ed25519 public key (hex). Generate a new keypair with:
+//   cargo run --bin gen-keys
+// Replace this with the PUBLIC_KEY output.
+const PUBKEY_HEX: &str = "e620bd0400f6d33960420789d9098dadf258cc591c79439a80de50341f1e9e04";
 
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
@@ -30,7 +36,7 @@ struct GitHubAsset {
 #[derive(Debug)]
 pub enum UpdateStatus {
     UpToDate,
-    UpdateAvailable { version: String, url: String, size: u64 },
+    UpdateAvailable { version: String, url: String, sig_url: String, size: u64 },
     Error(String),
 }
 
@@ -60,26 +66,46 @@ pub fn check_update() -> UpdateStatus {
         return UpdateStatus::UpToDate;
     }
 
-    // Buscar el asset .exe portable
+    // Buscar el asset .exe portable y su .sig
     let asset = release.assets.iter().find(|a| a.name == "ZenDesktop.exe");
-    match asset {
-        Some(a) => UpdateStatus::UpdateAvailable {
+    let sig_asset = release.assets.iter().find(|a| a.name == "ZenDesktop.exe.sig");
+
+    match (asset, sig_asset) {
+        (Some(a), Some(s)) => UpdateStatus::UpdateAvailable {
             version: latest.to_string(),
             url: a.browser_download_url.clone(),
+            sig_url: s.browser_download_url.clone(),
             size: a.size,
         },
-        None => UpdateStatus::Error("No .exe asset found".into()),
+        (Some(_), None) => UpdateStatus::Error("No .sig signature found in release".into()),
+        (None, _) => UpdateStatus::Error("No .exe asset found".into()),
     }
 }
 
+/// Decodes the hardcoded public key from hex.
+fn pubkey() -> Option<ed25519_dalek::VerifyingKey> {
+    let bytes = hex_decode(PUBKEY_HEX)?;
+    ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok()
+}
+
+/// Verifies an Ed25519 signature against the embedded public key.
+fn verify_signature(data: &[u8], sig_bytes: &[u8; 64]) -> bool {
+    let vk = match pubkey() {
+        Some(k) => k,
+        None => return false,
+    };
+    let sig = ed25519_dalek::Signature::from_bytes(sig_bytes);
+    vk.verify_strict(data, &sig).is_ok()
+}
+
 /// Downloads and installs the update, then auto-restarts the app.
-/// Returns the path to the new executable.
-pub fn download_and_install(url: &str) -> Result<PathBuf, String> {
+/// Verifies Ed25519 signature before installing.
+pub fn download_and_install(url: &str, sig_url: &str) -> Result<PathBuf, String> {
     let current = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let backup = current.with_extension("exe.bak");
     let temp = current.with_extension("exe.new");
 
-    // Descargar
+    // Download .exe
     let response = ureq::get(url)
         .set("User-Agent", "ZenDesktop-Updater/1.0")
         .call()
@@ -91,14 +117,39 @@ pub fn download_and_install(url: &str) -> Result<PathBuf, String> {
     std::io::copy(&mut reader, &mut file)
         .map_err(|e| format!("Write error: {e}"))?;
 
-    // Verificar que el archivo se descargo completo
+    // Download .sig
+    let sig_response = ureq::get(sig_url)
+        .set("User-Agent", "ZenDesktop-Updater/1.0")
+        .call()
+        .map_err(|e| format!("Signature download error: {e}"))?;
+
+    let mut sig_bytes = [0u8; 64];
+    let sig_reader = sig_response.into_reader();
+    let n = std::io::Read::take(sig_reader, 64)
+        .read(&mut sig_bytes)
+        .map_err(|e| format!("Sig read error: {e}"))?;
+
+    if n != 64 {
+        return Err(format!("Invalid signature size: {n} bytes (expected 64)"));
+    }
+
+    // Verify signature
+    let exe_data = std::fs::read(&temp)
+        .map_err(|e| format!("Read temp for verify: {e}"))?;
+
+    if !verify_signature(&exe_data, &sig_bytes) {
+        let _ = std::fs::remove_file(&temp);
+        return Err("Signature verification FAILED — possible tampering!".into());
+    }
+
+    // Verify file size sanity
     let meta = std::fs::metadata(&temp).map_err(|e| format!("metadata: {e}"))?;
     if meta.len() < 100_000 {
         let _ = std::fs::remove_file(&temp);
         return Err("Downloaded file too small".into());
     }
 
-    // Renombrar actual -> backup, nuevo -> actual
+    // Rename current -> backup, new -> current
     if backup.exists() {
         let _ = std::fs::remove_file(&backup);
     }
@@ -107,16 +158,29 @@ pub fn download_and_install(url: &str) -> Result<PathBuf, String> {
     std::fs::rename(&temp, &current)
         .map_err(|e| format!("Replace error: {e}"))?;
 
-    // Limpiar backup
+    // Clean up backup
     let _ = std::fs::remove_file(&backup);
 
-    // Auto-restart the new exe before this process exits.
+    // Auto-restart the new exe before this process exits
     let _ = std::process::Command::new(&current).spawn();
 
     Ok(current)
 }
 
-/// Devuelve la version actual del binario.
+/// Returns the current version of the binary.
 pub fn current_version() -> &'static str {
     CURRENT_VERSION
+}
+
+fn hex_decode(hex: &str) -> Option<[u8; 32]> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let s = std::str::from_utf8(chunk).ok()?;
+        bytes[i] = u8::from_str_radix(s, 16).ok()?;
+    }
+    Some(bytes)
 }
