@@ -15,7 +15,7 @@
     <MediaTemplate EmbedCab="yes" />
 
     <!-- Icon for Add/Remove Programs -->
-    <Icon Id="zendesktop.ico" SourceFile="zendesktop.ico" />
+    <Icon Id="zendesktop.ico" SourceFile="$(var.SrcDir)\zendesktop.ico" />
 
     <Property Id="ARPPRODUCTICON" Value="zendesktop.ico" />
     <Property Id="ARPHELPLINK" Value="https://github.com/jaimitus/ZenDesktop" />
@@ -24,7 +24,7 @@
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
 
     <!-- Professional install UI with license agreement -->
-    <WixVariable Id="WixUILicenseRtf" Value="LICENSE.rtf" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.SrcDir)\LICENSE.rtf" />
     <UIRef Id="WixUI_Minimal" />
 
     <!-- Install to Program Files\ZenDesktop -->
@@ -33,17 +33,17 @@
         <!-- Main executable component -->
         <Component Id="MainExe" Guid="*">
           <File Id="ZenDesktopExe"
-                Source="ZenDesktop.exe"
+                Source="$(var.SrcDir)\ZenDesktop.exe"
                 KeyPath="yes"
                 Checksum="yes" />
           <File Id="ZenDesktopIco"
-                Source="zendesktop.ico" />
+                Source="$(var.SrcDir)\zendesktop.ico" />
         </Component>
 
         <!-- LICENSE and README -->
         <Component Id="Docs" Guid="*">
-          <File Id="LicenseFile" Source="LICENSE" />
-          <File Id="ReadmeFile" Source="README.md" />
+          <File Id="LicenseFile" Source="$(var.SrcDir)\LICENSE" />
+          <File Id="ReadmeFile" Source="$(var.SrcDir)\README.md" />
         </Component>
       </Directory>
     </StandardDirectory>

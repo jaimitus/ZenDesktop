@@ -75,7 +75,12 @@ jobs:
           cp LICENSE installer/staging/LICENSE
           cp installer/LICENSE.rtf installer/staging/LICENSE.rtf
           cp README.md installer/staging/README.md
-          ~/.dotnet/tools/wix build -d Version=${V} -bf installer/staging installer/zendesktop.wxs -o "release/ZenDesktop-v${V}-x64.msi"
+          # Paths in the .wxs resolve relative to the .wxs file, so run from
+          # installer/ with SrcDir=staging. -ext WixToolset.UI.wixext is
+          # required for WixUI_Minimal (license dialog).
+          cd installer
+          ~/.dotnet/tools/wix build -d Version=${V} -d SrcDir=staging \
+            -ext WixToolset.UI.wixext zendesktop.wxs -o "../release/ZenDesktop-v${V}-x64.msi"
 
       - name: Generate SHA256 checksums
         shell: powershell
