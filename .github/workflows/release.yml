@@ -81,6 +81,35 @@ jobs:
           ~/.dotnet/tools/wix build -arch x64 -d Version=${V} -d SrcDir=staging \
             zendesktop.wxs -o "../release/ZenDesktop-v${V}-x64.msi"
 
+      - name: Install Inno Setup
+        shell: bash
+        run: |
+          choco install innosetup -y --no-progress 2>&1 | tail -2 || true
+          ls "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" 2>&1 || \
+            ls "/c/Program Files (x86)/Inno Setup 5/ISCC.exe" 2>&1
+
+      - name: Build EXE installer (Inno Setup)
+        shell: bash
+        run: |
+          V="${{ steps.version.outputs.VERSION }}"
+          mkdir -p installer/staging
+          cp target/release/zendesktop.exe installer/staging/ZenDesktop.exe
+          cp assets/icons/zendesktop.ico installer/staging/zendesktop.ico
+          cp LICENSE installer/staging/LICENSE
+          cp README.md installer/staging/README.md
+          ISCC=""
+          if [ -f "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" ]; then
+            ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+          elif [ -f "/c/Program Files (x86)/Inno Setup 5/ISCC.exe" ]; then
+            ISCC="/c/Program Files (x86)/Inno Setup 5/ISCC.exe"
+          fi
+          if [ -n "$ISCC" ]; then
+            cd installer
+            "$ISCC" /DMyAppVersion=${V} zendesktop.iss
+          else
+            echo "Inno Setup not found - skipping EXE installer"
+          fi
+
       - name: Generate SHA256 checksums
         shell: powershell
         run: |

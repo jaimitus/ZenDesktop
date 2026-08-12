@@ -88,8 +88,37 @@ if ($wixExe) {
     Write-Host "  Skipping MSI." -ForegroundColor Gray
 }
 
-# 6. Generate SHA256 checksums + done
-Write-Host "[6/6] Generating checksums..." -ForegroundColor Yellow
+# 6. Build EXE installer with Inno Setup
+Write-Host "[6/7] Building EXE installer (Inno Setup)..." -ForegroundColor Yellow
+
+$iscc = $null
+foreach ($path in @(
+    "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+    "${env:ProgramFiles(x86)}\Inno Setup 5\ISCC.exe"
+)) {
+    if (Test-Path $path) { $iscc = $path; break }
+}
+
+if ($iscc) {
+    $staging = "$InstallerDir\staging"
+    New-Item -ItemType Directory -Force -Path $staging | Out-Null
+    Copy-Item "$Target\zendesktop.exe" "$staging\ZenDesktop.exe" -Force
+    Copy-Item "$Root\assets\icons\zendesktop.ico" "$staging\zendesktop.ico" -Force
+    Copy-Item "$Root\LICENSE" "$staging\LICENSE" -Force
+    Copy-Item "$Root\README.md" "$staging\README.md" -Force
+
+    & $iscc /DMyAppVersion=$Version "$InstallerDir\zendesktop.iss"
+    if ($LASTEXITCODE -ne 0) { throw "Inno Setup build failed" }
+
+    Remove-Item -Recurse -Force $staging
+    Write-Host "  EXE installer built!" -ForegroundColor Green
+} else {
+    Write-Host "  Inno Setup not found. Install from https://jrsoftware.org/isdl.php" -ForegroundColor Gray
+    Write-Host "  Skipping EXE installer." -ForegroundColor Gray
+}
+
+# 7. Generate SHA256 checksums + done
+Write-Host "[7/7] Generating checksums..." -ForegroundColor Yellow
 Get-ChildItem -Path $ReleaseDir -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' } | ForEach-Object {
     $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
     "$hash  $($_.Name)"
