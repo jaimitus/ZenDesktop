@@ -7,6 +7,15 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.10] - 2026-08-12
+
+### Fixed
+- **Update checks no longer hit the GitHub API**: the public API rate-limits
+  per IP (60/hour), which made the updater report "status code 403" and
+  blocked updates entirely. The latest version is now read from a small
+  `version.txt` published on the downloads CDN (no rate limit), and the
+  exe/signature URLs are built by convention.
+
 ## [1.0.9] - 2026-08-12
 
 ### Changed

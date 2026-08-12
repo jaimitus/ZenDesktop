@@ -1,39 +1,25 @@
 //! ZenDesktop :: updater.rs
 //!
-//! Auto-update via GitHub Releases API with Ed25519 signature verification.
-//! No heavy dependencies: just ureq + serde_json + ed25519-dalek.
+//! Auto-update via GitHub Releases CDN with Ed25519 signature verification.
+//! No heavy dependencies: just ureq + ed25519-dalek.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
-use serde::Deserialize;
 use windows::core::{w, PCWSTR};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-const GITHUB_API: &str = "https://api.github.com/repos/jaimitus/ZenDesktop/releases/latest";
+// La version se lee del CDN de descargas (no de la API), que no tiene rate
+// limit: cada release publica un version.txt apuntado por "latest".
+const VERSION_URL: &str =
+    "https://github.com/jaimitus/ZenDesktop/releases/latest/download/version.txt";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Ed25519 public key (hex). Generated 2026-08-12 with `cargo run --bin gen-keys`.
 // The matching private key is stored as the GitHub Actions secret SIGNING_KEY.
 const PUBKEY_HEX: &str = "df1c9091cd42eb37b8986f5df342667c808ac3c2fb27a9e5f1465198c2d17489";
-
-#[derive(Debug, Deserialize)]
-struct GitHubRelease {
-    tag_name: String,
-    #[allow(dead_code)]
-    name: String,
-    #[allow(dead_code)]
-    body: String,
-    assets: Vec<GitHubAsset>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubAsset {
-    name: String,
-    browser_download_url: String,
-}
 
 /// Resultado de la comprobacion de actualizaciones.
 #[derive(Debug)]
@@ -82,18 +68,18 @@ fn http_agent() -> ureq::Agent {
         .build()
 }
 
-/// Consulta la API de GitHub Releases y compara con la version actual.
-/// Reintenta ante cortes transitorios: el CDN/API de GitHub corta conexiones
-/// de vez en cuando ("Network Error: Unexpected EOF").
+/// Lee la version mas reciente del CDN de descargas y compara con la actual.
+/// No usa la API de GitHub (rate-limited): cada release publica un
+/// version.txt apuntado por la URL "latest" del CDN, que no tiene limite.
+/// Reintenta ante cortes transitorios de red.
 pub fn check_update() -> UpdateStatus {
     let agent = http_agent();
     let mut last_err = String::new();
     for attempt in 1..=4 {
         let body = match (|| -> Result<String, String> {
             let response = agent
-                .get(GITHUB_API)
+                .get(VERSION_URL)
                 .set("User-Agent", "ZenDesktop-Updater/1.0")
-                .set("Accept", "application/vnd.github.v3+json")
                 .call()
                 .map_err(|e| format!("Network error: {e}"))?;
             response.into_string().map_err(|e| format!("Read error: {e}"))
@@ -108,31 +94,39 @@ pub fn check_update() -> UpdateStatus {
             }
         };
 
-        let release: GitHubRelease = match serde_json::from_str(&body) {
-            Ok(r) => r,
-            Err(e) => return UpdateStatus::Error(format!("Parse error: {e}")),
-        };
+        let latest = body.trim().trim_start_matches('v');
+        if !is_semver(latest) {
+            last_err = format!("version.txt inesperado: {latest:?}");
+            if attempt < 4 {
+                std::thread::sleep(Duration::from_millis(500 * attempt));
+            }
+            continue;
+        }
 
-        let latest = release.tag_name.trim_start_matches('v');
         if is_up_to_date(CURRENT_VERSION, latest) {
             return UpdateStatus::UpToDate;
         }
 
-        // Buscar el asset .exe portable y su .sig
-        let asset = release.assets.iter().find(|a| a.name == "ZenDesktop.exe");
-        let sig_asset = release.assets.iter().find(|a| a.name == "ZenDesktop.exe.sig");
-
-        return match (asset, sig_asset) {
-            (Some(a), Some(s)) => UpdateStatus::UpdateAvailable {
-                version: latest.to_string(),
-                url: a.browser_download_url.clone(),
-                sig_url: s.browser_download_url.clone(),
-            },
-            (Some(_), None) => UpdateStatus::Error("No .sig signature found in release".into()),
-            (None, _) => UpdateStatus::Error("No .exe asset found".into()),
+        // Los assets siguen una convencion fija en cada release.
+        let base = format!(
+            "https://github.com/jaimitus/ZenDesktop/releases/download/v{latest}/ZenDesktop.exe"
+        );
+        return UpdateStatus::UpdateAvailable {
+            version: latest.to_string(),
+            url: base.clone(),
+            sig_url: format!("{base}.sig"),
         };
     }
     UpdateStatus::Error(format!("Network error after 4 attempts: {last_err}"))
+}
+
+/// True si `s` tiene forma de version semver ("1.2.3"), para rechazar
+/// respuestas erroneas del CDN (paginas de error, HTML, etc.).
+fn is_semver(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() >= 2
+        && parts.len() <= 4
+        && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// Decodes the hardcoded public key from hex.

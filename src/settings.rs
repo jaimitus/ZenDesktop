@@ -1464,7 +1464,7 @@ impl Settings {
         }
         // Pie de la barra lateral: version.
         self.text(
-            "v1.0.9",
+            "v1.0.10",
             Fmt::Small,
             D2D_RECT_F {
                 left: 12.0,

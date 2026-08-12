@@ -55,6 +55,9 @@ jobs:
           if [ -f target/release/zendesktop.exe.sig ]; then
             cp target/release/zendesktop.exe.sig release/ZenDesktop.exe.sig
           fi
+          # version.txt: el updater lo lee desde el CDN (releases/latest) para
+          # saber la version mas reciente SIN usar la API de GitHub.
+          printf '%s' "${V}" > release/version.txt
           cp LICENSE release/
           cp README.md release/
           cp CHANGELOG.md release/
