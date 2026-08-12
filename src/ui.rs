@@ -30,8 +30,8 @@ use std::ptr;
 
 use windows::core::{w, GUID, Interface, Result as WinResult, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{
-    COLORREF, GENERIC_ACCESS_RIGHTS, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, POINTL,
-    RECT, SIZE, WPARAM,
+    BOOL, COLORREF, GENERIC_ACCESS_RIGHTS, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT,
+    POINTL, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
@@ -58,6 +58,8 @@ use windows::Win32::Graphics::Gdi::{
     AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
     DT_CENTER, DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL, TRANSPARENT, HBITMAP,
     HDC, HGDIOBJ, IntersectClipRect, NULL_PEN, RestoreDC, SaveDC,
+    EnumDisplayMonitors, GetMonitorInfoW, HMONITOR, MonitorFromWindow, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::System::Com::{
     CoTaskMemFree, DVASPECT_CONTENT, FORMATETC, IDataObject, TYMED_HGLOBAL,
@@ -149,6 +151,8 @@ const TIMER_TOAST: usize = 4;
 /// Temporizador de animaciones suaves (colapsar/expandir, Zen mode).
 const TIMER_ANIM: usize = 5;
 const TIMER_SCROLL: usize = 6;
+/// Temporizador de retraso de inicio: muestra las cajas tras N segundos.
+const TIMER_STARTUP: usize = 7;
 /// Pasos de interpolacion por animacion (8 pasos a 10ms = 80ms).
 const ANIM_STEPS: u8 = 16;
 /// Identificador del atajo global Ctrl+Alt+Z ("ZE" en ASCII).
@@ -179,6 +183,7 @@ const CLASS_CONTROLLER: PCWSTR = w!("ZenDesktop.Controller");
 const CLASS_FENCE: PCWSTR = w!("ZenDesktop.Fence");
 const CLASS_THUMB: PCWSTR = w!("ZenDesktop.Thumb");
 const CLASS_TOAST: PCWSTR = w!("ZenDesktop.Toast");
+const CLASS_GUIDES: PCWSTR = w!("ZenDesktop.Guides");
 
 const GRIP: i32 = 22; // zona inferior derecha para redimensionar
 const SCROLLBAR_W: f32 = 3.0;
@@ -1021,6 +1026,18 @@ pub struct App {
     toast_alpha: u8,
     toast_fading_out: bool,
     toast_hold: u32,
+    /// true mientras un toast esta visible (fade in / hold / fade out).
+    toast_active: bool,
+    /// Cola de toasts pendientes: (mensaje, color, glifo). Los toasts se
+    /// apilan mientras otro ocupa la pantalla, en vez de pisarse el ultimo.
+    toast_queue: VecDeque<(String, COLORREF, char)>,
+    /// Ventana overlay de guias de alineacion magnetica al mover cajas.
+    guides_hwnd: HWND,
+    /// Superficie de la ventana de guias (tamano de la work area).
+    guides_surface: Option<SurfaceDib>,
+    /// Ultima guia vertical/horizontal dibujada (para no redibujar si no cambia).
+    guides_vx: Option<i32>,
+    guides_vy: Option<i32>,
     zen_anim_kind: u8,
     zen_anim_step: u8,
     anim_zen_alpha: u8,
@@ -1035,6 +1052,9 @@ pub struct App {
     /// Salir al cerrar el dialogo de configuracion (tras instalar una
     /// actualizacion desde el panel de Updates).
     quit_after_settings: bool,
+    /// true mientras el retraso de inicio no ha expirado: build_fences vuelve
+    /// a ocultar las cajas reconstruidas para que no aparezcan antes de tiempo.
+    startup_pending: bool,
 }
 
 /// Puntero estable a la aplicacion, propiedad del hilo de interfaz.
@@ -1193,6 +1213,12 @@ impl App {
                 toast_alpha: 255,
                 toast_fading_out: false,
                 toast_hold: 0,
+                toast_active: false,
+                toast_queue: VecDeque::new(),
+                guides_hwnd: HWND::default(),
+                guides_surface: None,
+                guides_vx: None,
+                guides_vy: None,
                 zen_anim_kind: 0,
                 zen_anim_step: 0,
                 anim_zen_alpha: 255,
@@ -1201,6 +1227,7 @@ impl App {
                 deferred_config: None,
                 skip_next_organize: false,
                 quit_after_settings: false,
+                startup_pending: false,
             });
             // Objetivo OLE de arrastrar y soltar, compartido por todas las
             // cajas: vive con la aplicacion (Box::leak) y guarda el puntero a
@@ -1234,7 +1261,17 @@ impl App {
             )?;
             (*ptr).controller = controller;
 
+            let delay_secs = (*ptr).cfg.general.startup_delay_seconds;
+            (*ptr).startup_pending = delay_secs > 0;
             (*ptr).build_fences()?;
+            // Plantilla por defecto: se aplica al arrancar solo si la
+            // disposicion de monitores coincide con la guardada (p.ej. dock ya
+            // conectado) Y cambio desde la ultima sesion. Con el mismo
+            // escritorio se respeta lo que el usuario dejo colocado.
+            let monitors = current_monitors();
+            if (*ptr).cfg.last_monitors != monitors {
+                (*ptr).apply_default_template_if(&monitors);
+            }
             (*ptr).toast_hwnd = CreateWindowExW(
                 // Sin WS_EX_TRANSPARENT: el toast debe recibir clics (instalar update).
                 WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -1258,11 +1295,29 @@ impl App {
                 instance,
                 None,
             )?;
+            (*ptr).guides_hwnd = CreateWindowExW(
+                // WS_EX_TRANSPARENT: las guias no interceptan clics del raton.
+                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                CLASS_GUIDES,
+                w!(""),
+                WS_POPUP,
+                0, 0, 1, 1,
+                None, None,
+                instance,
+                None,
+            )?;
             (*ptr).install_tray();
             (*ptr).install_hooks();
 
             let period = (*ptr).cfg.general.sweep_interval_minutes as u32 * 60_000;
             SetTimer(controller, TIMER_SWEEP, period, None);
+
+            // Retraso de inicio configurable: build_fences ya oculto las cajas
+            // (startup_pending) y este timer las muestra cuando expira, para no
+            // tapar el escritorio mientras Windows sigue cargando la sesion.
+            if delay_secs > 0 {
+                let _ = SetTimer(controller, TIMER_STARTUP, delay_secs * 1000, None);
+            }
 
             Ok(AppHandle { app: ptr })
         }
@@ -1352,6 +1407,7 @@ impl App {
                 sort_by: None,
                 tabs: Vec::new(),
                 group_title: None,
+                monitor: None,
             };
             let tabs = vec![FenceTab {
                 content,
@@ -1433,6 +1489,13 @@ impl App {
             DragAcceptFiles(hwnd, true);
         }
 
+        // Mientras el retraso de inicio este pendiente, las cajas reconstruidas
+        // (p.ej. por el watcher durante el arranque) se vuelven a ocultar.
+        if self.startup_pending {
+            for fence in &self.fences {
+                let _ = ShowWindow(fence.hwnd, SW_HIDE);
+            }
+        }
         self.render_all();
         Ok(())
     }
@@ -2173,16 +2236,77 @@ impl App {
                         );
                     }
                 } else if fence.tabs[fence.active_tab].content.items.is_empty() {
-                    brush.SetColor(&theme.muted);
+                    // Estado vacio bonito: icono de caja con flecha + texto
+                    // centrado en el cuerpo, para invitar a soltar archivos.
+                    let body_top = fence.header_h(theme) * scale;
+                    let body_bottom = h * scale;
+                    let mid_y = (body_top + body_bottom) * 0.5;
+                    let cx = (w * scale) * 0.5;
+                    // Icono: caja redondeada con tapa y flecha hacia abajo.
+                    let iw = 52.0 * scale;
+                    let ih = 38.0 * scale;
+                    let ix = cx - iw * 0.5;
+                    // Clamp: en cajas muy bajas el icono no debe salirse por la
+                    // cabecera ni por el borde inferior.
+                    let iy = (mid_y - ih * 0.5 - 10.0 * scale)
+                        .max(body_top + 4.0 * scale)
+                        .min(body_bottom - ih - 4.0 * scale);
+                    brush.SetColor(&with_alpha(fence.accent, 0.55));
+                    surface.target.DrawRoundedRectangle(
+                        &D2D1_ROUNDED_RECT {
+                            rect: rect(ix, iy, ix + iw, iy + ih),
+                            radiusX: 7.0 * scale,
+                            radiusY: 7.0 * scale,
+                        },
+                        brush,
+                        1.6 * scale,
+                        None,
+                    );
+                    // Tapa superior (linea horizontal con solapa).
+                    brush.SetColor(&with_alpha(fence.accent, 0.7));
+                    surface.target.DrawLine(
+                        D2D_POINT_2F { x: ix - 6.0 * scale, y: iy + 7.0 * scale },
+                        D2D_POINT_2F { x: ix + iw + 6.0 * scale, y: iy + 7.0 * scale },
+                        brush,
+                        1.6 * scale,
+                        None,
+                    );
+                    // Flecha hacia abajo dentro de la caja.
+                    let fx = cx;
+                    let fy0 = iy + 12.0 * scale;
+                    let fy1 = iy + ih - 8.0 * scale;
+                    surface.target.DrawLine(
+                        D2D_POINT_2F { x: fx, y: fy0 },
+                        D2D_POINT_2F { x: fx, y: fy1 },
+                        brush,
+                        1.6 * scale,
+                        None,
+                    );
+                    surface.target.DrawLine(
+                        D2D_POINT_2F { x: fx - 5.0 * scale, y: fy1 - 6.0 * scale },
+                        D2D_POINT_2F { x: fx, y: fy1 },
+                        brush,
+                        1.6 * scale,
+                        None,
+                    );
+                    surface.target.DrawLine(
+                        D2D_POINT_2F { x: fx + 5.0 * scale, y: fy1 - 6.0 * scale },
+                        D2D_POINT_2F { x: fx, y: fy1 },
+                        brush,
+                        1.6 * scale,
+                        None,
+                    );
+                    // Texto centrado bajo el icono.
+                    brush.SetColor(&with_alpha(theme.muted, 0.9));
                     let empty = wide_str(self.tr.fence_empty);
                     surface.target.DrawText(
                         &empty,
-                        &gfx.text_format,
+                        &gfx.center_meta_format,
                         &rect(
                             pad,
-                            fence.header_h(theme) * scale,
+                            (iy + ih + 8.0 * scale).min(body_bottom),
                             (w - theme.padding) * scale,
-                            (theme.header + theme.row) * scale,
+                            body_bottom,
                         ),
                         brush,
                         D2D1_DRAW_TEXT_OPTIONS_CLIP,
@@ -2667,6 +2791,22 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
         if self.toast_hwnd.is_invalid() {
             return;
         }
+        if self.toast_active {
+            // Cola acotada: si hay mas de 5 pendientes, descartar las antiguas.
+            if self.toast_queue.len() >= 5 {
+                self.toast_queue.pop_front();
+            }
+            self.toast_queue.push_back((message.to_string(), icon_color, glyph));
+            return;
+        }
+        self.render_toast(message, icon_color, glyph);
+    }
+
+    /// Dibuja y muestra un toast inmediatamente, sustituyendo al anterior.
+    unsafe fn render_toast(&mut self, message: &str, icon_color: COLORREF, glyph: char) {
+        if self.toast_hwnd.is_invalid() {
+            return;
+        }
         // --- Medir texto con GDI para calcular el tamano real ---
         let font_name: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
         let font = CreateFontW(
@@ -2784,6 +2924,33 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
         let _ = UpdateLayeredWindow(self.toast_hwnd, screen, Some(&position), Some(&size), surface.dc, Some(&source), COLORREF(0), Some(&blend), ULW_ALPHA);
         let _ = ReleaseDC(None, screen);
         let _ = SetTimer(self.controller, TIMER_TOAST, 16, None);
+        self.toast_active = true;
+    }
+
+    /// Muestra el siguiente toast encolado, si hay. Devuelve true si lo hizo.
+    unsafe fn pump_toast_queue(&mut self) -> bool {
+        if let Some((msg, color, glyph)) = self.toast_queue.pop_front() {
+            self.render_toast(&msg, color, glyph);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// El usuario hizo clic en el toast: ocultarlo y mostrar el siguiente.
+    unsafe fn toast_dismissed(&mut self) {
+        if !self.toast_active {
+            return;
+        }
+        self.toast_active = false;
+        self.toast_fading_out = false;
+        self.toast_hold = 0;
+        self.toast_alpha = 0;
+        let _ = ShowWindow(self.toast_hwnd, SW_HIDE);
+        if !self.pump_toast_queue() {
+            // Cola vacia: parar el timer para no mantener un ciclo fantasma.
+            let _ = KillTimer(self.controller, TIMER_TOAST);
+        }
     }
 
 
@@ -2796,10 +2963,15 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
         if self.toast_fading_out {
             if self.toast_alpha <= 32 {
                 self.toast_alpha = 0;
+                self.toast_active = false;
                 let _ = ShowWindow(self.toast_hwnd, SW_HIDE);
-                let _ = KillTimer(self.controller, TIMER_TOAST);
                 self.toast_fading_out = false;
                 self.toast_hold = 0;
+                // Mostrar el siguiente toast encolado, si hay.
+                if self.pump_toast_queue() {
+                    return;
+                }
+                let _ = KillTimer(self.controller, TIMER_TOAST);
                 return;
             }
             self.toast_alpha = self.toast_alpha.saturating_sub(32);
@@ -2819,6 +2991,82 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
         let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: self.toast_alpha, AlphaFormat: AC_SRC_ALPHA as u8 };
         let _ = UpdateLayeredWindow(self.toast_hwnd, screen, None, None, surface.dc, Some(&source), COLORREF(0), Some(&blend), ULW_ALPHA);
         let _ = ReleaseDC(None, screen);
+    }
+
+    /// Muestra las guias de alineacion magnetica mientras se arrastra una caja.
+    /// vx/vy son coordenadas de pantalla absolutas; None desactiva esa linea.
+    unsafe fn show_guides(&mut self, vx: Option<i32>, vy: Option<i32>) {
+        if self.guides_hwnd.is_invalid() {
+            return;
+        }
+        if vx == self.guides_vx && vy == self.guides_vy {
+            return; // sin cambios: no redibujar
+        }
+        self.guides_vx = vx;
+        self.guides_vy = vy;
+        let work = work_area();
+        let w = work.right - work.left;
+        let h = work.bottom - work.top;
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        if vx.is_none() && vy.is_none() {
+            let _ = ShowWindow(self.guides_hwnd, SW_HIDE);
+            return;
+        }
+        if self.guides_surface.as_ref().map_or(true, |s| s.width != w || s.height != h) {
+            self.guides_surface = SurfaceDib::new(w, h);
+        }
+        let Some(surface) = self.guides_surface.as_ref() else { return };
+        if surface.bits.is_null() {
+            return;
+        }
+        let bits = std::slice::from_raw_parts_mut(surface.bits, (w * h) as usize);
+        bits.fill(0);
+        // Linea azul acento premultiplicada (0xAARRGGBB, RGB*alpha/255),
+        // porque UpdateLayeredWindow con AC_SRC_ALPHA exige premultiplicacion.
+        let line: u32 = 0xB0295AAA;
+        if let Some(x) = vx {
+            let lx = x - work.left;
+            for row in 0..h {
+                let base = row as usize * w as usize;
+                for dx in 0..2 {
+                    let cx = lx + dx;
+                    if cx >= 0 && cx < w {
+                        bits[base + cx as usize] = line;
+                    }
+                }
+            }
+        }
+        if let Some(y) = vy {
+            let ly = y - work.top;
+            for col in 0..w {
+                for dy in 0..2 {
+                    let cy = ly + dy;
+                    if cy >= 0 && cy < h {
+                        bits[(cy as usize) * w as usize + col as usize] = line;
+                    }
+                }
+            }
+        }
+        let screen = GetDC(None);
+        let position = POINT { x: work.left, y: work.top };
+        let size = SIZE { cx: w, cy: h };
+        let source = POINT { x: 0, y: 0 };
+        let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+        let _ = SetWindowPos(self.guides_hwnd, HWND_TOPMOST, work.left, work.top, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        let _ = UpdateLayeredWindow(self.guides_hwnd, screen, Some(&position), Some(&size), surface.dc, Some(&source), COLORREF(0), Some(&blend), ULW_ALPHA);
+        let _ = ReleaseDC(None, screen);
+    }
+
+    /// Oculta las guias al terminar o cancelar el arrastre de una caja.
+    unsafe fn hide_guides(&mut self) {
+        if self.guides_hwnd.is_invalid() {
+            return;
+        }
+        self.guides_vx = None;
+        self.guides_vy = None;
+        let _ = ShowWindow(self.guides_hwnd, SW_HIDE);
     }
 
     fn start_collapse_anim(&mut self, index: usize) {
@@ -3009,6 +3257,21 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
             unsafe { self.show_toast(&msg, TOAST_ORGANIZE); }
         }
         self.refresh_contents();
+    }
+
+    /// Muestra las cajas tras el retraso de inicio configurable.
+    fn startup_reveal(&mut self) {
+        self.startup_pending = false;
+        // Si el usuario activo el Modo Zen durante el retraso, respetarlo.
+        if self.zen {
+            return;
+        }
+        unsafe {
+            for fence in &self.fences {
+                let _ = ShowWindow(fence.hwnd, SW_SHOWNA);
+            }
+        }
+        self.render_all();
     }
 
     fn toggle_zen(&mut self) {
@@ -3234,7 +3497,110 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
         for fence in &self.fences {
             self.cfg.set_layout(fence.layout.clone());
         }
+        // Firma de monitores: se guarda con la geometria para detectar al
+        // arrancar si la disposicion de pantalla cambio entre sesiones.
+        self.cfg.last_monitors = current_monitors();
         let _ = self.cfg.save(&self.cfg_path);
+    }
+
+    /// Snapshot de la geometria actual de todas las cajas, incluyendo el
+    /// monitor donde vive cada una para reposicionarlas en otras
+    /// disposiciones de pantalla.
+    pub(crate) fn capture_layouts(&self) -> Vec<crate::config::FenceLayout> {
+        self.fences
+            .iter()
+            .map(|f| {
+                let mut layout = f.layout.clone();
+                layout.monitor = fence_monitor(f.hwnd);
+                layout
+            })
+            .collect()
+    }
+
+    /// Guarda (o actualiza) una plantilla con la geometria actual.
+    pub(crate) fn save_layout_template(&mut self, name: &str) {
+        let layouts = self.capture_layouts();
+        if let Some(t) = self.cfg.templates.iter_mut().find(|t| t.name == name) {
+            t.layouts = layouts;
+        } else {
+            self.cfg.templates.push(crate::config::LayoutTemplate {
+                name: name.to_string(),
+                layouts,
+                default: false,
+            });
+        }
+        let _ = self.cfg.save(&self.cfg_path);
+    }
+
+    /// Aplica una plantilla guardada: reposiciona las cajas existentes por id.
+    pub(crate) fn apply_layout_template(&mut self, name: &str) -> bool {
+        let Some(t) = self.cfg.templates.iter().find(|t| t.name == name) else {
+            return false;
+        };
+        let monitors = current_monitors();
+        for fence in &mut self.fences {
+            if let Some(slot) = t.layouts.iter().find(|l| l.id.as_str() == fence.layout.id.as_str()) {
+                // Multi-monitor: la posicion guardada se traslada al monitor
+                // correspondiente de la disposicion actual (o al primario si
+                // el monitor original ya no existe).
+                let (nx, ny) = match slot.monitor {
+                    Some(m) => m.translate(slot.x, slot.y, slot.width, slot.height, &monitors),
+                    None => (slot.x, slot.y),
+                };
+                fence.layout.x = nx;
+                fence.layout.y = ny;
+                fence.layout.width = slot.width;
+                fence.layout.height = slot.height;
+                fence.layout.collapsed = slot.collapsed;
+                fence.layout.locked = slot.locked;
+                fence.origin = fence.layout.clone();
+                unsafe {
+                    let _ = SetWindowPos(
+                        fence.hwnd,
+                        HWND_BOTTOM,
+                        fence.layout.x,
+                        fence.layout.y,
+                        fence.layout.width,
+                        fence.visible_height(&self.theme),
+                        SWP_NOACTIVATE,
+                    );
+                }
+            }
+        }
+        self.render_all();
+        self.persist_layout();
+        true
+    }
+
+    /// Elimina una plantilla guardada.
+    pub(crate) fn delete_layout_template(&mut self, name: &str) {
+        self.cfg.templates.retain(|t| t.name != name);
+        let _ = self.cfg.save(&self.cfg_path);
+    }
+
+    /// Marca la plantilla `name` como por defecto (solo puede haber una).
+    pub(crate) fn set_default_template(&mut self, name: &str) {
+        for t in &mut self.cfg.templates {
+            t.default = t.name == name;
+        }
+        let _ = self.cfg.save(&self.cfg_path);
+    }
+
+    /// Aplica la plantilla por defecto si su disposicion de monitores coincide
+    /// con la actual `monitors` (p.ej. al conectar un monitor conocido). No
+    /// hace nada si no hay plantilla por defecto, si no cuadra o durante un
+    /// arrastre.
+    fn apply_default_template_if(&mut self, monitors: &[crate::config::MonitorRect]) {
+        if self.dragging {
+            return;
+        }
+        let Some(t) = self.cfg.templates.iter().find(|t| t.default) else {
+            return;
+        };
+        if t.matches_monitors(monitors) {
+            let name = t.name.clone();
+            let _ = self.apply_layout_template(&name);
+        }
     }
 
     fn open_item(&self, path: &Path) {
@@ -3553,6 +3919,9 @@ impl Drop for App {
             if !self.thumb_hwnd.is_invalid() {
                 let _ = DestroyWindow(self.thumb_hwnd);
             }
+            if !self.guides_hwnd.is_invalid() {
+                let _ = DestroyWindow(self.guides_hwnd);
+            }
             for fence in self.fences.drain(..) {
                 let _ = DestroyWindow(fence.hwnd);
             }
@@ -3609,6 +3978,17 @@ unsafe fn register_classes(instance: HINSTANCE) -> WinResult<()> {
         ..Default::default()
     };
     if RegisterClassExW(&toast) == 0 {
+        return Err(windows::core::Error::from_win32());
+    }
+
+    let guides = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(guides_proc),
+        hInstance: instance,
+        lpszClassName: CLASS_GUIDES,
+        ..Default::default()
+    };
+    if RegisterClassExW(&guides) == 0 {
         return Err(windows::core::Error::from_win32());
     }
 
@@ -3729,6 +4109,10 @@ extern "system" fn controller_proc(
                 LRESULT(0)
             }
             WM_ZEN_TOAST_CLICK => {
+                // Cualquier clic en un toast lo descarta y muestra el siguiente.
+                if let Some(app) = app_from(hwnd) {
+                    app.toast_dismissed();
+                }
                 // El usuario hizo clic en el toast de update: descargar e instalar.
                 if let Some((url, sig_url)) = updater::take_pending_update() {
                     match updater::download_and_install(&url, &sig_url) {
@@ -3763,6 +4147,16 @@ extern "system" fn controller_proc(
                 LRESULT(0)
             }
             WM_TIMER => {
+                // El retraso de inicio se maneja antes del guard de dragging:
+                // es one-shot y si se perdiera el tick las cajas quedarian
+                // ocultas para siempre.
+                if wparam.0 == TIMER_STARTUP {
+                    let _ = KillTimer(hwnd, TIMER_STARTUP);
+                    if let Some(app) = app_from(hwnd) {
+                        app.startup_reveal();
+                    }
+                    return LRESULT(0);
+                }
                 if let Some(app) = app_from(hwnd) {
                     // No ejecutar animaciones, persistencia ni barridos dentro
                     // del bucle modal OLE; algunos de ellos pueden renderizar o
@@ -3808,7 +4202,22 @@ extern "system" fn controller_proc(
                 }
                 LRESULT(0)
             }
-            WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
+            WM_DISPLAYCHANGE => {
+                if let Some(app) = app_from(hwnd) {
+                    if !app.dragging {
+                        // Monitor conectado/desconectado: si hay una plantilla
+                        // por defecto para esta disposicion, se aplica sola.
+                        let monitors = current_monitors();
+                        app.apply_default_template_if(&monitors);
+                        app.render_all();
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_SETTINGCHANGE => {
+                // Cambios de sistema (tema, DPI, etc.): solo re-render, nunca
+                // aplicar plantillas: las cajas no deben saltar por un cambio
+                // ajeno a la disposicion de pantalla.
                 if let Some(app) = app_from(hwnd) {
                     if !app.dragging {
                         app.render_all();
@@ -4028,6 +4437,23 @@ unsafe extern "system" fn drop_target_drop(
 }
 
 unsafe extern "system" fn thumb_proc(
+    hwnd: HWND,
+    message: u32,
+    _wparam: WPARAM,
+    _lparam: LPARAM,
+) -> LRESULT {
+    match message {
+        WM_PAINT => {
+            let _ = ValidateRect(hwnd, None);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, message, _wparam, _lparam),
+    }
+}
+
+/// Ventana overlay de guias de alineacion magnetica: solo valida WM_PAINT
+/// (todo el dibujo se hace por UpdateLayeredWindow).
+unsafe extern "system" fn guides_proc(
     hwnd: HWND,
     message: u32,
     _wparam: WPARAM,
@@ -4491,15 +4917,17 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 if mode == DragMode::Move {
                     let mut candidate_x = origin.x + dx;
                     let mut candidate_y = origin.y + dy;
+                    let mut guide_vx: Option<i32> = None;
+                    let mut guide_vy: Option<i32> = None;
 
                     let snap_dist = 10;
                     let work = work_area();
 
                     // Snap a los bordes del monitor
-                    if (candidate_x - work.left).abs() < snap_dist { candidate_x = work.left; }
-                    if (candidate_y - work.top).abs() < snap_dist { candidate_y = work.top; }
-                    if ((candidate_x + origin.width) - work.right).abs() < snap_dist { candidate_x = work.right - origin.width; }
-                    if ((candidate_y + origin.height) - work.bottom).abs() < snap_dist { candidate_y = work.bottom - origin.height; }
+                    if (candidate_x - work.left).abs() < snap_dist { candidate_x = work.left; guide_vx = Some(work.left); }
+                    if (candidate_y - work.top).abs() < snap_dist { candidate_y = work.top; guide_vy = Some(work.top); }
+                    if ((candidate_x + origin.width) - work.right).abs() < snap_dist { candidate_x = work.right - origin.width; guide_vx = Some(work.right); }
+                    if ((candidate_y + origin.height) - work.bottom).abs() < snap_dist { candidate_y = work.bottom - origin.height; guide_vy = Some(work.bottom); }
 
                     // Snap imantado con respecto a otras cajas adyacentes
                     for (i, f) in app.fences.iter().enumerate() {
@@ -4509,17 +4937,29 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                         let fw = f.layout.width;
                         let fh = f.layout.height;
 
-                        if (candidate_x - (fx + fw)).abs() < snap_dist { candidate_x = fx + fw; }
-                        if ((candidate_x + origin.width) - fx).abs() < snap_dist { candidate_x = fx - origin.width; }
-                        if (candidate_x - fx).abs() < snap_dist { candidate_x = fx; }
+                        // Alineacion de bordes (izquierda/derecha de la movida)
+                        if (candidate_x - (fx + fw)).abs() < snap_dist { candidate_x = fx + fw; guide_vx = Some(fx + fw); }
+                        if ((candidate_x + origin.width) - fx).abs() < snap_dist { candidate_x = fx - origin.width; guide_vx = Some(fx); }
+                        if (candidate_x - fx).abs() < snap_dist { candidate_x = fx; guide_vx = Some(fx); }
+                        if ((candidate_x + origin.width) - (fx + fw)).abs() < snap_dist { candidate_x = fx + fw - origin.width; guide_vx = Some(fx + fw); }
 
-                        if (candidate_y - (fy + fh)).abs() < snap_dist { candidate_y = fy + fh; }
-                        if ((candidate_y + origin.height) - fy).abs() < snap_dist { candidate_y = fy - origin.height; }
-                        if (candidate_y - fy).abs() < snap_dist { candidate_y = fy; }
+                        if (candidate_y - (fy + fh)).abs() < snap_dist { candidate_y = fy + fh; guide_vy = Some(fy + fh); }
+                        if ((candidate_y + origin.height) - fy).abs() < snap_dist { candidate_y = fy - origin.height; guide_vy = Some(fy); }
+                        if (candidate_y - fy).abs() < snap_dist { candidate_y = fy; guide_vy = Some(fy); }
+                        if ((candidate_y + origin.height) - (fy + fh)).abs() < snap_dist { candidate_y = fy + fh - origin.height; guide_vy = Some(fy + fh); }
+
+                        // Alineacion de centros (horizontal y vertical)
+                        let my_cx = candidate_x + origin.width / 2;
+                        let f_cx = fx + fw / 2;
+                        if (my_cx - f_cx).abs() < snap_dist { candidate_x = f_cx - origin.width / 2; guide_vx = Some(f_cx); }
+                        let my_cy = candidate_y + origin.height / 2;
+                        let f_cy = fy + fh / 2;
+                        if (my_cy - f_cy).abs() < snap_dist { candidate_y = f_cy - origin.height / 2; guide_vy = Some(f_cy); }
                     }
 
                     app.fences[index].layout.x = candidate_x;
                     app.fences[index].layout.y = candidate_y;
+                    app.show_guides(guide_vx, guide_vy);
                 } else if mode == DragMode::Resize {
                     app.fences[index].layout.width = (origin.width + dx).max(160);
                     app.fences[index].layout.height = (origin.height + dy).max(96);
@@ -4538,6 +4978,15 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                     SWP_NOACTIVATE,
                 );
                 let _ = app.render(index);
+                LRESULT(0)
+            }
+            WM_CAPTURECHANGED => {
+                // Si se pierde la captura (p.ej. alt-tab) sin WM_LBUTTONUP,
+                // limpiar el drag y ocultar las guias para no dejarlas huérfanas.
+                if app.fences[index].drag != DragMode::None {
+                    app.fences[index].drag = DragMode::None;
+                    app.hide_guides();
+                }
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
@@ -4561,6 +5010,7 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 }
  if app.fences[index].drag != DragMode::None {
                     let _ = ReleaseCapture();
+                    app.hide_guides();
                     app.fences[index].drag = DragMode::None;
                     let snap = app.theme.snap;
                     if snap > 1 {
@@ -5011,6 +5461,63 @@ unsafe fn class_name(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buffer[..len.max(0) as usize])
 }
 
+/// Extrae los limites de pantalla completa del monitor (o None si falla).
+fn monitor_rect(hmon: HMONITOR) -> Option<crate::config::MonitorRect> {
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        rcMonitor: RECT::default(),
+        rcWork: RECT::default(),
+        dwFlags: 0,
+    };
+    if !unsafe { GetMonitorInfoW(hmon, &mut mi) }.as_bool() {
+        return None;
+    }
+    Some(crate::config::MonitorRect {
+        left: mi.rcMonitor.left,
+        top: mi.rcMonitor.top,
+        right: mi.rcMonitor.right,
+        bottom: mi.rcMonitor.bottom,
+    })
+}
+
+/// Limites del monitor (pantalla completa) donde esta la ventana.
+fn fence_monitor(hwnd: HWND) -> Option<crate::config::MonitorRect> {
+    unsafe {
+        let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if hmon.0.is_null() {
+            return None;
+        }
+        monitor_rect(hmon)
+    }
+}
+
+/// Limites de todos los monitores de la disposicion actual.
+fn current_monitors() -> Vec<crate::config::MonitorRect> {
+    let mut out: Vec<crate::config::MonitorRect> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            HDC(std::ptr::null_mut()),
+            None,
+            Some(monitor_enum_proc),
+            LPARAM(&mut out as *mut Vec<crate::config::MonitorRect> as isize),
+        );
+    }
+    out
+}
+
+unsafe extern "system" fn monitor_enum_proc(
+    hmon: HMONITOR,
+    _hdc: HDC,
+    _clip: *mut RECT,
+    data: LPARAM,
+) -> BOOL {
+    if let Some(rect) = monitor_rect(hmon) {
+        let monitors = &mut *(data.0 as *mut Vec<crate::config::MonitorRect>);
+        monitors.push(rect);
+    }
+    BOOL(1)
+}
+
 fn work_area() -> RECT {
     let mut area = RECT::default();
     unsafe {
@@ -5034,8 +5541,9 @@ fn work_area() -> RECT {
 }
 
 /// Comprobacion en tiempo de compilacion: la geometria persistida debe seguir
-/// siendo `Copy` y de tamano fijo para poder clonarse en cada frame de arrastre.
-const _: () = assert!(std::mem::size_of::<FenceLayout>() <= 128);
+/// siendo de tamano fijo para poder clonarse en cada frame de arrastre.
+/// 144 bytes: FenceLayout lleva ademas el monitor de la caja (plantillas).
+const _: () = assert!(std::mem::size_of::<FenceLayout>() <= 192);
 
 // ---------------------------------------------------------------------------
 // Probe end-to-end (cargo test --release -- --ignored fence_e2e_probe)

@@ -28,38 +28,43 @@
 - **📂 Multi-desktop support** — Public desktop, OneDrive, and any additional folders
 - **⏱️ Auto-archiving** — Move old files to an archive folder with configurable age
 - **🌙 Zen Mode** — Hide/show all fences with double-click on desktop or `Ctrl+Alt+Z`
+- **🧲 Magnetic snap** — Blue alignment guides while dragging fences (edges, centers, same-size)
+- **📋 Layout templates** — Save named layout snapshots and reapply them with one click
+- **🖥️ Multi-monitor aware** — Templates remember each fence's monitor and reposition correctly on any display setup
+- **⚡ Auto-restore** — Mark a template as default and it applies itself when a known monitor connects (e.g. docking)
+- **⏱️ Startup delay** — Optional delay so fences appear after Windows finishes loading
 - **🌍 Multi-language** — English, Spanish, German, French, Portuguese, Italian
 - **🪶 Ultralight** — ~780 KB binary, ~4 MB RAM idle, 0% CPU (fully event-driven, no polling)
-- **🔔 Toast notifications** — Visual feedback with contextual icons (🟢 drops, 🔵 organization)
+- **🔔 Toast notifications** — Visual feedback with a queue (🟢 drops, 🔵 organization) so they never overwrite each other
 - **🤖 Local AI (Ollama)** — Semantic classification and automatic fence creation via local LLM
 
 ## 📥 Download
 
 | Format | File | Best for |
 |---|---|---|
-| 🖥️ **Installer (EXE)** | `ZenDesktop-1.0.11-setup.exe` | Most users — wizard installer with Start Menu shortcut |
-| 📦 **Installer (MSI)** | `ZenDesktop-v1.0.11-x64.msi` | Enterprises / system-wide installs with clean uninstall |
-| 💾 **Portable** | `ZenDesktop-v1.0.11-portable.zip` | USB drives, custom paths, no installation |
+| 🖥️ **Installer (EXE)** | `ZenDesktop-1.0.12-setup.exe` | Most users — wizard installer with Start Menu shortcut |
+| 📦 **Installer (MSI)** | `ZenDesktop-v1.0.12-x64.msi` | Enterprises / system-wide installs with clean uninstall |
+| 💾 **Portable** | `ZenDesktop-v1.0.12-portable.zip` | USB drives, custom paths, no installation |
 
 All downloads are available at **[Releases](https://github.com/jaimitus/ZenDesktop/releases)**.
 
 ### 🖥️ EXE Installer (recommended)
 
-1. Download `ZenDesktop-1.0.11-setup.exe` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+1. Download `ZenDesktop-1.0.12-setup.exe` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Run the installer — accepts the license, installs to `Program Files\ZenDesktop`
 3. Start Menu shortcut is created automatically
 4. Uninstall via Windows Settings → Apps, or re-run the installer
 
 ### 📦 MSI Installer
 
-1. Download `ZenDesktop-v1.0.11-x64.msi` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+1. Download `ZenDesktop-v1.0.12-x64.msi` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Run the installer — it installs to `Program Files\ZenDesktop` for all users
 3. Start Menu shortcut is created automatically
 4. Uninstall via Windows Settings → Apps, or re-run the MSI
 
 ### 💾 Portable (for USB drives / custom paths)
 
-1. Download `ZenDesktop-v1.0.11-portable.zip` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+1. Download `ZenDesktop-v1.0.12-portable.zip` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Extract to any folder (e.g. `%APPDATA%\ZenDesktop\`)
 3. Run `ZenDesktop.exe` — it minimizes to the system tray
 4. **Optional**: Add a shortcut to `shell:startup` for auto-start with Windows
@@ -91,6 +96,8 @@ cargo build --release
 | Search in a fence | Click the search bar 🔍 |
 | Change sort order | Right-click → Sort by |
 | Lock fence position | Click the lock icon 🔒 |
+| Save layout template | Settings → General → Layout templates → Save layout |
+| Auto-restore layout | Mark a template as default (★) in Settings → General |
 
 ## ⚙️ Configuration
 

@@ -7,6 +7,31 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.12] - 2026-08-13
+
+### Added
+- **Layout templates**: save named snapshots of all fence positions from
+  Settings → General and reapply them with one click (clickable chips).
+  Each template can be marked as the default (star icon).
+- **Multi-monitor aware templates**: templates remember which monitor each
+  fence lives on; applying one repositions fences onto their monitors even
+  when the display setup changed (moved, swapped, resized, or unplugged
+  monitors) — and never leaves a fence off-screen.
+- **Auto-restore on known monitors**: when the current monitor arrangement
+  matches the default template (e.g. reconnecting a dock), the layout
+  restores itself automatically — at startup if the display changed since
+  the last session, and live whenever monitors are connected/disconnected.
+- **Configurable startup delay**: fences appear after a configurable delay
+  (0–600 s) so they don't cover the desktop while Windows finishes booting.
+- **Toast queue**: notifications now queue up (max 5) instead of overwriting
+  each other, and clicking one dismisses it instantly.
+- **Magnetic snap guides**: blue alignment guides while dragging fences —
+  edges, centers, and same-size alignment with other fences and the monitor.
+
+### Changed
+- **Pretty empty state**: empty fences show a centered icon and a hint
+  ("Drop files here") instead of plain text.
+
 ## [1.0.11] - 2026-08-12
 
 ### Changed

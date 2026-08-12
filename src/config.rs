@@ -105,6 +105,15 @@ pub struct Config {
     pub rules: Vec<Rule>,
     /// Geometria persistida de cada caja (se reescribe al arrastrar/redimensionar).
     pub fences: Vec<FenceLayout>,
+    /// Plantillas de layout: snapshots con nombre de la geometria de todas las
+    /// cajas, para guardar y reaplicar perfiles (trabajo/ocio, etc.).
+    #[serde(default)]
+    pub templates: Vec<LayoutTemplate>,
+    /// Firma de monitores de la ultima sesion: al arrancar se compara con la
+    /// disposicion actual para saber si la pantalla cambio (y solo entonces
+    /// aplicar la plantilla por defecto, p.ej. al reconectar un dock).
+    #[serde(default)]
+    pub last_monitors: Vec<MonitorRect>,
     /// Idioma de la interfaz: en, es, de, fr, pt, it (ingles por defecto).
     #[serde(default = "default_language")]
     pub language: String,
@@ -155,6 +164,11 @@ pub struct General {
     pub zen_hides_desktop_icons: bool,
     /// Registrar la app en HKCU\...\Run.
     pub start_with_windows: bool,
+    /// Retraso (segundos) antes de mostrar las cajas al arrancar; 0 = inmediato.
+    /// Evita que las cajas tapan el escritorio mientras la sesion de Windows
+    /// sigue cargando programas de inicio.
+    #[serde(default)]
+    pub startup_delay_seconds: u32,
     /// Mover tambien las carpetas del escritorio a sus cajas (solo reglas con
     /// `include_folders` y `move_files`; nunca se copian entre volumenes).
     #[serde(default = "default_true")]
@@ -272,6 +286,9 @@ pub struct FenceLayout {
     pub sort_by: Option<String>,
     pub group_title: Option<String>,
     pub tabs: Vec<String>,
+    /// Monitor donde vive la caja (limites de pantalla completa): lo rellena
+    /// la captura de plantillas para reposicionar en disposiciones distintas.
+    pub monitor: Option<MonitorRect>,
 }
 
 /// Cadena corta de tamano fijo: evita una asignacion por caja y mantiene
@@ -322,6 +339,79 @@ impl<'de> Deserialize<'de> for String32 {
     }
 }
 
+/// Limites de un monitor en coordenadas de pantalla virtual. Se guardan en las
+/// plantillas para poder reposicionar las cajas cuando la disposicion de
+/// monitores cambia entre la captura y la aplicacion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct MonitorRect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+impl MonitorRect {
+    pub fn width(&self) -> i32 {
+        self.right - self.left
+    }
+
+    pub fn height(&self) -> i32 {
+        self.bottom - self.top
+    }
+
+    /// Traslada la posicion guardada `(x, y)` (con tamano `w` x `h`) a la
+    /// disposicion de monitores actual `now`:
+    ///   1. Monitor identico  -> desplazamiento exacto.
+    ///   2. Mismo tamano      -> el candidato mas cercano conserva el offset
+    ///      relativo dentro del monitor (monitores movidos o permutados).
+    ///   3. Monitor perdido   -> relativo al monitor primario.
+    ///
+    /// En los casos 2 y 3 la posicion se recorta para que la caja nunca quede
+    /// fuera de la pantalla. Sin monitores, devuelve la posicion original.
+    pub fn translate(&self, x: i32, y: i32, w: i32, h: i32, now: &[MonitorRect]) -> (i32, i32) {
+        if let Some(m) = now.iter().find(|m| **m == *self) {
+            return (x + (m.left - self.left), y + (m.top - self.top));
+        }
+        let same_size = now
+            .iter()
+            .filter(|m| m.width() == self.width() && m.height() == self.height())
+            .min_by_key(|m| (m.left - self.left).abs() + (m.top - self.top).abs());
+        let target = same_size
+            .or_else(|| now.iter().find(|m| m.left == 0 && m.top == 0))
+            .or_else(|| now.first());
+        let Some(t) = target else { return (x, y) };
+        let x_max = (t.right - w).max(t.left);
+        let y_max = (t.bottom - h).max(t.top);
+        let nx = (t.left + (x - self.left)).clamp(t.left, x_max);
+        let ny = (t.top + (y - self.top)).clamp(t.top, y_max);
+        (nx, ny)
+    }
+
+}
+
+/// Plantilla de layout: snapshot con nombre de la geometria de todas las cajas.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayoutTemplate {
+    pub name: String,
+    pub layouts: Vec<FenceLayout>,
+    /// Plantilla por defecto: se aplica sola al arrancar o al conectar un
+    /// monitor de su disposicion. Solo una puede estar marcada.
+    #[serde(default)]
+    pub default: bool,
+}
+
+impl LayoutTemplate {
+    /// true si todos los monitores que usa esta plantilla estan presentes en
+    /// la disposicion actual `now` con los mismos limites (monitor conocido
+    /// reconectado en el mismo sitio). La coincidencia es exacta a proposito:
+    /// con solo mismo tamano se dispararia al desconectar un monitor. Las
+    /// plantillas sin informacion de monitores nunca coinciden solas.
+    pub fn matches_monitors(&self, now: &[MonitorRect]) -> bool {
+        let saved: Vec<MonitorRect> = self.layouts.iter().filter_map(|l| l.monitor).collect();
+        !saved.is_empty() && saved.iter().all(|m| now.contains(m))
+    }
+}
+
 impl Default for FenceLayout {
     fn default() -> Self {
         FenceLayout {
@@ -336,6 +426,7 @@ impl Default for FenceLayout {
             sort_by: None,
             tabs: Vec::new(),
             group_title: None,
+            monitor: None,
         }
     }
 }
@@ -357,6 +448,7 @@ impl Default for General {
             zen_hotkey: true,
             zen_hides_desktop_icons: true,
             start_with_windows: false,
+            startup_delay_seconds: 0,
             organize_folders: true,
             protected: vec![
                 "desktop.ini".into(),
@@ -428,6 +520,8 @@ impl Default for Config {
             ai: AiConfig::default(),
             rules: default_rules(),
             fences: Vec::new(),
+            templates: Vec::new(),
+            last_monitors: Vec::new(),
             language: "en".into(),
         }
     }
@@ -598,11 +692,26 @@ impl Config {
         let g = &mut self.general;
         g.debounce_ms = g.debounce_ms.clamp(50, 10_000);
         g.sweep_interval_minutes = g.sweep_interval_minutes.clamp(1, 24 * 60);
+        g.startup_delay_seconds = g.startup_delay_seconds.clamp(0, 600);
         if g.root_folder.trim().is_empty() {
             g.root_folder = default_boxes_path("ZenDesktop");
         }
         if g.archive_folder.trim().is_empty() {
             g.archive_folder = default_boxes_path("ZenArchive");
+        }
+
+        // Plantillas sin nombre (config editada a mano) se descartan.
+        self.templates.retain(|t| !t.name.is_empty());
+        // A lo sumo una plantilla por defecto: la primera marcada gana.
+        let mut seen_default = false;
+        for t in &mut self.templates {
+            if t.default {
+                if seen_default {
+                    t.default = false;
+                } else {
+                    seen_default = true;
+                }
+            }
         }
 
         let a = &mut self.appearance;
@@ -990,5 +1099,118 @@ mod tests {
         let raw = "[general]\n";
         let cfg: Config = toml::from_str(raw).unwrap();
         assert_eq!(cfg.lang().code(), "en");
+    }
+
+    #[test]
+    fn fence_layout_monitor_round_trips() {
+        let fl = FenceLayout {
+            monitor: Some(MonitorRect { left: -1920, top: 0, right: 0, bottom: 1080 }),
+            ..Default::default()
+        };
+        let toml = toml::to_string(&fl).unwrap();
+        let back: FenceLayout = toml::from_str(&toml).unwrap();
+        assert_eq!(back.monitor, fl.monitor);
+        // Las cajas antiguas sin el campo cargan como None.
+        let back: FenceLayout = toml::from_str("id = \"x\"\n").unwrap();
+        assert_eq!(back.monitor, None);
+    }
+
+    #[test]
+    fn monitor_translate_same_layout_keeps_position() {
+        let saved = MonitorRect { left: -1920, top: 0, right: 0, bottom: 1080 };
+        let now = vec![
+            MonitorRect { left: -1920, top: 0, right: 0, bottom: 1080 },
+            MonitorRect { left: 0, top: 0, right: 1920, bottom: 1080 },
+        ];
+        assert_eq!(saved.translate(-1500, 300, 320, 240, &now), (-1500, 300));
+    }
+
+    #[test]
+    fn monitor_translate_same_size_moved_picks_nearest() {
+        let saved = MonitorRect { left: -1920, top: 0, right: 0, bottom: 1080 };
+        let now = vec![
+            MonitorRect { left: 0, top: 0, right: 1920, bottom: 1080 },
+            MonitorRect { left: 1920, top: 0, right: 3840, bottom: 1080 },
+        ];
+        assert_eq!(saved.translate(-1500, 300, 320, 240, &now), (420, 300));
+    }
+
+    #[test]
+    fn monitor_translate_lost_monitor_clamps_to_primary() {
+        let saved = MonitorRect { left: 0, top: 0, right: 2560, bottom: 1440 };
+        let now = vec![MonitorRect { left: 0, top: 0, right: 1920, bottom: 1080 }];
+        assert_eq!(saved.translate(2000, 1200, 600, 400, &now), (1320, 680));
+    }
+
+    #[test]
+    fn monitor_translate_wide_fence_clamps_without_panic() {
+        // Caja mas ancha que el monitor destino: el recorte no debe entrar en
+        // panico (min > max en clamp) y deja la caja visible a la izquierda.
+        let saved = MonitorRect { left: 0, top: 0, right: 1920, bottom: 1080 };
+        let now = vec![MonitorRect { left: 0, top: 0, right: 1280, bottom: 800 }];
+        let (x, y) = saved.translate(100, 100, 3000, 500, &now);
+        assert_eq!((x, y), (0, 100));
+    }
+
+    #[test]
+    fn monitor_translate_no_monitors_keeps_position() {
+        let saved = MonitorRect { left: 0, top: 0, right: 1920, bottom: 1080 };
+        assert_eq!(saved.translate(100, 100, 320, 240, &[]), (100, 100));
+    }
+
+    #[test]
+    fn template_matches_monitors_when_all_present() {
+        let fl = |id: &str, m: MonitorRect| FenceLayout {
+            id: String32::new(id),
+            monitor: Some(m),
+            ..Default::default()
+        };
+        let t = LayoutTemplate {
+            name: "dock".into(),
+            layouts: vec![
+                fl("a", MonitorRect { left: 0, top: 0, right: 1920, bottom: 1080 }),
+                fl("b", MonitorRect { left: 1920, top: 0, right: 3840, bottom: 1080 }),
+            ],
+            default: true,
+        };
+        // Ambos monitores conectados -> coincide.
+        let dual = vec![
+            MonitorRect { left: 0, top: 0, right: 1920, bottom: 1080 },
+            MonitorRect { left: 1920, top: 0, right: 3840, bottom: 1080 },
+        ];
+        assert!(t.matches_monitors(&dual));
+        // Solo uno conectado -> no coincide.
+        let single = vec![MonitorRect { left: 0, top: 0, right: 1920, bottom: 1080 }];
+        assert!(!t.matches_monitors(&single));
+        // Plantilla sin informacion de monitores -> nunca coincide sola.
+        let old = LayoutTemplate {
+            name: "old".into(),
+            layouts: vec![FenceLayout::default()],
+            default: false,
+        };
+        assert!(!old.matches_monitors(&dual));
+    }
+
+    #[test]
+    fn normalize_keeps_single_default_template() {
+        let mut cfg = Config::default();
+        cfg.templates.push(LayoutTemplate {
+            name: "a".into(),
+            layouts: vec![],
+            default: true,
+        });
+        cfg.templates.push(LayoutTemplate {
+            name: "b".into(),
+            layouts: vec![],
+            default: true,
+        });
+        cfg.normalize();
+        let defaults: Vec<&str> = cfg
+            .templates
+            .iter()
+            .filter(|t| t.default)
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(defaults, vec!["a"]);
     }
 }

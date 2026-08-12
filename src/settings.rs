@@ -18,6 +18,8 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -67,7 +69,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::config::{parse_color, wide, Config, Rule};
+use crate::config::{parse_color, wide, Config, LayoutTemplate, Rule};
 use crate::i18n::{Lang, Tr};
 use crate::ui::App;
 
@@ -101,6 +103,8 @@ const ID_EDIT_A_GRID_SIZE: u16 = 22;
 const ID_EDIT_AI_URL: u16 = 23;
 const ID_EDIT_AI_MODEL: u16 = 24;
 const ID_EDIT_A_GRID_ICON: u16 = 26;
+const ID_EDIT_STARTUP_DELAY: u16 = 27;
+const ID_EDIT_TEMPLATE_NAME: u16 = 28;
 
 const ID_CHECK_ORGANIZE_FOLDERS: u16 = 101;
 const ID_CHECK_ORGANIZE_START: u16 = 102;
@@ -138,14 +142,43 @@ const ID_BTN_CHECK_UPDATES: u16 = 213;
 const ID_BTN_DOWNLOAD_UPDATE: u16 = 214;
 const ID_BTN_EXPORT_CFG: u16 = 215;
 const ID_BTN_IMPORT_CFG: u16 = 216;
+const ID_BTN_TEMPLATE_SAVE: u16 = 217;
+const ID_BTN_TEMPLATE_APPLY: u16 = 218;
+const ID_BTN_TEMPLATE_DEL: u16 = 219;
+const ID_BTN_TEMPLATE_DEFAULT: u16 = 220;
 
-const ALL_EDITS: [u16; 26] = [
+// ---------------------------------------------------------------------------
+// Resultados asíncronos (hilo de trabajo -> hilo de UI del diálogo).
+// Las llamadas de red (update, Ollama) NUNCA se hacen en el hilo de UI: un
+// hilo de trabajo las ejecuta, guarda el resultado en un static y avisa con
+// PostMessageW; dlg_proc consume el resultado cuando llega el mensaje.
+// ---------------------------------------------------------------------------
+const WM_AI_PING_DONE: u32 = WM_APP + 0x41;
+const WM_AI_MODELS_DONE: u32 = WM_APP + 0x42;
+const WM_AI_CLUSTER_DONE: u32 = WM_APP + 0x43;
+const WM_UPDATE_DONE: u32 = WM_APP + 0x44;
+
+static AI_PING_RESULT: Mutex<Option<bool>> = Mutex::new(None);
+static AI_MODELS_RESULT: Mutex<Option<Vec<String>>> = Mutex::new(None);
+static AI_CLUSTER_RESULT: Mutex<Option<Vec<crate::ai::AiSuggestedRule>>> = Mutex::new(None);
+static UPDATE_RESULT: Mutex<Option<crate::updater::UpdateStatus>> = Mutex::new(None);
+
+/// Guarda anti doble-clic: evita lanzar dos hilos de red a la vez por accion.
+static AI_BUSY: AtomicBool = AtomicBool::new(false);
+static UPDATE_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Timer de animacion del spinner mientras hay una operacion de red en curso.
+const BUSY_TIMER_ID: usize = 0x4E5;
+
+const ALL_EDITS: [u16; 28] = [
     ID_EDIT_MAX_AGE, ID_EDIT_MIN_AGE, ID_EDIT_PURGE, ID_EDIT_R_TITLE, ID_EDIT_R_FOLDER,
     ID_EDIT_R_COLOR, ID_EDIT_R_EXTS, ID_EDIT_R_PATTERNS, ID_EDIT_R_GROUP_TITLE, ID_EDIT_A_BG, ID_EDIT_A_HOVER,
     ID_EDIT_A_BORDER, ID_EDIT_A_TITLE, ID_EDIT_A_TEXT, ID_EDIT_A_MUTED, ID_EDIT_A_SHADOW,
     ID_EDIT_A_RADIUS, ID_EDIT_A_TITLE_SIZE, ID_EDIT_A_TEXT_SIZE, ID_EDIT_A_SNAP,
     ID_EDIT_G_ROOT, ID_EDIT_G_ARCHIVE,
     ID_EDIT_A_GRID_SIZE, ID_EDIT_AI_URL, ID_EDIT_AI_MODEL, ID_EDIT_A_GRID_ICON,
+    ID_EDIT_STARTUP_DELAY,
+    ID_EDIT_TEMPLATE_NAME,
 ];
 
 // Valores de teclas para patrones de match (las constantes VK_* no son
@@ -228,6 +261,7 @@ enum Ctrl {
     Scroll,
     Picker(PickerPart),
     Lang(Lang),
+    Template(usize),
     Theme(&'static str),
     None,
 }
@@ -323,6 +357,9 @@ struct Settings {
     finished: bool,
     result: bool,
     target_px_size: (u32, u32),
+    // Fase de animacion del spinner (0..1) y si el timer de repintado esta vivo.
+    spinner_phase: f32,
+    busy_timer: bool,
 }
 
 const HEADER_H: f32 = 48.0;
@@ -868,6 +905,45 @@ impl Settings {
         );
     }
 
+    /// Dibuja un spinner de carga (anillo de segmentos girando) centrado en
+    /// (cx, cy). `phase` (0..1) anima la posicion del segmento mas brillante.
+    fn spinner(&mut self, cx: f32, cy: f32, r: f32, phase: f32) {
+        const SEGS: usize = 8;
+        let tau = std::f32::consts::TAU;
+        for i in 0..SEGS {
+            let t = i as f32 / SEGS as f32;
+            let mut d = t - phase;
+            d -= d.floor(); // distancia angular normalizada al segmento activo
+            let alpha = 1.0 - d; // el que va "detras" se atenua
+            let a = t * tau;
+            let (sin, cos) = a.sin_cos();
+            self.line(
+                cx + cos * r * 0.5,
+                cy + sin * r * 0.5,
+                cx + cos * r,
+                cy + sin * r,
+                D2D1_COLOR_F { r: 0.49, g: 0.83, b: 1.0, a: alpha },
+                2.0,
+            );
+        }
+    }
+
+    /// Arranca/para el timer que anima el spinner segun haya operaciones de
+    /// red en curso (AI_BUSY / UPDATE_BUSY). Solo se toca en transiciones.
+    fn sync_busy_timer(&mut self) {
+        let busy = AI_BUSY.load(Ordering::SeqCst) || UPDATE_BUSY.load(Ordering::SeqCst);
+        unsafe {
+            if busy && !self.busy_timer {
+                let _ = SetTimer(self.hwnd, BUSY_TIMER_ID, 80, None);
+                self.busy_timer = true;
+            } else if !busy && self.busy_timer {
+                let _ = KillTimer(self.hwnd, BUSY_TIMER_ID);
+                self.busy_timer = false;
+                self.spinner_phase = 0.0;
+            }
+        }
+    }
+
     fn push_button(&mut self, rect: Rect, label: &str, id: u16, kind: BtnKind) {
         let Rect { x, y, w, h } = rect;
         let over = self.hover == Some(Ctrl::Btn(id));
@@ -968,6 +1044,8 @@ impl Settings {
         ] {
             y = self.check(y, cx, cw, id, label);
         }
+        // Retraso antes de mostrar las cajas al arrancar (0 = inmediato).
+        y = self.num_row(y, cx, ID_EDIT_STARTUP_DELAY, self.tr.fld_startup_delay, &format!("{}", self.cfg.general.startup_delay_seconds));
         // Carpeta donde se guardan los elementos organizados (cajas fisicas).
         let root_folder = self.cfg.general.root_folder.clone();
         y = self.folder_row(
@@ -1019,7 +1097,78 @@ impl Settings {
         let bx0 = cx + 16.0;
         self.icon_button(Rect { x: bx0, y, w: 220.0, h: 32.0 }, self.tr.btn_export_cfg, ID_BTN_EXPORT_CFG, true);
         self.icon_button(Rect { x: bx0 + 230.0, y, w: 220.0, h: 32.0 }, self.tr.btn_import_cfg, ID_BTN_IMPORT_CFG, true);
-        let _ = y;
+        y += 42.0;
+        y = self.section(y, cx, cw, self.tr.sec_templates);
+        // Nombre de la plantilla a guardar/aplicar/borrar.
+        y = self.field_row(y, (cx, cw), ID_EDIT_TEMPLATE_NAME, self.tr.fld_template_name, "default", false);
+        let bx1 = cx + 16.0;
+        self.icon_button(Rect { x: bx1, y, w: 130.0, h: 30.0 }, self.tr.btn_template_save, ID_BTN_TEMPLATE_SAVE, true);
+        self.icon_button(Rect { x: bx1 + 140.0, y, w: 130.0, h: 30.0 }, self.tr.btn_template_apply, ID_BTN_TEMPLATE_APPLY, true);
+        self.icon_button(Rect { x: bx1 + 280.0, y, w: 130.0, h: 30.0 }, self.tr.btn_template_del, ID_BTN_TEMPLATE_DEL, !self.cfg.templates.is_empty());
+        self.icon_button(Rect { x: bx1 + 420.0, y, w: 130.0, h: 30.0 }, self.tr.btn_template_default, ID_BTN_TEMPLATE_DEFAULT, !self.cfg.templates.is_empty());
+        y += 40.0;
+        // Chips de las plantillas guardadas: clic = aplicar. Los nombres se
+        // clonan antes de dibujar para evitar el doble borrow con self.
+        let template_names: Vec<String> = self.cfg.templates.iter().map(|t| t.name.clone()).collect();
+        if !template_names.is_empty() {
+            let chip_gap = 8.0;
+            let x0 = cx + 16.0;
+            let chip_w = (cw - 32.0 - 2.0 * chip_gap) / 3.0;
+            for (i, name) in template_names.iter().enumerate() {
+                let col = i % 3;
+                let row = i / 3;
+                let is_default = self.cfg.templates.get(i).is_some_and(|t| t.default);
+                self.template_chip(
+                    Rect {
+                        x: x0 + col as f32 * (chip_w + chip_gap),
+                        y: y + row as f32 * 34.0,
+                        w: chip_w,
+                        h: 26.0,
+                    },
+                    i,
+                    name,
+                    is_default,
+                );
+            }
+        }
+    }
+
+    /// Chip de plantilla guardada (clic = aplicar y rellenar el campo nombre).
+    /// La plantilla por defecto se resalta con borde de acento y una estrella.
+    fn template_chip(&mut self, r: Rect, idx: usize, name: &str, is_default: bool) {
+        let over = self.hover == Some(Ctrl::Template(idx));
+        let bg = if over { col(C_HOVER) } else { col("#00000000") };
+        self.fill_rr(r.x, r.y, r.w, r.h, 7.0, bg);
+        if is_default {
+            self.draw_rr(r, 7.0, rgba(C_ACCENT, 0.85), 1.5);
+        } else {
+            self.draw_rr(r, 7.0, rgba(C_FIELD_BORDER, 0.6), 1.0);
+        }
+        let label = if is_default {
+            format!("★ {name}")
+        } else {
+            name.to_string()
+        };
+        self.text(
+            &label,
+            Fmt::Small,
+            D2D_RECT_F {
+                left: r.x + 4.0,
+                top: r.y + 4.0,
+                right: r.x + r.w - 4.0,
+                bottom: r.y + r.h - 2.0,
+            },
+            if is_default { col(C_ACCENT) } else { col(C_MUTED) },
+        );
+        self.add_region(
+            Ctrl::Template(idx),
+            D2D_RECT_F {
+                left: r.x,
+                top: r.y,
+                right: r.x + r.w,
+                bottom: r.y + r.h,
+            },
+        );
     }
 
     /// Chip de idioma (selector de i18n en el panel General).
@@ -1345,6 +1494,9 @@ impl Settings {
         y += 42.0;
         y = self.section(y, cx, cw, tr.sec_ai_organize);
         self.icon_button(Rect { x: bx0, y, w: 430.0, h: 34.0 }, tr.btn_ai_reorganize, ID_BTN_AI_REORGANIZE, true);
+        if AI_BUSY.load(Ordering::SeqCst) {
+            self.spinner(bx0 + 448.0, y + 17.0, 8.0, self.spinner_phase);
+        }
     }
 
     fn panel_updates(&mut self, cy: f32) {
@@ -1373,6 +1525,9 @@ impl Settings {
         y += 8.0;
         self.icon_button(Rect { x: bx0, y, w: 220.0, h: 32.0 }, self.tr.btn_check_updates, ID_BTN_CHECK_UPDATES, true);
         self.icon_button(Rect { x: bx0 + 230.0, y, w: 220.0, h: 32.0 }, self.tr.btn_download_update, ID_BTN_DOWNLOAD_UPDATE, true);
+        if UPDATE_BUSY.load(Ordering::SeqCst) {
+            self.spinner(bx0 + 236.0, y + 16.0, 8.0, self.spinner_phase);
+        }
     }
 }
 
@@ -1697,6 +1852,8 @@ impl Settings {
     fn render(&mut self) {
         self.regions.clear();
         self.edits_shown.clear();
+        // El timer del spinner se sincroniza cada frame, independiente del panel.
+        self.sync_busy_timer();
 
         let mut r = RECT::default();
         unsafe { let _ = GetClientRect(self.hwnd, &mut r); }
@@ -1887,6 +2044,7 @@ impl Settings {
                     Ctrl::Check(ID_CHECK_PUBLIC),
                     Ctrl::Check(ID_CHECK_SHORTCUTS),
                     Ctrl::Check(ID_CHECK_STARTUP),
+                    Ctrl::Field(ID_EDIT_STARTUP_DELAY),
                     Ctrl::Check(ID_CHECK_ZEN_DBL),
                     Ctrl::Check(ID_CHECK_ZEN_HOTKEY),
                     Ctrl::Check(ID_CHECK_ZEN_HIDE),
@@ -1897,6 +2055,11 @@ impl Settings {
                     Ctrl::Field(ID_EDIT_PURGE),
                     Ctrl::Btn(ID_BTN_EXPORT_CFG),
                     Ctrl::Btn(ID_BTN_IMPORT_CFG),
+                    Ctrl::Field(ID_EDIT_TEMPLATE_NAME),
+                    Ctrl::Btn(ID_BTN_TEMPLATE_SAVE),
+                    Ctrl::Btn(ID_BTN_TEMPLATE_APPLY),
+                    Ctrl::Btn(ID_BTN_TEMPLATE_DEL),
+                    Ctrl::Btn(ID_BTN_TEMPLATE_DEFAULT),
                 ]);
             }
             Panel::Rules => {
@@ -2032,6 +2195,11 @@ impl Settings {
             Ctrl::Btn(ID_BTN_DOWNLOAD_UPDATE) => self.download_update(),
             Ctrl::Btn(ID_BTN_EXPORT_CFG) => self.export_config(),
             Ctrl::Btn(ID_BTN_IMPORT_CFG) => self.import_config(),
+            Ctrl::Btn(ID_BTN_TEMPLATE_SAVE) => self.template_save(),
+            Ctrl::Btn(ID_BTN_TEMPLATE_APPLY) => self.template_apply(),
+            Ctrl::Btn(ID_BTN_TEMPLATE_DEL) => self.template_delete(),
+            Ctrl::Btn(ID_BTN_TEMPLATE_DEFAULT) => self.template_set_default(),
+            Ctrl::Template(i) => self.template_apply_index(i),
             Ctrl::Folder(id) => self.pick_folder(id),
             Ctrl::Btn(ID_BTN_NEW) => self.new_rule(),
             Ctrl::Btn(ID_BTN_DEL) => self.delete_rule(),
@@ -2084,20 +2252,35 @@ impl Settings {
     }
 
     fn test_ollama_connection(&self) {
+        if AI_BUSY.swap(true, Ordering::SeqCst) {
+            return; // Ya hay una operacion de IA en curso.
+        }
         let host_url = self.edit_text(ID_EDIT_AI_URL).unwrap_or_else(|| self.cfg.ai.ollama_url.clone());
         let host_clean = host_url
             .replace("http://", "")
             .replace("https://", "");
         let parts: Vec<&str> = host_clean.split(':').collect();
-        let host = parts.first().copied().unwrap_or("127.0.0.1").trim();
+        let host = parts.first().copied().unwrap_or("127.0.0.1").trim().to_string();
         let port = parts.get(1).and_then(|p| p.parse::<u16>().ok()).unwrap_or(11434);
+        let model = self.edit_text(ID_EDIT_AI_MODEL).unwrap_or_else(|| self.cfg.ai.model.clone());
+        let hwnd = self.hwnd.0 as usize;
 
-        let client = crate::ai::AiClient {
-            host: host.to_string(),
-            port,
-            model: self.edit_text(ID_EDIT_AI_MODEL).unwrap_or_else(|| self.cfg.ai.model.clone()),
-        };
-        let ok = client.ping();
+        // El ping es de red: fuera del hilo de UI para no congelar el diálogo.
+        let _ = std::thread::spawn(move || {
+            let hwnd = HWND(hwnd as *mut c_void);
+            let client = crate::ai::AiClient { host, port, model };
+            let ok = client.ping();
+            if let Ok(mut slot) = AI_PING_RESULT.lock() {
+                *slot = Some(ok);
+            }
+            let _ = unsafe { PostMessageW(hwnd, WM_AI_PING_DONE, WPARAM(0), LPARAM(0)) };
+        });
+    }
+
+    fn on_ai_ping_done(&self) {
+        AI_BUSY.store(false, Ordering::SeqCst);
+        // Sin resultado (dialogo cerrado o mensaje duplicado): ignorar.
+        let Some(ok) = AI_PING_RESULT.lock().ok().and_then(|mut s| s.take()) else { return };
         let msg = if ok {
             "🟢 Conexión exitosa con Ollama!\n\nEl servidor responde correctamente en la dirección configurada."
         } else {
@@ -2116,18 +2299,36 @@ impl Settings {
     }
 
     fn detect_models(&mut self) {
+        if AI_BUSY.swap(true, Ordering::SeqCst) {
+            return; // Ya hay una operacion de IA en curso.
+        }
         let host_url = self.edit_text(ID_EDIT_AI_URL).unwrap_or_else(|| self.cfg.ai.ollama_url.clone());
         let host_clean = host_url.replace("http://", "").replace("https://", "");
         let parts: Vec<&str> = host_clean.split(':').collect();
-        let host = parts.first().copied().unwrap_or("127.0.0.1").trim();
+        let host = parts.first().copied().unwrap_or("127.0.0.1").trim().to_string();
         let port = parts.get(1).and_then(|p| p.parse::<u16>().ok()).unwrap_or(11434);
+        let hwnd = self.hwnd.0 as usize;
 
-        let client = crate::ai::AiClient {
-            host: host.to_string(),
-            port,
-            model: String::from("llama3.2"),
-        };
-        let models = client.list_models();
+        // Listar modelos es una llamada de red: fuera del hilo de UI.
+        let _ = std::thread::spawn(move || {
+            let hwnd = HWND(hwnd as *mut c_void);
+            let client = crate::ai::AiClient {
+                host,
+                port,
+                model: String::from("llama3.2"),
+            };
+            let models = client.list_models();
+            if let Ok(mut slot) = AI_MODELS_RESULT.lock() {
+                *slot = Some(models);
+            }
+            let _ = unsafe { PostMessageW(hwnd, WM_AI_MODELS_DONE, WPARAM(0), LPARAM(0)) };
+        });
+    }
+
+    fn on_ai_models_done(&mut self) {
+        AI_BUSY.store(false, Ordering::SeqCst);
+        // Sin resultado (dialogo cerrado o mensaje duplicado): ignorar.
+        let Some(models) = AI_MODELS_RESULT.lock().ok().and_then(|mut s| s.take()) else { return };
         if !models.is_empty() {
             let selected = if models.len() == 1 {
                 models[0].clone()
@@ -2190,6 +2391,9 @@ impl Settings {
 
     fn reorganize_with_ai(&mut self) {
         if self.app.is_null() { return; }
+        if AI_BUSY.swap(true, Ordering::SeqCst) {
+            return; // Ya hay una operacion de IA en curso.
+        }
         let app = unsafe { &mut *self.app };
         
         let host_url = self.edit_text(ID_EDIT_AI_URL).unwrap_or_else(|| self.cfg.ai.ollama_url.clone());
@@ -2198,11 +2402,10 @@ impl Settings {
         let host = parts.first().copied().unwrap_or("127.0.0.1").trim();
         let port = parts.get(1).and_then(|p| p.parse::<u16>().ok()).unwrap_or(11434);
 
-        let client = crate::ai::AiClient {
-            host: host.to_string(),
-            port,
-            model: self.edit_text(ID_EDIT_AI_MODEL).unwrap_or_else(|| self.cfg.ai.model.clone()),
-        };
+        let client_host = host.to_string();
+        let client_port = port;
+        let client_model = self.edit_text(ID_EDIT_AI_MODEL).unwrap_or_else(|| self.cfg.ai.model.clone());
+        let hwnd = self.hwnd.0 as usize;
 
         // Recopilar nombres de archivos del escritorio
         let desktop_path = app.desktop.clone();
@@ -2226,7 +2429,28 @@ impl Settings {
             return;
         }
 
-        let suggestions = client.auto_cluster_desktop(&filenames);
+        // La generación con el modelo (puede tardar segundos, más si Ollama
+        // está en otro equipo) corre en un hilo; la UI queda libre.
+        let _ = std::thread::spawn(move || {
+            let hwnd = HWND(hwnd as *mut c_void);
+            let client = crate::ai::AiClient {
+                host: client_host,
+                port: client_port,
+                model: client_model,
+            };
+            let suggestions = client.auto_cluster_desktop(&filenames);
+            if let Ok(mut slot) = AI_CLUSTER_RESULT.lock() {
+                *slot = Some(suggestions);
+            }
+            let _ = unsafe { PostMessageW(hwnd, WM_AI_CLUSTER_DONE, WPARAM(0), LPARAM(0)) };
+        });
+    }
+
+    fn on_ai_cluster_done(&mut self) {
+        AI_BUSY.store(false, Ordering::SeqCst);
+        if self.app.is_null() { return; }
+        let app = unsafe { &mut *self.app };
+        let Some(suggestions) = AI_CLUSTER_RESULT.lock().ok().and_then(|mut s| s.take()) else { return };
         if suggestions.is_empty() {
             unsafe {
                 let body = crate::config::wide("🔴 No se pudo obtener la propuesta de categorías de Ollama. Verifica que el modelo esté activo.");
@@ -2275,7 +2499,28 @@ impl Settings {
     }
 
     fn check_for_updates(&self) {
-        match crate::updater::check_update() {
+        if UPDATE_BUSY.swap(true, Ordering::SeqCst) {
+            return; // Ya hay una comprobacion en curso.
+        }
+        let hwnd = self.hwnd.0 as usize;
+
+        // La comprobación es una llamada de red (reintentos incluidos):
+        // fuera del hilo de UI para que el diálogo no se congele.
+        let _ = std::thread::spawn(move || {
+            let hwnd = HWND(hwnd as *mut c_void);
+            let status = crate::updater::check_update();
+            if let Ok(mut slot) = UPDATE_RESULT.lock() {
+                *slot = Some(status);
+            }
+            let _ = unsafe { PostMessageW(hwnd, WM_UPDATE_DONE, WPARAM(0), LPARAM(0)) };
+        });
+    }
+
+    fn on_update_done(&self) {
+        UPDATE_BUSY.store(false, Ordering::SeqCst);
+        // Sin resultado (dialogo cerrado o mensaje duplicado): ignorar.
+        let Some(status) = UPDATE_RESULT.lock().ok().and_then(|mut s| s.take()) else { return };
+        match status {
             crate::updater::UpdateStatus::UpToDate => {
                 // Sin modales: un toast verde confirma que esta al dia.
                 if !self.app.is_null() {
@@ -2295,18 +2540,110 @@ impl Settings {
                 }
             }
             crate::updater::UpdateStatus::Error(e) => {
-                // Los errores si son modales: requieren atencion.
-                let msg = format!("Update check failed:\n{}", e);
-                unsafe {
-                    let body = crate::config::wide(&msg);
-                    let title = crate::config::wide("ZenDesktop :: Update Error");
-                    MessageBoxW(self.hwnd, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONWARNING);
+                // Error de red real: aviso no intrusivo, no "estas al dia".
+                if !self.app.is_null() {
+                    let msg = format!("{}: {}", self.tr.toast_update_failed, e);
+                    unsafe {
+                        (*self.app).show_toast_glyph(&msg, crate::ui::TOAST_ERROR, '\u{2715}');
+                    }
                 }
             }
         }
     }
 
     /// Exporta la configuracion actual a un archivo TOML elegido por el usuario.
+    fn template_name(&self) -> String {
+        self.edit_text(ID_EDIT_TEMPLATE_NAME).unwrap_or_default().trim().to_string()
+    }
+
+    fn template_save(&mut self) {
+        let name = self.template_name();
+        if name.is_empty() {
+            return;
+        }
+        if !self.app.is_null() {
+            unsafe {
+                (*self.app).save_layout_template(&name);
+            }
+            // Refrescar el cfg local para que el chip aparezca al instante.
+            let layouts = unsafe { (*self.app).capture_layouts() };
+            if let Some(t) = self.cfg.templates.iter_mut().find(|t| t.name == name) {
+                t.layouts = layouts;
+            } else {
+                self.cfg.templates.push(LayoutTemplate {
+                    name: name.clone(),
+                    layouts,
+                    default: false,
+                });
+            }
+        }
+        self.invalidate();
+    }
+
+    fn template_apply(&mut self) {
+        let name = self.template_name();
+        if name.is_empty() {
+            return;
+        }
+        self.template_apply_named(&name);
+    }
+
+    fn template_apply_index(&mut self, i: usize) {
+        if let Some(t) = self.cfg.templates.get(i) {
+            let name = t.name.clone();
+            if let Some(edit) = self.edits.get(&ID_EDIT_TEMPLATE_NAME).copied() {
+                set_text(edit, &name);
+            }
+            self.template_apply_named(&name);
+        }
+    }
+
+    fn template_apply_named(&mut self, name: &str) {
+        if self.app.is_null() {
+            return;
+        }
+        let ok = unsafe { (*self.app).apply_layout_template(name) };
+        if !ok {
+            self.warn(&self.tr.warn_template_missing.replace("{name}", name));
+        }
+    }
+
+    fn template_delete(&mut self) {
+        let name = self.template_name();
+        if name.is_empty() {
+            return;
+        }
+        self.cfg.templates.retain(|t| t.name != name);
+        if !self.app.is_null() {
+            unsafe {
+                (*self.app).delete_layout_template(&name);
+            }
+        }
+        self.invalidate();
+    }
+
+    /// Marca la plantilla nombrada como por defecto (se aplicara sola al
+    /// arrancar o al conectar su disposicion de monitores).
+    fn template_set_default(&mut self) {
+        let name = self.template_name();
+        if name.is_empty() {
+            return;
+        }
+        if !self.cfg.templates.iter().any(|t| t.name == name) {
+            self.warn(&self.tr.warn_template_missing.replace("{name}", &name));
+            return;
+        }
+        for t in &mut self.cfg.templates {
+            t.default = t.name == name;
+        }
+        if !self.app.is_null() {
+            unsafe {
+                (*self.app).set_default_template(&name);
+            }
+        }
+        self.invalidate();
+    }
+
     fn export_config(&mut self) {
         let Some(path) = save_file_dialog(self.hwnd, self.tr.btn_export_cfg, "zendesktop-config.toml") else {
             return;
@@ -2700,6 +3037,13 @@ impl Settings {
         cfg.general.watch_public_desktop = self.checked(ID_CHECK_PUBLIC);
         cfg.general.keep_shortcuts = self.checked(ID_CHECK_SHORTCUTS);
         cfg.general.start_with_windows = self.checked(ID_CHECK_STARTUP);
+        cfg.general.startup_delay_seconds = match text(ID_EDIT_STARTUP_DELAY).trim().parse::<u32>() {
+            Ok(v) => v,
+            Err(_) => {
+                self.warn(&bad_number(self.tr.fld_startup_delay));
+                return None;
+            }
+        };
         cfg.general.auto_check_updates = self.checked(ID_CHECK_AUTO_UPDATE);
         cfg.general.zen_double_click = self.checked(ID_CHECK_ZEN_DBL);
         cfg.general.zen_hotkey = self.checked(ID_CHECK_ZEN_HOTKEY);
@@ -3217,12 +3561,48 @@ extern "system" fn dlg_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                 let _ = SetBkColor(dc, COLORREF(0x0036241B));
                 LRESULT(edit_brush().0 as isize)
             }
+            WM_TIMER => {
+                if wparam.0 == BUSY_TIMER_ID {
+                    let state = &mut *state_from(hwnd);
+                    state.spinner_phase = (state.spinner_phase + 0.125).fract();
+                    state.invalidate();
+                }
+                LRESULT(0)
+            }
+            WM_AI_PING_DONE => {
+                let state = &mut *state_from(hwnd);
+                state.on_ai_ping_done();
+                LRESULT(0)
+            }
+            WM_AI_MODELS_DONE => {
+                let state = &mut *state_from(hwnd);
+                state.on_ai_models_done();
+                LRESULT(0)
+            }
+            WM_AI_CLUSTER_DONE => {
+                let state = &mut *state_from(hwnd);
+                state.on_ai_cluster_done();
+                LRESULT(0)
+            }
+            WM_UPDATE_DONE => {
+                let state = &mut *state_from(hwnd);
+                state.on_update_done();
+                LRESULT(0)
+            }
             WM_CLOSE => {
                 let state = &mut *state_from(hwnd);
+                if state.busy_timer {
+                    let _ = KillTimer(hwnd, BUSY_TIMER_ID);
+                    state.busy_timer = false;
+                }
+                AI_BUSY.store(false, Ordering::SeqCst);
+                UPDATE_BUSY.store(false, Ordering::SeqCst);
                 state.finished = true;
                 LRESULT(0)
             }
             WM_DESTROY => {
+                // Red de seguridad: si la ventana se destruye por otra via.
+                let _ = KillTimer(hwnd, BUSY_TIMER_ID);
                 // Sin PostQuitMessage: el bucle principal de la app decide.
                 LRESULT(0)
             }
@@ -3556,7 +3936,14 @@ pub fn open_dialog(current: &Config, app: *mut App) -> Option<Config> {
             finished: false,
             result: false,
             target_px_size: (0, 0),
+            spinner_phase: 0.0,
+            busy_timer: false,
         };
+
+        // Limpieza de flags stale: si una operacion quedo en curso al cerrar el
+        // dialogo, su resultado nunca llego y el flag quedaria activo para siempre.
+        AI_BUSY.store(false, Ordering::SeqCst);
+        UPDATE_BUSY.store(false, Ordering::SeqCst);
 
         // Se crea sin WS_VISIBLE: si la inicializacion D2D falla, la ventana
         // nunca se muestra y se destruye sin dejar una ventana huerfana.
@@ -3791,6 +4178,8 @@ fn seed_edits(s: &Settings) {
     let rows: Vec<(u16, String)> = vec![
         (ID_EDIT_G_ROOT, s.cfg.general.root_folder.clone()),
         (ID_EDIT_G_ARCHIVE, s.cfg.general.archive_folder.clone()),
+        (ID_EDIT_STARTUP_DELAY, format!("{}", s.cfg.general.startup_delay_seconds)),
+        (ID_EDIT_TEMPLATE_NAME, "default".to_string()),
         (ID_EDIT_MAX_AGE, format!("{}", s.cfg.ephemeral.max_age_days)),
         (ID_EDIT_MIN_AGE, format!("{}", s.cfg.ephemeral.min_age_minutes)),
         (ID_EDIT_PURGE, format!("{}", s.cfg.ephemeral.purge_archive_after_days)),
