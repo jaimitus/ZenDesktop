@@ -1,0 +1,96 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+  <!-- ZenDesktop Installer -->
+  <Package
+    Name="ZenDesktop"
+    Manufacturer="ZenDesktop"
+    Version="1.0.0"
+    UpgradeCode="7E8F4A2D-1B3C-4D5E-8F9A-0B1C2D3E4F5A"
+    Scope="perMachine"
+    Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of ZenDesktop is already installed." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Icon for Add/Remove Programs -->
+    <Icon Id="zendesktop.ico" SourceFile="zendesktop.ico" />
+
+    <Property Id="ARPPRODUCTICON" Value="zendesktop.ico" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/jaimitus/ZenDesktop" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/jaimitus/ZenDesktop" />
+    <Property Id="ARPCOMMENTS" Value="Ultra-lightweight native desktop organizer for Windows" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+
+    <WixVariable Id="WixUILicenseRtf" Value="LICENSE.rtf" />
+
+    <!-- Install to Program Files\ZenDesktop -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="ZenDesktop">
+        <!-- Main executable component -->
+        <Component Id="MainExe" Guid="*">
+          <File Id="ZenDesktopExe"
+                Source="ZenDesktop.exe"
+                KeyPath="yes"
+                Checksum="yes" />
+          <File Id="ZenDesktopIco"
+                Source="zendesktop.ico" />
+        </Component>
+
+        <!-- LICENSE and README -->
+        <Component Id="Docs" Guid="*">
+          <File Id="LicenseFile" Source="LICENSE" />
+          <File Id="ReadmeFile" Source="README.md" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <!-- Start Menu shortcut -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="*">
+        <Shortcut Id="ZenDesktopShortcut"
+                  Name="ZenDesktop"
+                  Description="Ultra-lightweight desktop organizer"
+                  Target="[INSTALLFOLDER]ZenDesktop.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="zendesktop.ico" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\ZenDesktop"
+                       Name="installed"
+                       Value="1"
+                       Type="integer"
+                       KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <!-- Desktop shortcut (optional, off by default) -->
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="*">
+        <Condition>INSTALLDESKTOPSHORTCUT</Condition>
+        <Shortcut Id="DesktopZenShortcut"
+                  Name="ZenDesktop"
+                  Description="Ultra-lightweight desktop organizer"
+                  Target="[INSTALLFOLDER]ZenDesktop.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="zendesktop.ico" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\ZenDesktop"
+                       Name="desktopShortcut"
+                       Value="1"
+                       Type="integer"
+                       KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Feature Id="Complete" Title="ZenDesktop" Level="1" Display="expand"
+             Description="Ultra-lightweight native desktop organizer for Windows"
+             ConfigurableDirectory="INSTALLFOLDER">
+      <ComponentRef Id="MainExe" />
+      <ComponentRef Id="Docs" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
+    </Feature>
+
+  </Package>
+
+</Wix>

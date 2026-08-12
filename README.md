@@ -27,15 +27,26 @@
 
 ## 📥 Installation
 
-### Portable (recommended)
-1. Download `ZenDesktop.exe` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
-2. Place it in a permanent location (e.g. `%APPDATA%\ZenDesktop\`)
-3. Run it — it minimizes to the system tray
+### MSI Installer (recommended for most users)
+
+1. Download `ZenDesktop-vX.X.X-x64.msi` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+2. Run the installer — it installs to `Program Files\ZenDesktop` for all users
+3. Start Menu shortcut is created automatically
+4. Uninstall via Windows Settings → Apps, or re-run the MSI
+
+> ✅ The MSI installs system-wide, creates shortcuts, and supports clean uninstall.
+
+### Portable (for USB drives / custom paths)
+
+1. Download `ZenDesktop-vX.X.X-portable.zip` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+2. Extract to any folder (e.g. `%APPDATA%\ZenDesktop\`)
+3. Run `ZenDesktop.exe` — it minimizes to the system tray
 4. **Optional**: Add a shortcut to `shell:startup` for auto-start with Windows
 
 > 💡 **Auto-update** works with the portable version too. When you click "Download & Install" in Settings → Updates, the new version replaces the current .exe and restarts automatically.
 
 ### From source
+
 ```bash
 git clone https://github.com/jaimitus/ZenDesktop.git
 cd ZenDesktop/src/code

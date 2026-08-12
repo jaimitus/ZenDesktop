@@ -38,7 +38,7 @@ jobs:
         shell: bash
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
-      - name: Collect artifacts
+      - name: Collect portable artifacts
         shell: bash
         run: |
           mkdir -p release
@@ -50,6 +50,25 @@ jobs:
           cd release
           powershell -Command "Compress-Archive -Path ZenDesktop.exe,LICENSE,README.md -DestinationPath ZenDesktop-v${V}-portable.zip"
 
+      - name: Install WiX v4
+        shell: bash
+        run: dotnet tool install --global wix --version 5.* 2>/dev/null || echo "WiX already installed"
+
+      - name: Build MSI installer
+        shell: bash
+        run: |
+          V="${{ steps.version.outputs.VERSION }}"
+          mkdir -p installer/staging
+          cp src/code/target/release/zendesktop.exe installer/staging/ZenDesktop.exe
+          cp src/code/assets/icons/zendesktop.ico installer/staging/zendesktop.ico
+          cp LICENSE installer/staging/LICENSE
+          cp README.md installer/staging/README.md
+          cd installer
+          # Set version in the .wxs before building
+          sed -i "s/Version=\"1.0.0\"/Version=\"${V}\"/" zendesktop.wxs 2>/dev/null || \
+            powershell -Command "(Get-Content zendesktop.wxs) -replace 'Version=\"[0-9.]+\"', 'Version=\"$env:V\"' | Set-Content zendesktop.wxs"
+          ~/.dotnet/tools/wix build -bf staging zendesktop.wxs -o "../release/ZenDesktop-v${V}-x64.msi"
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -59,6 +78,7 @@ jobs:
             release/ZenDesktop.exe
             release/ZenDesktop-v${{ steps.version.outputs.VERSION }}.exe
             release/ZenDesktop-v${{ steps.version.outputs.VERSION }}-portable.zip
+            release/ZenDesktop-v${{ steps.version.outputs.VERSION }}-x64.msi
           draft: false
           prerelease: false
         env:

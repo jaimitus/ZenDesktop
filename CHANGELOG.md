@@ -37,10 +37,13 @@ After months of development, ZenDesktop 1.0.0 is production-ready.
 
 ### 🔧 Improvements
 
+- MSI installer via WiX v4 with Start Menu shortcuts
 - Toast uses GDI `DrawTextW` for full Unicode support
 - Toast width dynamically measured with `GetTextExtentPoint32W`
 - Green checkmark icon on drop toasts
 - Blue icon for organization toasts
+- Settings → Updates panel with check/download buttons
+- Auto-restart after update (portable + installed)
 - Dead code removed (COM drag fallback, bitmap font, unused imports)
 - Zero compiler warnings
 
