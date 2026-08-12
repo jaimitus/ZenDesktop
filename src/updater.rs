@@ -62,7 +62,7 @@ pub fn check_update() -> UpdateStatus {
     };
 
     let latest = release.tag_name.trim_start_matches('v');
-    if latest == CURRENT_VERSION {
+    if version_at_least(latest, CURRENT_VERSION) {
         return UpdateStatus::UpToDate;
     }
 
@@ -155,8 +155,13 @@ pub fn download_and_install(url: &str, sig_url: &str) -> Result<PathBuf, String>
     }
     std::fs::rename(&current, &backup)
         .map_err(|e| format!("Backup error: {e}"))?;
-    std::fs::rename(&temp, &current)
-        .map_err(|e| format!("Replace error: {e}"))?;
+
+    // Replace the exe; if this fails, restore the backup so the app
+    // stays runnable and the update can be retried.
+    if let Err(e) = std::fs::rename(&temp, &current) {
+        let _ = std::fs::rename(&backup, &current);
+        return Err(format!("Replace error: {e} (original restored)"));
+    }
 
     // Clean up backup
     let _ = std::fs::remove_file(&backup);
@@ -172,6 +177,17 @@ pub fn current_version() -> &'static str {
     CURRENT_VERSION
 }
 
+/// True if `a >= b` as semantic versions (handles multi-digit segments,
+/// e.g. 1.0.10 > 1.0.9). Missing segments default to 0.
+fn version_at_least(a: &str, b: &str) -> bool {
+    fn parts(v: &str) -> (u64, u64, u64) {
+        let mut it = v.split('.');
+        let p = |s: Option<&str>| s.and_then(|x| x.parse().ok()).unwrap_or(0);
+        (p(it.next()), p(it.next()), p(it.next()))
+    }
+    parts(a) >= parts(b)
+}
+
 fn hex_decode(hex: &str) -> Option<[u8; 32]> {
     let hex = hex.trim();
     if hex.len() != 64 {
@@ -183,4 +199,30 @@ fn hex_decode(hex: &str) -> Option<[u8; 32]> {
         bytes[i] = u8::from_str_radix(s, 16).ok()?;
     }
     Some(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version_at_least;
+
+    #[test]
+    fn version_compares_multi_digit_segments() {
+        // String comparison would get this wrong ("1.0.9" > "1.0.10").
+        assert!(version_at_least("1.0.10", "1.0.9"));
+        assert!(!version_at_least("1.0.9", "1.0.10"));
+    }
+
+    #[test]
+    fn version_compares_same_and_newer() {
+        assert!(version_at_least("1.0.0", "1.0.0"));
+        assert!(version_at_least("1.1.0", "1.0.9"));
+        assert!(version_at_least("2.0.0", "1.9.9"));
+        assert!(!version_at_least("1.0.0", "1.0.1"));
+    }
+
+    #[test]
+    fn version_handles_missing_segments() {
+        assert!(version_at_least("1.0", "0.9.9"));
+        assert!(version_at_least("2", "1.9.9"));
+    }
 }

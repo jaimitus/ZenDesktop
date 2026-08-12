@@ -45,6 +45,10 @@
 
 > 💡 **Auto-update** works with the portable version too. When you click "Download & Install" in Settings → Updates, the new version replaces the current .exe and restarts automatically.
 
+> 🔐 **Security**: Every update is cryptographically verified with an **Ed25519 signature** before it is installed. If the signature check fails, the download is discarded and the current version is left untouched. Released binaries also ship with a `SHA256SUMS.txt` so you can verify downloads manually.
+
+> ⚠️ **Installed (MSI) users**: The app installs to `Program Files` where standard users can't write. To update an MSI install, download the new `.msi` from the release page instead of using the in-app updater (or run the updater elevated).
+
 ### From source
 
 ```bash

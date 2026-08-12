@@ -38,11 +38,9 @@ jobs:
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
       - name: Sign portable EXE (Ed25519)
-        if: env.SIGNING_KEY != ''
+        if: ${{ secrets.SIGNING_KEY != '' }}
         shell: bash
-        run: |
-          cargo run --release --bin sign-release -- target/release/zendesktop.exe
-          cp target/release/zendesktop.exe.sig target/release/zendesktop.exe.sig
+        run: cargo run --release --bin sign-release -- target/release/zendesktop.exe
         env:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
 
@@ -53,14 +51,14 @@ jobs:
           V="${{ steps.version.outputs.VERSION }}"
           cp target/release/zendesktop.exe "release/ZenDesktop-v${V}.exe"
           cp target/release/zendesktop.exe release/ZenDesktop.exe
-          # Copy .sig if it exists (from signing step)
           if [ -f target/release/zendesktop.exe.sig ]; then
             cp target/release/zendesktop.exe.sig release/ZenDesktop.exe.sig
           fi
           cp LICENSE release/
           cp README.md release/
+          cp CHANGELOG.md release/
           cd release
-          powershell -Command "Compress-Archive -Path ZenDesktop.exe,LICENSE,README.md -DestinationPath ZenDesktop-v${V}-portable.zip"
+          powershell -Command "Compress-Archive -Path ZenDesktop.exe,LICENSE,README.md,CHANGELOG.md -DestinationPath ZenDesktop-v${V}-portable.zip"
 
       - name: Install WiX v4
         shell: bash
@@ -74,23 +72,25 @@ jobs:
           cp target/release/zendesktop.exe installer/staging/ZenDesktop.exe
           cp assets/icons/zendesktop.ico installer/staging/zendesktop.ico
           cp LICENSE installer/staging/LICENSE
+          cp installer/LICENSE.rtf installer/staging/LICENSE.rtf
           cp README.md installer/staging/README.md
-          cd installer
-          sed -i "s/Version=\"1.0.0\"/Version=\"${V}\"/" zendesktop.wxs 2>/dev/null || \
-            powershell -Command "(Get-Content zendesktop.wxs) -replace 'Version=\"[0-9.]+\"', 'Version=\"$env:V\"' | Set-Content zendesktop.wxs"
-          ~/.dotnet/tools/wix build -bf staging zendesktop.wxs -o "../release/ZenDesktop-v${V}-x64.msi"
+          ~/.dotnet/tools/wix build -d Version=${V} -bf installer/staging installer/zendesktop.wxs -o "release/ZenDesktop-v${V}-x64.msi"
+
+      - name: Generate SHA256 checksums
+        shell: powershell
+        run: |
+          Get-ChildItem -Path release -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' } | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)"
+          } | Set-Content -Path release\SHA256SUMS.txt -Encoding ascii
+          Get-Content release\SHA256SUMS.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           name: "ZenDesktop v${{ steps.version.outputs.VERSION }}"
           body_path: CHANGELOG.md
-          files: |
-            release/ZenDesktop.exe
-            release/ZenDesktop.exe.sig
-            release/ZenDesktop-v${{ steps.version.outputs.VERSION }}.exe
-            release/ZenDesktop-v${{ steps.version.outputs.VERSION }}-portable.zip
-            release/ZenDesktop-v${{ steps.version.outputs.VERSION }}-x64.msi
+          files: release/*
           draft: false
           prerelease: false
         env:

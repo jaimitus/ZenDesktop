@@ -1,7 +1,8 @@
 # ZenDesktop Release Builder
-# Creates: portable .exe + .zip + .msi installer
+# Creates: portable .exe + .zip + .msi installer + SHA256SUMS.txt
 param(
-    [string]$Version = "1.0.0"
+    [string]$Version = "1.0.0",
+    [string]$SigningKey = $env:SIGNING_KEY
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,21 +14,19 @@ $InstallerDir = "$Root\installer"
 Write-Host "=== ZenDesktop Release Builder v$Version ===" -ForegroundColor Cyan
 
 # 1. Build release
-Write-Host "[1/5] Building release..." -ForegroundColor Yellow
+Write-Host "[1/6] Building release..." -ForegroundColor Yellow
 cargo build --release --manifest-path "$Root\Cargo.toml"
 if ($LASTEXITCODE -ne 0) { throw "Build failed" }
 
 # 2. Prepare release directory
-Write-Host "[2/5] Preparing release dir..." -ForegroundColor Yellow
+Write-Host "[2/6] Preparing release dir..." -ForegroundColor Yellow
 New-Item -ItemType Directory -Force -Path $ReleaseDir | Out-Null
 
 # 3. Copy and compress portable
-Write-Host "[3/5] Creating portable artifacts..." -ForegroundColor Yellow
+Write-Host "[3/6] Creating portable artifacts..." -ForegroundColor Yellow
 
-# Portable .exe (versioned)
+# Portable .exe (versioned + generic name)
 Copy-Item "$Target\zendesktop.exe" "$ReleaseDir\ZenDesktop-v$Version.exe" -Force
-
-# Portable .exe (generic name)
 Copy-Item "$Target\zendesktop.exe" "$ReleaseDir\ZenDesktop.exe" -Force
 
 # Portable .zip (with docs)
@@ -36,14 +35,26 @@ New-Item -ItemType Directory -Force -Path $zipDir | Out-Null
 Copy-Item "$Target\zendesktop.exe" "$zipDir\ZenDesktop.exe" -Force
 Copy-Item "$Root\LICENSE" "$zipDir\" -Force
 Copy-Item "$Root\README.md" "$zipDir\" -Force
+Copy-Item "$Root\CHANGELOG.md" "$zipDir\" -Force
 Compress-Archive -Path "$zipDir\*" `
     -DestinationPath "$ReleaseDir\ZenDesktop-v$Version-portable.zip" -Force
 Remove-Item -Recurse -Force $zipDir
 
-# 4. Build MSI installer with WiX v4
-Write-Host "[4/5] Building MSI installer..." -ForegroundColor Yellow
+# 4. Sign portable EXE (Ed25519) if a key is provided
+if ($SigningKey) {
+    Write-Host "[4/6] Signing executable..." -ForegroundColor Yellow
+    $env:SIGNING_KEY = $SigningKey
+    cargo run --release --bin sign-release -- "$Target\zendesktop.exe"
+    if (Test-Path "$Target\zendesktop.exe.sig") {
+        Copy-Item "$Target\zendesktop.exe.sig" "$ReleaseDir\ZenDesktop.exe.sig" -Force
+    }
+} else {
+    Write-Host "[4/6] No SIGNING_KEY set - skipping Ed25519 signature." -ForegroundColor Yellow
+}
 
-# Check if WiX v4 dotnet tool is available
+# 5. Build MSI installer with WiX v4
+Write-Host "[5/6] Building MSI installer..." -ForegroundColor Yellow
+
 $wixGlobal = "$env:USERPROFILE\.dotnet\tools\wix.exe"
 $wixLocal = (Get-Command "wix.exe" -ErrorAction SilentlyContinue)
 
@@ -55,23 +66,17 @@ if (Test-Path $wixGlobal) {
 }
 
 if ($wixExe) {
-    # Prepare staging dir with all files
     $staging = "$InstallerDir\staging"
     New-Item -ItemType Directory -Force -Path $staging | Out-Null
     Copy-Item "$Target\zendesktop.exe" "$staging\ZenDesktop.exe" -Force
     Copy-Item "$Root\assets\icons\zendesktop.ico" "$staging\zendesktop.ico" -Force
     Copy-Item "$Root\LICENSE" "$staging\LICENSE" -Force
+    Copy-Item "$InstallerDir\LICENSE.rtf" "$staging\LICENSE.rtf" -Force
     Copy-Item "$Root\README.md" "$staging\README.md" -Force
 
-    # Set version in .wxs
-    $wxsContent = Get-Content "$InstallerDir\zendesktop.wxs" -Raw
-    $wxsContent = $wxsContent -replace 'Version="[0-9.]+"', "Version=`"$Version`""
-    Set-Content "$InstallerDir\zendesktop.wxs" -Value $wxsContent
-
-    # Build MSI
-    pushd "$InstallerDir"
-    & $wixExe build -bf staging zendesktop.wxs -o "$ReleaseDir\ZenDesktop-v$Version-x64.msi"
-    popd
+    & $wixExe build -d Version=$Version -bf $staging "$InstallerDir\zendesktop.wxs" `
+        -o "$ReleaseDir\ZenDesktop-v$Version-x64.msi"
+    if ($LASTEXITCODE -ne 0) { throw "WiX build failed" }
 
     Remove-Item -Recurse -Force $staging
     Write-Host "  MSI built!" -ForegroundColor Green
@@ -81,8 +86,14 @@ if ($wixExe) {
     Write-Host "  Skipping MSI." -ForegroundColor Gray
 }
 
-# 5. Done
-Write-Host "[5/5] Done!" -ForegroundColor Green
+# 6. Generate SHA256 checksums + done
+Write-Host "[6/6] Generating checksums..." -ForegroundColor Yellow
+Get-ChildItem -Path $ReleaseDir -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' } | ForEach-Object {
+    $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+    "$hash  $($_.Name)"
+} | Set-Content -Path "$ReleaseDir\SHA256SUMS.txt" -Encoding ascii
+
+Write-Host "Done!" -ForegroundColor Green
 Write-Host ""
 Write-Host "Artifacts in: $ReleaseDir" -ForegroundColor White
 Get-ChildItem $ReleaseDir | ForEach-Object {
