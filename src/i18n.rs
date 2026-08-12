@@ -132,6 +132,8 @@ pub struct Tr {
     pub btn_apply: &'static str,
     pub btn_new: &'static str,
     pub btn_delete: &'static str,
+    pub btn_group: &'static str,
+    pub btn_ungroup: &'static str,
     pub btn_use: &'static str,
     pub picker_title: &'static str,
     // Mensajes
@@ -179,6 +181,7 @@ pub struct Tr {
     pub chk_search: &'static str,
     pub chk_grid: &'static str,
     pub fld_grid_size: &'static str,
+    pub fld_grid_icon: &'static str,
     // Updates
     pub sec_updates: &'static str,
     pub btn_check_updates: &'static str,
@@ -192,6 +195,7 @@ pub struct Tr {
     // Toast de actualizaciones (no intrusivo)
     pub toast_update: &'static str,
     pub toast_up_to_date: &'static str,
+    pub toast_whats_new: &'static str,
     // Backup / portabilidad de la configuracion
     pub sec_backup: &'static str,
     pub btn_export_cfg: &'static str,
@@ -212,6 +216,11 @@ pub struct Tr {
     pub btn_ai_detect: &'static str,
     pub sec_ai_organize: &'static str,
     pub btn_ai_reorganize: &'static str,
+    pub fld_group: &'static str,
+    pub fld_view: &'static str,
+    pub view_auto: &'static str,
+    pub view_list: &'static str,
+    pub view_grid: &'static str,
 }
 
 macro_rules! tr {
@@ -278,6 +287,8 @@ pub static EN: Tr = tr! {
     btn_apply: "Apply",
     btn_new: "New",
     btn_delete: "Delete",
+    btn_group: "Group",
+    btn_ungroup: "Ungroup",
     btn_use: "Use",
     picker_title: "Choose color",
     rules_empty: "No rules. Press \"New\" to create the first one.",
@@ -320,6 +331,7 @@ pub static EN: Tr = tr! {
     chk_search: "Show search bar in boxes",
     chk_grid: "Grid view instead of list",
     fld_grid_size: "Grid item size (px)",
+    fld_grid_icon: "Icon size (px)",
     sec_updates: "UPDATES",
     btn_check_updates: "Check for Updates",
     lbl_version: "Current version",
@@ -329,6 +341,7 @@ pub static EN: Tr = tr! {
     btn_download_update: "Download & Install",
     toast_update: "Update v{0} available — click to install",
     toast_up_to_date: "ZenDesktop is up to date",
+    toast_whats_new: "ZenDesktop updated to v{0} 🎉",
     sec_backup: "BACKUP & PORTABILITY",
     btn_export_cfg: "Export configuration…",
     btn_import_cfg: "Import configuration…",
@@ -346,6 +359,11 @@ pub static EN: Tr = tr! {
         btn_ai_detect: "Auto-Detect Models",
         sec_ai_organize: "Full Autonomous Organization",
         btn_ai_reorganize: "Reorganize Desktop From Scratch with AI",
+        fld_group: "Group Title:",
+        fld_view: "View",
+        view_auto: "Auto",
+        view_list: "List",
+        view_grid: "Grid",
 };
 
 pub static ES: Tr = tr! {
@@ -404,6 +422,8 @@ pub static ES: Tr = tr! {
     btn_apply: "Aplicar",
     btn_new: "Nueva",
     btn_delete: "Borrar",
+    btn_group: "Agrupar",
+    btn_ungroup: "Desagrupar",
     btn_use: "Usar",
     picker_title: "Elegir color",
     rules_empty: "No hay reglas. Pulsa \"Nueva\" para crear la primera.",
@@ -446,6 +466,7 @@ pub static ES: Tr = tr! {
     chk_search: "Mostrar barra de búsqueda en las cajas",
     chk_grid: "Vista en cuadrícula en lugar de lista",
     fld_grid_size: "Tamaño de celda (px)",
+    fld_grid_icon: "Tamaño del icono (px)",
     sec_updates: "ACTUALIZACIONES",
     btn_check_updates: "Buscar actualizaciones",
     lbl_version: "Versión actual",
@@ -455,6 +476,7 @@ pub static ES: Tr = tr! {
     btn_download_update: "Descargar e instalar",
     toast_update: "Actualización v{0} disponible — clic para instalar",
     toast_up_to_date: "ZenDesktop está actualizado",
+    toast_whats_new: "ZenDesktop actualizado a v{0} 🎉",
     sec_backup: "RESPALDO Y PORTABILIDAD",
     btn_export_cfg: "Exportar configuración…",
     btn_import_cfg: "Importar configuración…",
@@ -472,6 +494,11 @@ pub static ES: Tr = tr! {
         btn_ai_detect: "Autodetectar Modelos",
         sec_ai_organize: "Organización Autónoma Total",
         btn_ai_reorganize: "Reorganizar Escritorio Desde Cero con IA",
+        fld_group: "Título de Grupo:",
+        fld_view: "Vista",
+        view_auto: "Auto",
+        view_list: "Lista",
+        view_grid: "Cuadrícula",
 };
 
 pub static DE: Tr = tr! {
@@ -530,6 +557,8 @@ pub static DE: Tr = tr! {
     btn_apply: "Übernehmen",
     btn_new: "Neu",
     btn_delete: "Löschen",
+    btn_group: "Gruppieren",
+    btn_ungroup: "Lösen",
     btn_use: "Übernehmen",
     picker_title: "Farbe wählen",
     rules_empty: "Keine Regeln. Drücke \"Neu\", um die erste zu erstellen.",
@@ -572,6 +601,7 @@ pub static DE: Tr = tr! {
     chk_search: "Suchleiste in Boxen anzeigen",
     chk_grid: "Rasteransicht statt Liste",
     fld_grid_size: "Rasterzellengröße (px)",
+    fld_grid_icon: "Symbolgröße (px)",
     sec_updates: "UPDATES",
     btn_check_updates: "Nach Updates suchen",
     lbl_version: "Aktuelle Version",
@@ -581,6 +611,7 @@ pub static DE: Tr = tr! {
     btn_download_update: "Herunterladen & Installieren",
     toast_update: "Update v{0} verfügbar — klicken zum Installieren",
     toast_up_to_date: "ZenDesktop ist aktuell",
+    toast_whats_new: "ZenDesktop auf v{0} aktualisiert 🎉",
     sec_backup: "SICHERUNG & PORTABILITÄT",
     btn_export_cfg: "Konfiguration exportieren…",
     btn_import_cfg: "Konfiguration importieren…",
@@ -598,6 +629,11 @@ pub static DE: Tr = tr! {
         btn_ai_detect: "Modelle automatisch erkennen",
         sec_ai_organize: "Vollständige autonome Organisation",
         btn_ai_reorganize: "Desktop von Grund auf mit KI reorganisieren",
+        fld_group: "Gruppentitel:",
+        fld_view: "Ansicht",
+        view_auto: "Auto",
+        view_list: "Liste",
+        view_grid: "Raster",
 };
 
 pub static FR: Tr = tr! {
@@ -656,6 +692,8 @@ pub static FR: Tr = tr! {
     btn_apply: "Appliquer",
     btn_new: "Nouvelle",
     btn_delete: "Supprimer",
+    btn_group: "Grouper",
+    btn_ungroup: "Dégrouper",
     btn_use: "Appliquer",
     picker_title: "Choisir une couleur",
     rules_empty: "Aucune règle. Cliquez sur \"Nouvelle\" pour créer la première.",
@@ -698,6 +736,7 @@ pub static FR: Tr = tr! {
     chk_search: "Afficher la barre de recherche",
     chk_grid: "Vue en grille au lieu de liste",
     fld_grid_size: "Taille des cellules (px)",
+    fld_grid_icon: "Taille de l'icône (px)",
     sec_updates: "MISES À JOUR",
     btn_check_updates: "Vérifier les mises à jour",
     lbl_version: "Version actuelle",
@@ -707,6 +746,7 @@ pub static FR: Tr = tr! {
     btn_download_update: "Télécharger & Installer",
     toast_update: "Mise à jour v{0} disponible — cliquer pour installer",
     toast_up_to_date: "ZenDesktop est à jour",
+    toast_whats_new: "ZenDesktop mis à jour en v{0} 🎉",
     sec_backup: "SAUVEGARDE & PORTABILITÉ",
     btn_export_cfg: "Exporter la configuration…",
     btn_import_cfg: "Importer la configuration…",
@@ -724,6 +764,11 @@ pub static FR: Tr = tr! {
         btn_ai_detect: "Détecter automatiquement les modèles",
         sec_ai_organize: "Organisation autonome complète",
         btn_ai_reorganize: "Réorganiser le bureau avec l'IA",
+        fld_group: "Titre du groupe:",
+        fld_view: "Vue",
+        view_auto: "Auto",
+        view_list: "Liste",
+        view_grid: "Grille",
 };
 
 pub static PT: Tr = tr! {
@@ -782,6 +827,8 @@ pub static PT: Tr = tr! {
     btn_apply: "Aplicar",
     btn_new: "Nova",
     btn_delete: "Excluir",
+    btn_group: "Agrupar",
+    btn_ungroup: "Desagrupar",
     btn_use: "Aplicar",
     picker_title: "Escolher cor",
     rules_empty: "Nenhuma regra. Pressione \"Nova\" para criar a primeira.",
@@ -824,6 +871,7 @@ pub static PT: Tr = tr! {
     chk_search: "Mostrar barra de pesquisa nas caixas",
     chk_grid: "Visualização em grade em vez de lista",
     fld_grid_size: "Tamanho da célula (px)",
+    fld_grid_icon: "Tamanho do ícone (px)",
     sec_updates: "ATUALIZAÇÕES",
     btn_check_updates: "Verificar atualizações",
     lbl_version: "Versão atual",
@@ -833,6 +881,7 @@ pub static PT: Tr = tr! {
     btn_download_update: "Baixar e instalar",
     toast_update: "Atualização v{0} disponível — clique para instalar",
     toast_up_to_date: "O ZenDesktop está atualizado",
+    toast_whats_new: "ZenDesktop atualizado para v{0} 🎉",
     sec_backup: "BACKUP E PORTABILIDADE",
     btn_export_cfg: "Exportar configuração…",
     btn_import_cfg: "Importar configuração…",
@@ -850,6 +899,11 @@ pub static PT: Tr = tr! {
         btn_ai_detect: "Detectar modelos automaticamente",
         sec_ai_organize: "Organização autônoma completa",
         btn_ai_reorganize: "Reorganizar área de trabalho com IA",
+        fld_group: "Título do Grupo:",
+        fld_view: "Visualização",
+        view_auto: "Auto",
+        view_list: "Lista",
+        view_grid: "Grade",
 };
 
 pub static IT: Tr = tr! {
@@ -908,6 +962,8 @@ pub static IT: Tr = tr! {
     btn_apply: "Applica",
     btn_new: "Nuova",
     btn_delete: "Elimina",
+    btn_group: "Raggruppa",
+    btn_ungroup: "Separa",
     btn_use: "Applica",
     picker_title: "Scegli colore",
     rules_empty: "Nessuna regola. Premi \"Nuova\" per crearne una.",
@@ -950,6 +1006,7 @@ pub static IT: Tr = tr! {
     chk_search: "Mostra barra di ricerca nelle caselle",
     chk_grid: "Vista a griglia invece di elenco",
     fld_grid_size: "Dimensione cella (px)",
+    fld_grid_icon: "Dimensione icona (px)",
     sec_updates: "AGGIORNAMENTI",
     btn_check_updates: "Verifica aggiornamenti",
     lbl_version: "Versione attuale",
@@ -959,6 +1016,7 @@ pub static IT: Tr = tr! {
     btn_download_update: "Scarica e installa",
     toast_update: "Aggiornamento v{0} disponibile — clic per installare",
     toast_up_to_date: "ZenDesktop è aggiornato",
+    toast_whats_new: "ZenDesktop aggiornato alla v{0} 🎉",
     sec_backup: "BACKUP E PORTABILITÀ",
     btn_export_cfg: "Esporta configurazione…",
     btn_import_cfg: "Importa configurazione…",
@@ -976,6 +1034,11 @@ pub static IT: Tr = tr! {
         btn_ai_detect: "Rileva modelli automaticamente",
         sec_ai_organize: "Organizzazione autonoma completa",
         btn_ai_reorganize: "Riorganizza il desktop con l'IA",
+        fld_group: "Titolo del gruppo:",
+        fld_view: "Vista",
+        view_auto: "Auto",
+        view_list: "Elenco",
+        view_grid: "Griglia",
 };
 
 impl Tr {

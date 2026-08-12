@@ -23,7 +23,7 @@
 //! del sistema.
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -57,7 +57,7 @@ use windows::Win32::Graphics::Gdi::{
     ReleaseDC, ScreenToClient, SelectObject, SetBkMode, SetTextColor, ValidateRect, AC_SRC_ALPHA,
     AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
     DT_CENTER, DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL, TRANSPARENT, HBITMAP,
-    HDC, HGDIOBJ, NULL_PEN,
+    HDC, HGDIOBJ, IntersectClipRect, NULL_PEN, RestoreDC, SaveDC,
 };
 use windows::Win32::System::Com::{
     CoTaskMemFree, DVASPECT_CONTENT, FORMATETC, IDataObject, TYMED_HGLOBAL,
@@ -84,7 +84,7 @@ use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
 };
-use windows::Win32::UI::Controls::{LVHITTESTINFO, LVM_HITTEST};
+use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT, LVHITTESTINFO, LVM_HITTEST};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, RegisterHotKey, ReleaseCapture, SetCapture, SetFocus,
@@ -95,11 +95,12 @@ use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
     BHID_DataObject, DragAcceptFiles, DragFinish, DragQueryFileW, HDROP,
     SHCreateShellItemArrayFromIDLists, ShellExecuteW,
-    Shell_NotifyIconW, SHBindToParent, SHGetFileInfoW, SHParseDisplayName,
+    Shell_NotifyIconW, SHBindToParent, SHGetFileInfoW, SHGetImageList, SHParseDisplayName,
     CMINVOKECOMMANDINFO, CMF_NORMAL,
     IContextMenu, IContextMenu3, IShellFolder, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
     NOTIFYICONDATAW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SMALLICON,
-    SHGFI_USEFILEATTRIBUTES, SHFileOperationW, SHFILEOPSTRUCTW, FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION,
+    SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHIL_EXTRALARGE, SHIL_JUMBO, SHFileOperationW,
+    SHFILEOPSTRUCTW, FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -115,7 +116,7 @@ use crate::watcher::DesktopWatcher;
 fn watch_paths_for(cfg: &Config, desktop: &Path, extra_desktops: &[PathBuf]) -> Vec<PathBuf> {
     let mut paths = vec![desktop.to_path_buf()];
     paths.extend(extra_desktops.iter().cloned());
-    let root = cfg.root_dir(desktop);
+    let root = cfg.root_dir();
     for rule in cfg.rules.iter().filter(|r| r.enabled && r.move_files) {
         paths.push(root.join(&rule.folder));
     }
@@ -137,6 +138,7 @@ pub const WM_ZEN_DBLCLICK: u32 = WM_APP + 0x12;
 const WM_ZEN_DRAG_DONE: u32 = WM_APP + 0x13;
     /// Resultado del chequeo de updates en segundo plano (hilo de trabajo -> UI).
     pub const WM_ZEN_UPDATE_CHECKED: u32 = WM_APP + 0x14;
+pub const WM_ZEN_SHOW_WHATS_NEW_TOAST: u32 = WM_APP + 0x16;
     /// El usuario hizo clic en el toast (p. ej. para instalar una actualizacion).
     const WM_ZEN_TOAST_CLICK: u32 = WM_APP + 0x15;
 const TIMER_SWEEP: usize = 1;
@@ -611,63 +613,182 @@ impl Drop for Surface {
 // Cache de iconos del shell
 // ---------------------------------------------------------------------------
 
+/// Clase de tamano del icono a obtener. La clave de cache distingue la fuente
+/// para no reutilizar un icono pequeno donde hace falta uno mas grande.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum IconClass {
+    /// 16px (lista, DPI normal): SHGetFileInfoW con SHGFI_SMALLICON.
+    Small,
+    /// 48px (EXTRALARGE): cuadricula a DPI normal o lista a DPI alto.
+    Large,
+    /// 256px (JUMBO): cuadricula a DPI alto (150%+), nitido al reducir.
+    Jumbo,
+}
+
 #[derive(Default)]
 struct IconCache {
-    by_ext: HashMap<String, HICON>,
-    by_path: HashMap<PathBuf, HICON>,
+    by_ext: HashMap<(String, IconClass), HICON>,
+    by_path: HashMap<(PathBuf, IconClass), HICON>,
+    /// Orden de uso por-archivo (LRU): el frente es el mas reciente, el final
+    /// el menos usado recientemente. Se mantiene sincronizado con `by_path`.
+    path_order: VecDeque<(PathBuf, IconClass)>,
+    /// Iconos pendientes de destruir: se difieren hasta despues de estamparlos
+    /// en el frame, para no invalidar HICONs que `icon_jobs` aun referencia.
+    trash: Vec<HICON>,
+    /// Listas de imagenes del sistema cacheadas (EXTRALARGE 48px y JUMBO 256px).
+    image_list_48: Option<IImageList>,
+    image_list_jumbo: Option<IImageList>,
+}
+
+/// Tope de iconos por-archivo en cache (LRU) segun la clase: los JUMBO (256px)
+/// pesan ~256KB cada uno, asi que se acotan a una cuarta parte para no disparar
+/// la memoria maxima de la app.
+const fn icon_path_cap(class: IconClass) -> usize {
+    match class {
+        IconClass::Small | IconClass::Large => 1024,
+        IconClass::Jumbo => 256,
+    }
+}
+
+/// Tope de iconos por-extension en cache: las extensiones son pocas, pero los
+/// JUMBO pesan ~256KB, asi que tambien se acotan para no crecer sin limite.
+const fn icon_ext_cap(class: IconClass) -> usize {
+    match class {
+        IconClass::Small | IconClass::Large => 512,
+        IconClass::Jumbo => 128,
+    }
 }
 
 impl IconCache {
     /// Para la mayoria de extensiones basta con una consulta por tipo
     /// (`SHGFI_USEFILEATTRIBUTES`, sin tocar el disco). Solo ejecutables,
     /// accesos directos e iconos requieren consulta por archivo.
-    unsafe fn get(&mut self, path: &Path, ext: &str, is_dir: bool, large: bool) -> Option<HICON> {
+    /// La clave distingue la clase de tamano (`IconClass`) porque el shell
+    /// devuelve iconos distintos segun la fuente pedida.
+    unsafe fn get(&mut self, path: &Path, ext: &str, is_dir: bool, class: IconClass) -> Option<HICON> {
         let per_file = matches!(ext, "exe" | "lnk" | "ico" | "msi" | "url");
         if per_file {
-            if let Some(icon) = self.by_path.get(path) {
-                return Some(*icon);
+            let key = (path.to_path_buf(), class);
+            if let Some(icon) = self.by_path.get(&key).copied() {
+                self.touch_path(&key);
+                return Some(icon);
             }
-            if self.by_path.len() > 256 {
-                self.purge_paths();
+            while self.by_path.len() >= icon_path_cap(class) {
+                if !self.evict_lru() {
+                    break;
+                }
             }
-            let icon = query_icon(&wide(&path.to_string_lossy()), false, large)?;
-            self.by_path.insert(path.to_path_buf(), icon);
+            let icon = self.fetch_icon(&wide(&path.to_string_lossy()), false, class)?;
+            self.by_path.insert(key.clone(), icon);
+            self.path_order.push_front(key);
             return Some(icon);
         }
 
-        let key = if is_dir {
+        let ext_key = if is_dir {
             String::from("<dir>")
         } else if ext.is_empty() {
             String::from("<file>")
         } else {
             ext.to_string()
         };
+        let key = (ext_key.clone(), class);
         if let Some(icon) = self.by_ext.get(&key) {
             return Some(*icon);
         }
         let probe = if is_dir {
             wide("C:\\")
         } else {
-            wide(&format!("zen.{key}"))
+            wide(&format!("zen.{ext_key}"))
         };
-        let icon = query_icon(&probe, true, large)?;
+        if self.by_ext.len() >= icon_ext_cap(class) {
+            self.evict_ext();
+        }
+        let icon = self.fetch_icon(&probe, true, class)?;
         self.by_ext.insert(key, icon);
         Some(icon)
     }
 
-    fn purge_paths(&mut self) {
-        for (_, icon) in self.by_path.drain() {
-            unsafe {
-                let _ = DestroyIcon(icon);
+    /// Obtiene el HICON segun la clase pedida. `Small` mantiene SHGetFileInfoW
+    /// (16px); `Large` y `Jumbo` usan la lista de imagenes del sistema (48px o
+    /// 256px) para que el icono nunca se tenga que escalar hacia arriba.
+    unsafe fn fetch_icon(&mut self, path: &[u16], use_attributes: bool, class: IconClass) -> Option<HICON> {
+        match class {
+            IconClass::Small => query_icon(path, use_attributes, false),
+            IconClass::Large | IconClass::Jumbo => {
+                let index = query_icon_index(path, use_attributes)?;
+                let il = self.image_list(class == IconClass::Jumbo)?;
+                il.GetIcon(index, ILD_TRANSPARENT.0).ok()
             }
         }
+    }
+
+    /// Lista de imagenes del sistema cachead (EXTRALARGE 48px o JUMBO 256px),
+    /// creada una sola vez por tamano.
+    unsafe fn image_list(&mut self, jumbo: bool) -> Option<IImageList> {
+        let slot = if jumbo { &mut self.image_list_jumbo } else { &mut self.image_list_48 };
+        if let Some(il) = slot {
+            return Some(il.clone());
+        }
+        let size = if jumbo { SHIL_JUMBO } else { SHIL_EXTRALARGE };
+        let il = SHGetImageList::<IImageList>(size as i32).ok()?;
+        *slot = Some(il.clone());
+        Some(il)
+    }
+
+    /// Marca `key` como la entrada mas recientemente usada.
+    fn touch_path(&mut self, key: &(PathBuf, IconClass)) {
+        if let Some(pos) = self.path_order.iter().position(|k| k == key) {
+            self.path_order.remove(pos);
+        }
+        self.path_order.push_front(key.clone());
+    }
+
+    /// Expulsa el icono por-archivo menos usado recientemente (final de la
+    /// cola). La destruccion se difiere a `trash`: el HICON podria estar aun en
+    /// `icon_jobs` del frame en curso. Devuelve false si no queda nada que
+    /// expulsar.
+    fn evict_lru(&mut self) -> bool {
+        while let Some(oldest) = self.path_order.pop_back() {
+            if let Some(icon) = self.by_path.remove(&oldest) {
+                self.trash.push(icon);
+                return true;
+            }
+            // Clave ya expulsada (cola desincronizada): seguir limpiando.
+        }
+        false
+    }
+
+    /// Expulsa una entrada arbitraria de la cache por-extension (no hay orden
+    /// de uso: las extensiones son pocas y se consultan de forma uniforme). La
+    /// destruccion se difiere a `trash` igual que en `evict_lru`.
+    fn evict_ext(&mut self) {
+        let key = self.by_ext.keys().next().cloned();
+        if let Some(key) = key {
+            if let Some(icon) = self.by_ext.remove(&key) {
+                self.trash.push(icon);
+            }
+        }
+    }
+
+    /// Saca los iconos pendientes de destruir (llamar despues de DrawIconEx).
+    fn drain_trash(&mut self) -> Vec<HICON> {
+        std::mem::take(&mut self.trash)
     }
 }
 
 impl Drop for IconCache {
     fn drop(&mut self) {
-        self.purge_paths();
+        for (_, icon) in self.by_path.drain() {
+            unsafe {
+                let _ = DestroyIcon(icon);
+            }
+        }
         for (_, icon) in self.by_ext.drain() {
+            unsafe {
+                let _ = DestroyIcon(icon);
+            }
+        }
+        for icon in self.trash.drain(..) {
             unsafe {
                 let _ = DestroyIcon(icon);
             }
@@ -698,6 +819,32 @@ unsafe fn query_icon(path: &[u16], use_attributes: bool, large: bool) -> Option<
     }
 }
 
+/// Devuelve el indice del icono en la lista de imagenes del sistema para una
+/// ruta: con `use_attributes` no toca el disco (tipos por extension), sin el
+/// resuelve el archivo real (accesos directos y ejecutables).
+unsafe fn query_icon_index(path: &[u16], use_attributes: bool) -> Option<i32> {
+    let mut info = SHFILEINFOW::default();
+    let mut flags = SHGFI_SYSICONINDEX;
+    let attributes = if use_attributes {
+        flags |= SHGFI_USEFILEATTRIBUTES;
+        windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL
+    } else {
+        windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0)
+    };
+    let ok = SHGetFileInfoW(
+        PCWSTR(path.as_ptr()),
+        attributes,
+        Some(&mut info),
+        std::mem::size_of::<SHFILEINFOW>() as u32,
+        flags,
+    );
+    if ok == 0 {
+        None
+    } else {
+        Some(info.iIcon)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Caja
 // ---------------------------------------------------------------------------
@@ -712,8 +859,6 @@ enum DragMode {
 }
 
 struct FenceTab {
-    _rule_id: String,
-    _target_dir: Option<PathBuf>,
     content: FenceContent,
     selected: HashSet<usize>,
     scroll: i32,
@@ -765,6 +910,16 @@ impl Fence {
         }
     }
 
+    /// Vista efectiva de la caja: la regla puede forzar lista o cuadricula, o
+    /// seguir el ajuste global de Apariencia ("auto" o valor desconocido).
+    fn grid_mode(&self, theme: &Theme) -> bool {
+        match self.tabs[self.active_tab].content.view_mode.as_str() {
+            "grid" => true,
+            "list" => false,
+            _ => theme.grid_mode,
+        }
+    }
+
     fn visible_height(&self, theme: &Theme) -> i32 {
         if self.layout.collapsed && !self.is_mouse_over {
             ((self.header_h(theme) + theme.padding) * self.scale) as i32
@@ -790,7 +945,7 @@ impl Fence {
             return None;
         }
         let tab = &self.tabs[self.active_tab];
-        if theme.grid_mode {
+        if self.grid_mode(theme) {
             let cell = theme.grid_item_size.max(48.0);
             let pad = theme.padding;
             let w_dip = self.layout.width as f32 / self.scale;
@@ -930,7 +1085,7 @@ unsafe fn build_shell_menu_for_paths(paths: &[PathBuf]) -> Result<(IContextMenu,
     let parent: IShellFolder = match SHBindToParent(pidls[0], Some(&mut first_child)) {
         Ok(f) => f,
         Err(_) => {
-            for p in &pidls { let _ = CoTaskMemFree(Some(*p as *const c_void)); }
+            for p in &pidls { CoTaskMemFree(Some(*p as *const c_void)); }
             return Err("SHBindToParent".into());
         }
     };
@@ -948,14 +1103,14 @@ unsafe fn build_shell_menu_for_paths(paths: &[PathBuf]) -> Result<(IContextMenu,
         child_pidls.push(*cp as *const ITEMIDLIST);
     }
     if child_pidls.is_empty() {
-        for p in &pidls { let _ = CoTaskMemFree(Some(*p as *const c_void)); }
+        for p in &pidls { CoTaskMemFree(Some(*p as *const c_void)); }
         return Err("No child pidls".into());
     }
 
     let menu: IContextMenu = match parent.GetUIObjectOf(HWND::default(), &child_pidls, None) {
         Ok(m) => m,
         Err(_) => {
-            for p in &pidls { let _ = CoTaskMemFree(Some(*p as *const c_void)); }
+            for p in &pidls { CoTaskMemFree(Some(*p as *const c_void)); }
             return Err("GetUIObjectOf".into());
         }
     };
@@ -963,26 +1118,26 @@ unsafe fn build_shell_menu_for_paths(paths: &[PathBuf]) -> Result<(IContextMenu,
     let hmenu = match CreatePopupMenu() {
         Ok(h) => h,
         Err(_) => {
-            for p in &pidls { let _ = CoTaskMemFree(Some(*p as *const c_void)); }
+            for p in &pidls { CoTaskMemFree(Some(*p as *const c_void)); }
             return Err("CreatePopupMenu".into());
         }
     };
 
     if menu.QueryContextMenu(hmenu, 0, 0x8000, 0xFFFF, CMF_NORMAL).is_err() {
         let _ = DestroyMenu(hmenu);
-        for p in &pidls { let _ = CoTaskMemFree(Some(*p as *const c_void)); }
+        for p in &pidls { CoTaskMemFree(Some(*p as *const c_void)); }
         return Err("QueryContextMenu".into());
     }
 
     if GetMenuItemCount(hmenu) <= 0 {
         let _ = DestroyMenu(hmenu);
-        for p in &pidls { let _ = CoTaskMemFree(Some(*p as *const c_void)); }
+        for p in &pidls { CoTaskMemFree(Some(*p as *const c_void)); }
         return Err("GetMenuItemCount==0".into());
     }
 
     // Liberar los PIDLs extra (pidls[1..]): pidls[0] lo libera el caller.
     for p in pidls.iter().skip(1) {
-        let _ = CoTaskMemFree(Some(*p as *const c_void));
+        CoTaskMemFree(Some(*p as *const c_void));
     }
     Ok((menu, hmenu, pidls[0]))
 }
@@ -1130,11 +1285,9 @@ impl App {
             let mut tabs = Vec::new();
             if !layout.tabs.is_empty() {
                 for tab_id in &layout.tabs {
-                    if let Some(idx) = unassigned.iter().position(|c| c.as_ref().map_or(false, |content| &content.id == tab_id)) {
+                    if let Some(idx) = unassigned.iter().position(|c| c.as_ref().is_some_and(|content| &content.id == tab_id)) {
                         if let Some(content) = unassigned[idx].take() {
                             tabs.push(FenceTab {
-                                _rule_id: content.id.clone(),
-                                _target_dir: content.folder.clone(),
                                 content,
                                 selected: HashSet::new(),
                                 scroll: 0,
@@ -1150,11 +1303,9 @@ impl App {
                 }
             } else {
                 let target_id = layout.id.as_str();
-                if let Some(idx) = unassigned.iter().position(|c| c.as_ref().map_or(false, |content| content.id == target_id)) {
+                if let Some(idx) = unassigned.iter().position(|c| c.as_ref().is_some_and(|content| content.id == target_id)) {
                     if let Some(content) = unassigned[idx].take() {
                         tabs.push(FenceTab {
-                            _rule_id: content.id.clone(),
-                            _target_dir: content.folder.clone(),
                             content,
                             selected: HashSet::new(),
                             scroll: 0,
@@ -1177,43 +1328,39 @@ impl App {
         let work = work_area();
         let mut cursor_y = work.top + 32;
 
-        for maybe_content in unassigned {
-            if let Some(content) = maybe_content {
-                let layout = FenceLayout {
-                    id: String32::new(&content.id),
-                    x: work.left + 32,
-                    y: {
-                        let y = cursor_y;
-                        cursor_y += 260;
-                        if cursor_y > work.bottom - 80 {
-                            cursor_y = work.top + 32;
-                        }
-                        y
-                    },
-                    width: 320,
-                    height: 240,
-                    collapsed: false,
-                    hidden: false,
-                    locked: false,
-                    sort_by: None,
-                    tabs: Vec::new(),
-                    group_title: None,
-                };
-                let tabs = vec![FenceTab {
-                    _rule_id: content.id.clone(),
-                    _target_dir: content.folder.clone(),
-                    content,
-                    selected: HashSet::new(),
-                    scroll: 0,
-                    smooth_scroll: 0.0,
-                    search_focused: false,
-                    search_text: String::new(),
-                    rename_item: None,
-                    rename_text: String::new(),
-                    rename_path: None,
-                }];
-                grouped_fences.push((layout, tabs));
-            }
+        for content in unassigned.into_iter().flatten() {
+            let layout = FenceLayout {
+                id: String32::new(&content.id),
+                x: work.left + 32,
+                y: {
+                    let y = cursor_y;
+                    cursor_y += 260;
+                    if cursor_y > work.bottom - 80 {
+                        cursor_y = work.top + 32;
+                    }
+                    y
+                },
+                width: 320,
+                height: 240,
+                collapsed: false,
+                hidden: false,
+                locked: false,
+                sort_by: None,
+                tabs: Vec::new(),
+                group_title: None,
+            };
+            let tabs = vec![FenceTab {
+                content,
+                selected: HashSet::new(),
+                scroll: 0,
+                smooth_scroll: 0.0,
+                search_focused: false,
+                search_text: String::new(),
+                rename_item: None,
+                rename_text: String::new(),
+                rename_path: None,
+            }];
+            grouped_fences.push((layout, tabs));
         }
 
         for (index, (layout, tabs)) in grouped_fences.into_iter().enumerate() {
@@ -1279,7 +1426,7 @@ impl App {
             if let Some(target) = &self.drop_target {
                 let _ = RegisterDragDrop(hwnd, target);
             }
-            let _ = DragAcceptFiles(hwnd, true);
+            DragAcceptFiles(hwnd, true);
         }
 
         self.render_all();
@@ -1396,12 +1543,12 @@ impl App {
             Err(_) => return Vec::new(),
         };
         if medium.tymed != TYMED_HGLOBAL.0 as u32 {
-            let _ = ReleaseStgMedium(&mut medium);
+            ReleaseStgMedium(&mut medium);
             return Vec::new();
         }
         let ptr = GlobalLock(medium.u.hGlobal);
         if ptr.is_null() {
-            let _ = ReleaseStgMedium(&mut medium);
+            ReleaseStgMedium(&mut medium);
             return Vec::new();
         }
         let hdrop = HDROP(ptr);
@@ -1415,7 +1562,7 @@ impl App {
             }
         }
         let _ = GlobalUnlock(medium.u.hGlobal);
-        let _ = ReleaseStgMedium(&mut medium);
+        ReleaseStgMedium(&mut medium);
         paths
     }
 
@@ -1640,13 +1787,47 @@ impl App {
             } else {
                 fence.tabs[fence.active_tab].content.title.clone()
             };
+            // Icono de "paginas apiladas" cuando la caja agrupa varias reglas
+            // en pestanas; el titulo se desplaza para dejarle sitio.
+            let title_left = if fence.tabs.len() > 1 {
+                let ix = pad + 2.0 * scale;
+                let iy = (base_h - 14.0 * scale) * 0.5;
+                let pw = 11.0 * scale;
+                let ph = 12.0 * scale;
+                // Hoja trasera (contorno).
+                brush.SetColor(&with_alpha(theme.title, 0.45));
+                surface.target.DrawRoundedRectangle(
+                    &D2D1_ROUNDED_RECT {
+                        rect: rect(ix + 4.0 * scale, iy, ix + 4.0 * scale + pw, iy + ph),
+                        radiusX: 2.0 * scale,
+                        radiusY: 2.0 * scale,
+                    },
+                    brush,
+                    1.2 * scale,
+                    None,
+                );
+                // Hoja delantera (rellena con el acento).
+                brush.SetColor(&fence.accent);
+                surface.target.FillRoundedRectangle(
+                    &D2D1_ROUNDED_RECT {
+                        rect: rect(ix, iy + 2.5 * scale, ix + pw, iy + 2.5 * scale + ph),
+                        radiusX: 2.0 * scale,
+                        radiusY: 2.0 * scale,
+                    },
+                    brush,
+                );
+                (pad + 21.0 * scale).min(title_right.max(pad + 20.0) * scale)
+            } else {
+                pad + 10.0 * scale
+            };
+
             let title = wide_str(&title_str);
             brush.SetColor(&theme.title);
             surface.target.DrawText(
                 &title,
                 &gfx.title_format,
                 &rect(
-                    pad + 10.0 * scale,
+                    title_left,
                     0.0,
                     title_right.max(pad + 20.0) * scale,
                     base_h,
@@ -1884,7 +2065,7 @@ impl App {
                 );
             }
 
-            let mut icon_jobs: Vec<(i32, i32, HICON)> = Vec::new();
+            let mut icon_jobs: Vec<(i32, i32, i32, HICON)> = Vec::new();
 
             if !fence.layout.collapsed || fence.is_mouse_over {
                 let content_rect = rect(0.0, fence.header_h(theme) * scale, w * scale, h * scale);
@@ -1907,14 +2088,14 @@ impl App {
                 let first = fence.tabs[fence.active_tab].smooth_scroll.max(0.0) as usize;
                 let _last = (first + rows.max(0) as usize + 1).min(fence.tabs[fence.active_tab].content.items.len());
 
-                let grid_mode = self.cfg.appearance.grid_mode;
+                let grid_mode = fence.grid_mode(theme);
                 let cell = (self.cfg.appearance.grid_item_size * scale).max(48.0);
                 let grid_cols = ((w * scale - pad * 2.0) / cell).floor().max(1.0) as usize;
 
                 if grid_mode && !fence.tabs[fence.active_tab].content.items.is_empty() {
                     fence.hit_row_h = cell / scale;
                     // Calcular scroll en modo cuadricula.
-                    let grid_rows = (fence.tabs[fence.active_tab].content.items.len() + grid_cols - 1) / grid_cols;
+                    let grid_rows = fence.tabs[fence.active_tab].content.items.len().div_ceil(grid_cols);
                     let visible_rows = ((h * scale - fence.header_h(theme) * scale) / cell).floor().max(1.0) as usize;
                     let max_grid_scroll = grid_rows.saturating_sub(visible_rows);
                     fence.tabs[fence.active_tab].scroll = fence.tabs[fence.active_tab].scroll.min(max_grid_scroll as i32).max(0);
@@ -1922,7 +2103,9 @@ impl App {
                     let first_row = fence.tabs[fence.active_tab].smooth_scroll.floor().max(0.0) as usize;
                     let last_row = (first_row + visible_rows + 1).min(grid_rows);
                     let cell_pad = 4.0 * scale;
-                    let icon_size = (cell * 0.48).min(32.0 * scale).max(20.0 * scale);
+                    let icon_size = (self.cfg.appearance.grid_icon_size * scale)
+                        .min(cell * 0.70 - cell_pad)
+                        .max(16.0 * scale);
                     for row in first_row..last_row {
                         for col in 0..grid_cols {
                             let idx = row * grid_cols + col;
@@ -1953,22 +2136,23 @@ impl App {
                                 }
                             }
                             if theme.show_icons {
-                                if let Some(icon) = (*icons).get(&item.path, &item.ext, item.is_dir, scale > 1.25) {
-                                    let ix = cx + (cell - icon_size) / 2.0;
-                                    icon_jobs.push((ix as i32, (cy_val + cell_pad) as i32, icon));
+                                if let Some(icon) = (*icons).get(&item.path, &item.ext, item.is_dir, if scale >= 1.5 { IconClass::Jumbo } else { IconClass::Large }) {
+                                    let ix = cx + (cell - icon_size) * 0.5;
+                                    let iy = cy_val + cell_pad + (cell * 0.70 - cell_pad - icon_size) * 0.5;
+                                    icon_jobs.push((ix as i32, iy as i32, icon_size.round() as i32, icon));
                                 }
                             }
                             brush.SetColor(&theme.text);
                             let name = wide_str(&item.name);
                             surface.target.DrawText(
-                                &name, &gfx.meta_format,
-                                &rect(cx + cell_pad, cy_val + cell * 0.55, cx + cell - cell_pad, cy_val + cell - cell_pad),
+                                &name, &gfx.center_meta_format,
+                                &rect(cx + cell_pad, cy_val + cell * 0.70, cx + cell - cell_pad, cy_val + cell - cell_pad),
                                 brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL,
                             );
                         }
                     }
                     // Scrollbar en modo cuadricula.
-                    let _grid_rows = (fence.tabs[fence.active_tab].content.items.len() + grid_cols - 1) / grid_cols;
+                    let _grid_rows = fence.tabs[fence.active_tab].content.items.len().div_ceil(grid_cols);
                     let _visible_rows = ((h * scale - fence.header_h(theme) * scale) / cell).floor().max(1.0) as usize;
                     let _max_grid = _grid_rows.saturating_sub(_visible_rows);
                     if _max_grid > 0 {
@@ -2062,10 +2246,10 @@ impl App {
                             &item.path,
                             &item.ext,
                             item.is_dir,
-                            scale > 1.25,
+                            if scale > 1.25 { IconClass::Large } else { IconClass::Small },
                         ) {
                             let iy = top + (theme.row * scale - icon_px * scale) * 0.5;
-                            icon_jobs.push((pad as i32, iy as i32, icon));
+                            icon_jobs.push((pad as i32, iy as i32, icon_px as i32, icon));
                         }
                         text_left += (icon_px + 6.0) * scale;
                     }
@@ -2201,7 +2385,7 @@ impl App {
                 if !l.collapsed {
                     let vis = ri as i32 - fence.tabs[fence.active_tab].smooth_scroll.round() as i32;
                     if vis >= 0 {
-                        let (bx, by, bw, bh) = if theme.grid_mode {
+                        let (bx, by, bw, bh) = if fence.grid_mode(theme) {
                             let cell = theme.grid_item_size.max(48.0);
                             let w_dip = l.width as f32 / scale;
                             let cols = ((w_dip - theme.padding) / cell).floor().max(1.0) as usize;
@@ -2258,9 +2442,22 @@ impl App {
 
             // Los iconos del shell son HICON de GDI: se estampan sobre la misma
             // DIB despues de que Direct2D haya volcado su contenido.
-            let icon_px = if scale > 1.25 { 20 } else { 16 };
-            for (x, y, icon) in icon_jobs {
-                let _ = DrawIconEx(surface.dc, x, y, icon, icon_px, icon_px, 0, None, DI_NORMAL);
+            // Clip GDI a la zona de contenido (debajo de la cabecera) para que
+            // los iconos no se pinten sobre la cabecera al hacer scroll.
+            let saved_dc = SaveDC(surface.dc);
+            let header_px = (fence.header_h(theme) * scale) as i32;
+            // Evitar region de clip vacia (bottom <= top) cuando la caja queda
+            // mas corta que su cabecera durante el redimensionado.
+            let clip_bottom = surface.height.max(header_px + 1);
+            let _ = IntersectClipRect(surface.dc, 0, header_px, surface.width, clip_bottom);
+            for (x, y, px, icon) in icon_jobs {
+                let _ = DrawIconEx(surface.dc, x, y, icon, px, px, 0, None, DI_NORMAL);
+            }
+            let _ = RestoreDC(surface.dc, saved_dc);
+            // Destruir iconos expulsados de la cache SOLO tras estamparlos, para
+            // no invalidar HICONs que este frame aun referencia.
+            for icon in (*icons).drain_trash() {
+                let _ = DestroyIcon(icon);
             }
 
             // Publicacion atomica del frame con alfa por pixel.
@@ -2597,7 +2794,7 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
             self.toast_alpha = self.toast_alpha.saturating_sub(32);
         } else {
             if self.toast_alpha < 255 - 32 {
-                self.toast_alpha = (self.toast_alpha + 32).min(255);
+                self.toast_alpha += 32;
             } else if self.toast_alpha < 255 {
                 self.toast_alpha = 255;
             } else {
@@ -2757,7 +2954,7 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
                 // Ya esta completamente visible: no seguimos gastando timer.
                 return;
             }
-            self.thumb_alpha = (self.thumb_alpha + 32).min(255);
+            self.thumb_alpha += 32;
         }
         let screen = GetDC(None);
         let source = POINT { x: 0, y: 0 };
@@ -2899,7 +3096,7 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
             return; // sin cambios
         }
         if new_path.exists() {
-            self.show_toast_glyph(&self.tr.toast_rename_exists, TOAST_ERROR, '\u{2715}');
+            self.show_toast_glyph(self.tr.toast_rename_exists, TOAST_ERROR, '\u{2715}');
             return;
         }
         match std::fs::rename(&path, &new_path) {
@@ -2955,7 +3152,7 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
         if let Ok(gfx) = Graphics::new(&self.cfg) {
             self.gfx = gfx;
         }
-        let _ = rules::ensure_layout(&self.cfg, &self.desktop);
+        let _ = rules::ensure_layout(&self.cfg);
         unsafe {
             let _ = self.build_fences();
         }
@@ -3165,13 +3362,13 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
                 lpVerb: PCSTR(verb),
                 lpParameters: PCSTR(std::ptr::null()),
                 lpDirectory: PCSTR(std::ptr::null()),
-                nShow: SW_SHOWNORMAL.0 as i32,
+                nShow: SW_SHOWNORMAL.0,
                 dwHotKey: 0,
                 hIcon: HANDLE::default(),
             };
             let _ = menu.InvokeCommand(&info);
         }
-        let _ = CoTaskMemFree(Some(pidl as *const c_void));
+        CoTaskMemFree(Some(pidl as *const c_void));
     }
 
     unsafe fn show_menu(&mut self, owner: HWND, fence_index: Option<usize>) {
@@ -3505,6 +3702,14 @@ extern "system" fn controller_proc(
                 }
                 LRESULT(0)
             }
+            crate::ui::WM_ZEN_SHOW_WHATS_NEW_TOAST => {
+                if let Some(app) = app_from(hwnd) {
+                    let version = env!("CARGO_PKG_VERSION");
+                    let msg = app.tr.toast_whats_new.replacen("{0}", version, 1);
+                    app.show_toast(&msg, TOAST_DROP);
+                }
+                LRESULT(0)
+            }
             WM_ZEN_TOAST_CLICK => {
                 // El usuario hizo clic en el toast de update: descargar e instalar.
                 if let Some((url, sig_url)) = updater::take_pending_update() {
@@ -3679,14 +3884,13 @@ unsafe extern "system" fn drop_target_qi(
     riid: *const GUID,
     ppv: *mut *mut c_void,
 ) -> windows::core::HRESULT {
-    const IID_IUNKNOWN: GUID = GUID::from_u128(0x0000_0000_0000_0000_c000_000000000046);
-    const IID_IDROPTARGET: GUID = GUID::from_u128(0x0000_0122_0000_0000_c000_000000000046);
-    if !riid.is_null() && !ppv.is_null() {
-        if *riid == IID_IUNKNOWN || *riid == IID_IDROPTARGET {
+    const IID_IUNKNOWN: GUID = GUID::from_u128(0x0000_0000_0000_0000_c000_0000_0000_0046);
+    const IID_IDROPTARGET: GUID = GUID::from_u128(0x0000_0122_0000_0000_c000_0000_0000_0046);
+    if !riid.is_null() && !ppv.is_null()
+        && (*riid == IID_IUNKNOWN || *riid == IID_IDROPTARGET) {
             *ppv = this;
             return windows::core::HRESULT(0); // S_OK
         }
-    }
     windows::core::HRESULT(0x8000_4002u32 as i32) // E_NOINTERFACE
 }
 
@@ -3913,6 +4117,7 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 if app.dragging {
                     return LRESULT(0);
                 }
+                // Cualquier clic cierra el Quick Look.
                 // Renombrado en curso: confirmar antes de procesar el clic.
                 if app.fences[index].tab_mut().rename_item.is_some() {
                     app.commit_rename(index);
@@ -3975,8 +4180,8 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                     let item_cnt = fence.tabs[fence.active_tab].content.items.len();
                     let lr = lock_rect(w_dip, &app.theme, app.theme.show_counter, item_cnt);
                     
-                    if y >= theme_header && y <= (fence.header_h(&app.theme) * fence.scale) as i32 {
-                        if fence.tabs.len() > 1 {
+                    if y >= theme_header && y <= (fence.header_h(&app.theme) * fence.scale) as i32
+                        && fence.tabs.len() > 1 {
                             let scale = fence.scale;
                             let pad = app.theme.padding * scale;
                             let mut tab_x = pad;
@@ -3991,7 +4196,6 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                                 tab_x += tab_w + 4.0 * scale;
                             }
                         }
-                    }
 
                     let in_lock = y <= theme_header
                         && x >= (lr.left * fence.scale) as i32
@@ -4130,7 +4334,7 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                         hwndTrack: hwnd,
                         dwHoverTime: 0,
                     };
-                    unsafe { let _ = TrackMouseEvent(&mut track); }
+                    let _ = TrackMouseEvent(&mut track);
                 }
                 let (x, y) = point_of(lparam);
                 let mode = app.fences[index].drag.clone();
@@ -4221,7 +4425,7 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                     let scale = app.fences[index].scale;
                     let theme = &app.theme;
                     let fence = &mut app.fences[index];
-                    let grid_mode = theme.grid_mode;
+                    let grid_mode = fence.grid_mode(theme);
                     let pad = theme.padding;
                     
                     if grid_mode {
@@ -4364,7 +4568,7 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 let in_lock = y <= header
                     && x >= (lr.left * s) as i32
                     && x <= (lr.right * s) as i32;
-                let in_search = app.cfg.appearance.show_search && y <= header && search_rect(w_dip, &app.theme, app.theme.show_counter, item_cnt).map_or(false, |sr| {
+                let in_search = app.cfg.appearance.show_search && y <= header && search_rect(w_dip, &app.theme, app.theme.show_counter, item_cnt).is_some_and(|sr| {
                     x >= (sr.left * s) as i32 && x <= (sr.right * s) as i32
                 });
                 if in_lock || in_search {
@@ -4381,12 +4585,12 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
             }
             WM_MOUSEWHEEL => {
                 let delta = ((wparam.0 >> 16) as i16) as i32 / WHEEL_DELTA as i32;
-                let max = if app.cfg.appearance.grid_mode {
+                let max = if app.fences[index].grid_mode(&app.theme) {
                     let cell = (app.cfg.appearance.grid_item_size * app.fences[index].scale).max(48.0);
                     let w_dip = app.fences[index].layout.width as f32 / app.fences[index].scale;
                     let pad = app.theme.padding;
                     let grid_cols = ((w_dip * app.fences[index].scale - pad * 2.0) / cell).floor().max(1.0) as usize;
-                    let grid_rows = (app.fences[index].tab_mut().content.items.len() + grid_cols - 1) / grid_cols;
+                    let grid_rows = app.fences[index].tab_mut().content.items.len().div_ceil(grid_cols);
                     let h_dip = app.fences[index].visible_height(&app.theme) as f32 / app.fences[index].scale;
                     let visible_rows = ((h_dip * app.fences[index].scale - app.fences[index].header_h(&app.theme) * app.fences[index].scale) / cell).floor().max(1.0) as usize;
                     grid_rows.saturating_sub(visible_rows) as i32
@@ -4396,7 +4600,7 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 let next = (app.fences[index].tab_mut().scroll - delta * 3).clamp(0, max);
                 if next != app.fences[index].tab_mut().scroll {
                     app.fences[index].tab_mut().scroll = next;
-                    unsafe { let _ = SetTimer(app.controller, TIMER_SCROLL, 16, None); }
+                    let _ = SetTimer(app.controller, TIMER_SCROLL, 16, None);
                 }
                 LRESULT(0)
             }
@@ -4842,6 +5046,115 @@ mod tests {
         unsafe {
             let _ = PostMessageW(hwnd, msg, wparam, lparam);
         }
+    }
+
+    /// Inserta una entrada en la cache por-archivo como lo haria `get` en un
+    /// fallo de cache (mantiene `by_path` y `path_order` sincronizados).
+    fn cache_insert(cache: &mut IconCache, key: &str) {
+        let k = (PathBuf::from(key), IconClass::Large);
+        cache.by_path.insert(k.clone(), HICON::default());
+        cache.path_order.push_front(k);
+    }
+
+    /// La cache por-archivo debe comportarse como una LRU: `touch_path` mueve la
+    /// entrada al frente y `evict_lru` expulsa la menos usada recientemente,
+    /// difiriendo su destruccion a `trash` (nunca se invalida en pleno render).
+    #[test]
+    fn icon_cache_lru_evicts_least_recently_used() {
+        let mut cache = IconCache::default();
+        cache_insert(&mut cache, "a.lnk");
+        cache_insert(&mut cache, "b.lnk");
+        cache_insert(&mut cache, "c.lnk");
+        // Recencia (frente -> final): [c, b, a].
+
+        // Volver a usar `a`: pasa al frente -> [a, c, b].
+        cache.touch_path(&(PathBuf::from("a.lnk"), IconClass::Large));
+        assert_eq!(
+            cache.path_order.front().unwrap().clone(),
+            (PathBuf::from("a.lnk"), IconClass::Large),
+            "touch_path debe mover la clave al frente"
+        );
+
+        // El menos usado es ahora `b`.
+        cache.evict_lru();
+        assert!(
+            !cache.by_path.contains_key(&(PathBuf::from("b.lnk"), IconClass::Large)),
+            "b (LRU) debio expulsarse"
+        );
+        assert!(cache.by_path.contains_key(&(PathBuf::from("a.lnk"), IconClass::Large)));
+        assert!(cache.by_path.contains_key(&(PathBuf::from("c.lnk"), IconClass::Large)));
+
+        // Destruccion diferida: el icono expulsado queda en `trash`, no se
+        // destruye al momento, y `drain_trash` lo entrega.
+        assert_eq!(cache.trash.len(), 1, "el icono expulsado debe quedar en trash");
+        let drained = cache.drain_trash();
+        assert_eq!(drained.len(), 1, "drain_trash debe devolver el icono diferido");
+        assert!(cache.trash.is_empty(), "drain_trash debe vaciar la papelera");
+
+        // Evitar que Drop llame a DestroyIcon sobre manejadores ficticios.
+        std::mem::forget(cache);
+    }
+
+    /// La expulsion debe respetar el orden de uso a lo largo de varias
+    /// expulsiones y saltarse claves fantasma ya retiradas de `by_path`.
+    #[test]
+    fn icon_cache_lru_evicts_in_usage_order_and_skips_stale() {
+        let mut cache = IconCache::default();
+        cache_insert(&mut cache, "a.lnk");
+        cache_insert(&mut cache, "b.lnk");
+        cache_insert(&mut cache, "c.lnk");
+        // Recencia: [c, b, a].
+
+        // Marcar `b` como usado: [b, c, a].
+        cache.touch_path(&(PathBuf::from("b.lnk"), IconClass::Large));
+
+        // Clave fantasma al final de la cola (ya no esta en by_path).
+        cache.path_order.push_back((PathBuf::from("fantasma.lnk"), IconClass::Large));
+
+        // 1) Se salta la fantasma y expulsa a `a` (LRU real).
+        cache.evict_lru();
+        assert!(!cache.by_path.contains_key(&(PathBuf::from("a.lnk"), IconClass::Large)));
+        assert!(cache.by_path.contains_key(&(PathBuf::from("b.lnk"), IconClass::Large)));
+        assert!(cache.by_path.contains_key(&(PathBuf::from("c.lnk"), IconClass::Large)));
+
+        // 2) Siguiente expulsion: `c` (a ya salio; b es el mas usado).
+        cache.evict_lru();
+        assert!(!cache.by_path.contains_key(&(PathBuf::from("c.lnk"), IconClass::Large)));
+        assert!(
+            cache.by_path.contains_key(&(PathBuf::from("b.lnk"), IconClass::Large)),
+            "b es el mas usado y debe quedar"
+        );
+
+        assert_eq!(cache.trash.len(), 2, "se difirieron dos destrucciones");
+        let _ = cache.drain_trash();
+        std::mem::forget(cache);
+    }
+
+    /// El tope de la cache se reduce para los iconos JUMBO (256px, ~256KB cada
+    /// uno) para acotar la memoria maxima de la aplicacion.
+    #[test]
+    fn icon_cache_cap_is_lower_for_jumbo() {
+        assert_eq!(icon_path_cap(IconClass::Small), 1024);
+        assert_eq!(icon_path_cap(IconClass::Large), 1024);
+        assert_eq!(icon_path_cap(IconClass::Jumbo), 256);
+    }
+
+    /// La cache por-extension tambien se acota: el tope es menor para JUMBO y,
+    /// al expulsar, la destruccion se difiere a `trash`.
+    #[test]
+    fn icon_cache_ext_cap_and_eviction() {
+        assert_eq!(icon_ext_cap(IconClass::Small), 512);
+        assert_eq!(icon_ext_cap(IconClass::Large), 512);
+        assert_eq!(icon_ext_cap(IconClass::Jumbo), 128);
+
+        let mut cache = IconCache::default();
+        cache.by_ext.insert(("pdf".to_string(), IconClass::Large), HICON::default());
+        cache.by_ext.insert(("png".to_string(), IconClass::Large), HICON::default());
+        cache.evict_ext();
+        assert_eq!(cache.by_ext.len(), 1, "evict_ext debe expulsar una entrada");
+        assert_eq!(cache.trash.len(), 1, "la destruccion debe diferirse a trash");
+        let _ = cache.drain_trash();
+        std::mem::forget(cache);
     }
 
     /// Prueba real de la app: lanza el proceso de interfaz sobre un escritorio

@@ -31,17 +31,3 @@ pub fn latest_release() -> Option<(&'static str, &'static str)> {
 
     Some((version, body.trim()))
 }
-
-/// Truncates the release body to fit nicely in a MessageBox (~800 chars).
-pub fn summary(body: &str, max_chars: usize) -> String {
-    if body.len() <= max_chars {
-        return body.to_string();
-    }
-    let mut truncated = body[..max_chars].to_string();
-    // Cut at last newline to avoid chopping mid-word
-    if let Some(pos) = truncated.rfind('\n') {
-        truncated.truncate(pos);
-    }
-    truncated.push_str("\n\n... (see full changelog on GitHub)");
-    truncated
-}

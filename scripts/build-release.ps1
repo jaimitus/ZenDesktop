@@ -1,7 +1,7 @@
 ﻿# ZenDesktop Release Builder
 # Creates: portable .exe + .zip + .msi installer + SHA256SUMS.txt
 param(
-    [string]$Version = "1.0.1",
+    [string]$Version = "1.0.2",
     [string]$SigningKey = $env:SIGNING_KEY
 )
 

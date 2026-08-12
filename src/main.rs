@@ -40,7 +40,7 @@ use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MessageBoxW, PostMessageW, TranslateMessage, MB_ICONINFORMATION,
+    DispatchMessageW, GetMessageW, MessageBoxW, PostMessageW, TranslateMessage,
     MB_ICONERROR, MB_OK, MSG,
 };
 
@@ -103,16 +103,19 @@ fn bootstrap() -> Result<ExitCode, Box<dyn std::error::Error>> {
     // ------------------------------------------------------------ 4. Configuracion
     let (mut cfg, cfg_path) = Config::load_or_create()?;
 
-    // Show "What's New" dialog if this version hasn't been seen yet.
+    // Si esta version aun no se ha visto, se marca "What's New" pendiente: se
+    // avisa con un toast no intrusivo una vez arrancada la interfaz (nada de
+    // ventanas modales al iniciar).
     let current_ver = env!("CARGO_PKG_VERSION");
+    let mut whats_new_pending = false;
     if cfg.general.last_seen_version != current_ver {
-        if let Some((ver, body)) = changelog::latest_release() {
-            // Only show if the latest changelog entry matches our version
+        if let Some((ver, _body)) = changelog::latest_release() {
+            // Solo si la entrada mas reciente del changelog coincide con esta version.
             if ver == current_ver {
-                show_whats_new(body);
+                whats_new_pending = true;
             }
         }
-        // Mark as seen so the dialog doesn't appear again
+        // Marcar como vista para no volver a avisar.
         cfg.general.last_seen_version = current_ver.to_string();
         let _ = cfg.save(&cfg_path);
     }
@@ -133,7 +136,7 @@ fn bootstrap() -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
 
     // ------------------------------------------- 5. Arbol de carpetas y primer barrido
-    rules::ensure_layout(&cfg, &desktop)?;
+    rules::ensure_layout(&cfg)?;
     if cfg.general.organize_on_start {
         let organize = rules::organize(&cfg, &desktop);
         let sweep = rules::sweep_ephemeral(&cfg, &desktop);
@@ -148,6 +151,18 @@ fn bootstrap() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let lang = cfg.lang();
     let auto_check_updates = cfg.general.auto_check_updates;
     let handle = App::launch(cfg, cfg_path, desktop, extra_desktops)?;
+
+    // Aviso "What's New" via toast (ya con la interfaz lista y el toast creado).
+    if whats_new_pending {
+        unsafe {
+            let _ = PostMessageW(
+                handle.controller(),
+                ui::WM_ZEN_SHOW_WHATS_NEW_TOAST,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
 
     // Chequeo de updates en segundo plano: no bloquea el arranque. El hilo
     // consulta GitHub y postea el resultado a la ventana de control.
@@ -190,26 +205,6 @@ fn bootstrap() -> Result<ExitCode, Box<dyn std::error::Error>> {
     } else {
         ExitCode::FAILURE
     })
-}
-
-/// Shows the "What's New" dialog with a summary of the latest release.
-fn show_whats_new(body: &str) {
-    let version = env!("CARGO_PKG_VERSION");
-    let summary = changelog::summary(body, 800);
-    let title = format!("ZenDesktop v{version} — What's New");
-    let msg = format!("ZenDesktop has been updated to v{version}!\n\n{summary}");
-
-    let title_wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-    let msg_wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-
-    unsafe {
-        MessageBoxW(
-            None,
-            PCWSTR(msg_wide.as_ptr()),
-            PCWSTR(title_wide.as_ptr()),
-            MB_OK | MB_ICONINFORMATION,
-        );
-    }
 }
 
 /// Bucle principal. `GetMessageW` bloquea el hilo dentro del kernel hasta que

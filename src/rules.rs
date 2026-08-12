@@ -70,6 +70,8 @@ pub struct FenceContent {
     pub id: String,
     pub title: String,
     pub color: String,
+    /// Vista de la caja: "auto" | "list" | "grid".
+    pub view_mode: String,
     /// Carpeta fisica respaldada por la caja (None en cajas virtuales).
     pub folder: Option<PathBuf>,
     pub items: Vec<FileItem>,
@@ -109,11 +111,11 @@ impl Report {
 // Preparacion del arbol de carpetas
 // ---------------------------------------------------------------------------
 
-/// Crea `<Escritorio>\<root>` y una subcarpeta por cada regla fisica activa,
+/// Crea `<Documentos>\<root>` y una subcarpeta por cada regla fisica activa,
 /// mas la carpeta de archivo historico. Idempotente y barato.
-pub fn ensure_layout(cfg: &Config, desktop: &Path) -> io::Result<Vec<PathBuf>> {
+pub fn ensure_layout(cfg: &Config) -> io::Result<Vec<PathBuf>> {
     let mut created = Vec::new();
-    let root = cfg.root_dir(desktop);
+    let root = cfg.root_dir();
     let needs_root = cfg.rules.iter().any(|r| r.enabled && r.move_files);
     if needs_root {
         fs::create_dir_all(&root)?;
@@ -125,7 +127,7 @@ pub fn ensure_layout(cfg: &Config, desktop: &Path) -> io::Result<Vec<PathBuf>> {
         created.push(dir);
     }
     if cfg.ephemeral.enabled {
-        let archive = cfg.archive_dir(desktop);
+        let archive = cfg.archive_dir();
         fs::create_dir_all(&archive)?;
         created.push(archive);
     }
@@ -223,9 +225,9 @@ pub fn is_protected(cfg: &Config, name: &str, _ext: &str) -> bool {
 }
 
 /// Rutas internas de la aplicacion que nunca se clasifican ni se listan.
-fn is_internal(cfg: &Config, desktop: &Path, path: &Path) -> bool {
-    let root = cfg.root_dir(desktop);
-    let archive = cfg.archive_dir(desktop);
+fn is_internal(cfg: &Config, path: &Path) -> bool {
+    let root = cfg.root_dir();
+    let archive = cfg.archive_dir();
     path == root || path == archive || path.starts_with(&root) || path.starts_with(&archive)
 }
 
@@ -242,7 +244,7 @@ pub fn organize(cfg: &Config, desktop: &Path) -> Report {
     let started = SystemTime::now();
     let mut report = Report::default();
 
-    let root = cfg.root_dir(desktop);
+    let root = cfg.root_dir();
     let entries = match fs::read_dir(desktop) {
         Ok(e) => e,
         Err(err) => {
@@ -253,7 +255,7 @@ pub fn organize(cfg: &Config, desktop: &Path) -> Report {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if is_internal(cfg, desktop, &path) {
+        if is_internal(cfg, &path) {
             continue;
         }
         let file_type = match entry.file_type() {
@@ -320,7 +322,7 @@ pub fn notify_shell() {
 pub fn restore_desktop(cfg: &Config, desktop: &Path) -> Report {
     let started = SystemTime::now();
     let mut report = Report::default();
-    let root = cfg.root_dir(desktop);
+    let root = cfg.root_dir();
 
     // 1) Carpetas fisicas de las cajas: se vacia TODO lo que haya dentro de la
     // raiz interna (reglas activas, desactivadas o ya eliminadas) para que
@@ -341,8 +343,8 @@ pub fn restore_desktop(cfg: &Config, desktop: &Path) -> Report {
         }
     }
     // 2) Archivo historico (ficheros sueltos y subcarpetas AAAA-MM aplanadas).
-    restore_tree(&mut report, &cfg.archive_dir(desktop), desktop, true);
-    // 3) Si la raiz interna quedo vacia se retira entera del escritorio.
+    restore_tree(&mut report, &cfg.archive_dir(), desktop, true);
+    // 3) Si la raiz interna quedo vacia se retira entera.
     if fs::read_dir(&root).map(|mut e| e.next().is_none()).unwrap_or(false) {
         let _ = fs::remove_dir(&root);
     }
@@ -397,7 +399,7 @@ fn restore_tree(report: &mut Report, src_dir: &Path, dest: &Path, flat: bool) {
 // Regla de archivos efimeros
 // ---------------------------------------------------------------------------
 
-/// Mueve a `<Escritorio>\<archive_folder>\AAAA-MM` todo lo que lleve mas de
+/// Mueve a `<Documentos>\<archive_folder>\AAAA-MM` todo lo que lleve mas de
 /// `max_age_days` sin modificarse ni abrirse. Barre el escritorio y tambien el
 /// interior de las cajas fisicas (un instalador olvidado en "Instaladores"
 /// tambien caduca).
@@ -410,14 +412,14 @@ pub fn sweep_ephemeral(cfg: &Config, desktop: &Path) -> Report {
 
     let max_age = cfg.max_age();
     let min_age = Duration::from_secs(cfg.ephemeral.min_age_minutes * 60);
-    let archive_root = cfg.archive_dir(desktop);
+    let archive_root = cfg.archive_dir();
     if let Err(err) = fs::create_dir_all(&archive_root) {
         report.push_error("crear archivo historico", &err);
         return report;
     }
 
     let mut scopes: Vec<PathBuf> = vec![desktop.to_path_buf()];
-    let root = cfg.root_dir(desktop);
+    let root = cfg.root_dir();
     for rule in cfg.rules.iter().filter(|r| r.enabled && r.move_files) {
         let dir = root.join(&rule.folder);
         if dir.is_dir() {
@@ -437,7 +439,7 @@ pub fn sweep_ephemeral(cfg: &Config, desktop: &Path) -> Report {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if is_desktop_root && is_internal(cfg, desktop, &path) {
+            if is_desktop_root && is_internal(cfg, &path) {
                 continue;
             }
             let meta = match entry.metadata() {
@@ -487,7 +489,7 @@ pub fn sweep_ephemeral(cfg: &Config, desktop: &Path) -> Report {
     }
 
     if cfg.ephemeral.purge_archive_after_days > 0 {
-        report.merge(purge_archive(cfg, desktop));
+        report.merge(purge_archive(cfg));
     }
 
     report.elapsed_ms = elapsed_ms(started);
@@ -495,14 +497,14 @@ pub fn sweep_ephemeral(cfg: &Config, desktop: &Path) -> Report {
 }
 
 /// Borrado definitivo opcional del historico (desactivado por defecto).
-pub fn purge_archive(cfg: &Config, desktop: &Path) -> Report {
+pub fn purge_archive(cfg: &Config) -> Report {
     let mut report = Report::default();
     let days = cfg.ephemeral.purge_archive_after_days;
     if days == 0 {
         return report;
     }
     let limit = Duration::from_secs(days as u64 * 86_400);
-    let root = cfg.archive_dir(desktop);
+    let root = cfg.archive_dir();
 
     let mut stack = vec![root];
     while let Some(dir) = stack.pop() {
@@ -537,7 +539,7 @@ pub fn purge_archive(cfg: &Config, desktop: &Path) -> Report {
 
 /// Resuelve el contenido visible de cada caja activa.
 pub fn collect_fences(cfg: &Config, desktop: &Path, sort_overrides: &std::collections::HashMap<String, Option<String>>) -> Vec<FenceContent> {
-    let root = cfg.root_dir(desktop);
+    let root = cfg.root_dir();
     let mut fences = Vec::with_capacity(cfg.rules.len());
 
     for rule in cfg.rules.iter().filter(|r| r.enabled) {
@@ -555,6 +557,7 @@ pub fn collect_fences(cfg: &Config, desktop: &Path, sort_overrides: &std::collec
             id: rule.id.clone(),
             title: rule.title.clone(),
             color: rule.color.clone(),
+            view_mode: rule.view_mode.clone(),
             folder,
             items,
         });
@@ -575,7 +578,7 @@ fn read_items(
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if is_internal(cfg, desktop, &path) && dir == desktop {
+        if is_internal(cfg, &path) && dir == desktop {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -611,7 +614,7 @@ pub const IMAGE_EXTENSIONS: &[&str] = &[
 ];
 
 pub fn is_image(ext: &str) -> bool {
-    !ext.is_empty() && IMAGE_EXTENSIONS.iter().any(|e| *e == ext)
+    !ext.is_empty() && IMAGE_EXTENSIONS.contains(&ext)
 }
 
 /// Ordena items in-place (publico: lo usa el menu contextual de cada caja).
@@ -960,6 +963,14 @@ mod tests {
         dir
     }
 
+    /// Configuracion aislada: redirige las carpetas internas (ZenDesktop /
+    /// ZenArchive) a rutas absolutas dentro del directorio temporal, para que
+    /// los tests jamas toquen Mis Documentos reales.
+    fn isolated(cfg: &mut Config, base: &Path) {
+        cfg.general.root_folder = base.join("ZenDesktop").to_string_lossy().into_owned();
+        cfg.general.archive_folder = base.join("ZenArchive").to_string_lossy().into_owned();
+    }
+
     #[test]
     fn organizes_files_and_folders() {
         let desktop = test_desktop("org");
@@ -968,6 +979,7 @@ mod tests {
         fs::write(desktop.join("otro.dat"), b"x").unwrap();
 
         let mut cfg = Config::default();
+        isolated(&mut cfg, &desktop);
         cfg.general.organize_folders = true;
         cfg.rules = vec![
             Rule {
@@ -980,6 +992,7 @@ mod tests {
                 folder: "Media".into(),
                 color: "#38BDF8".into(),
                 include_folders: true,
+                view_mode: "auto".into(),
             },
             Rule {
                 id: "misc".into(),
@@ -991,14 +1004,15 @@ mod tests {
                 folder: "Varios".into(),
                 color: "#34D399".into(),
                 include_folders: true,
+                view_mode: "auto".into(),
             },
         ];
 
-        ensure_layout(&cfg, &desktop).unwrap();
+        ensure_layout(&cfg).unwrap();
         let report = organize(&cfg, &desktop);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
 
-        let root = cfg.root_dir(&desktop);
+        let root = cfg.root_dir();
         // La carpeta "Fotos" casa con la regla Media por patron de nombre
         // (las carpetas no tienen extension, asi que casan por nombre o por
         // la regla comodin).
@@ -1018,6 +1032,7 @@ mod tests {
         fs::create_dir_all(desktop.join("Fotos")).unwrap();
 
         let mut cfg = Config::default();
+        isolated(&mut cfg, &desktop);
         cfg.general.organize_folders = false;
         cfg.rules = vec![Rule {
             id: "media".into(),
@@ -1029,8 +1044,9 @@ mod tests {
             folder: "Media".into(),
             color: "#38BDF8".into(),
             include_folders: true,
+            view_mode: "auto".into(),
         }];
-        ensure_layout(&cfg, &desktop).unwrap();
+        ensure_layout(&cfg).unwrap();
         let report = organize(&cfg, &desktop);
         assert!(report.errors.is_empty());
         assert!(desktop.join("Fotos").is_dir(), "sin organize_folders la carpeta no se toca");
@@ -1046,6 +1062,7 @@ mod tests {
         fs::write(desktop.join("nota.pdf"), b"x").unwrap();
 
         let mut cfg = Config::default();
+        isolated(&mut cfg, &desktop);
         cfg.general.organize_folders = true;
         cfg.rules = vec![
             Rule {
@@ -1058,6 +1075,7 @@ mod tests {
                 folder: "Media".into(),
                 color: "#38BDF8".into(),
                 include_folders: false,
+                view_mode: "auto".into(),
             },
             Rule {
                 id: "misc".into(),
@@ -1069,9 +1087,10 @@ mod tests {
                 folder: "Varios".into(),
                 color: "#34D399".into(),
                 include_folders: true,
+                view_mode: "auto".into(),
             },
         ];
-        ensure_layout(&cfg, &desktop).unwrap();
+        ensure_layout(&cfg).unwrap();
         let report = organize(&cfg, &desktop);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
 
@@ -1080,8 +1099,8 @@ mod tests {
         assert!(desktop.join("foto.jpg").is_file(), "foto.jpg debe volver a la raiz");
         assert!(desktop.join("nota.pdf").is_file(), "nota.pdf debe volver a la raiz");
         // La raiz interna quedo vacia y se retiro.
-        assert!(!cfg.root_dir(&desktop).join("Media").exists());
-        assert!(!cfg.root_dir(&desktop).join("Varios").exists());
+        assert!(!cfg.root_dir().join("Media").exists());
+        assert!(!cfg.root_dir().join("Varios").exists());
 
         let _ = fs::remove_dir_all(&desktop);
     }
@@ -1092,6 +1111,7 @@ mod tests {
         fs::write(desktop.join("viejo.log"), b"x").unwrap();
 
         let mut cfg = Config::default();
+        isolated(&mut cfg, &desktop);
         cfg.rules = vec![Rule {
             id: "misc".into(),
             title: "Varios".into(),
@@ -1102,12 +1122,13 @@ mod tests {
             folder: "Varios".into(),
             color: "#34D399".into(),
             include_folders: true,
+            view_mode: "auto".into(),
         }];
-        ensure_layout(&cfg, &desktop).unwrap();
+        ensure_layout(&cfg).unwrap();
         organize(&cfg, &desktop);
 
         // Simular el archivo historico con un mes anidado.
-        let month = cfg.archive_dir(&desktop).join("2025-01");
+        let month = cfg.archive_dir().join("2025-01");
         fs::create_dir_all(&month).unwrap();
         fs::write(month.join("caduco.log"), b"x").unwrap();
 
@@ -1125,6 +1146,7 @@ mod tests {
         fs::write(desktop.join("foto.jpg"), b"x").unwrap();
 
         let mut cfg = Config::default();
+        isolated(&mut cfg, &desktop);
         cfg.general.organize_folders = true;
         cfg.rules = vec![Rule {
             id: "media".into(),
@@ -1136,23 +1158,24 @@ mod tests {
             folder: "Media".into(),
             color: "#38BDF8".into(),
             include_folders: false,
+            view_mode: "auto".into(),
         }];
-        ensure_layout(&cfg, &desktop).unwrap();
+        ensure_layout(&cfg).unwrap();
         organize(&cfg, &desktop);
-        assert!(cfg.root_dir(&desktop).join("Media").join("foto.jpg").is_file());
+        assert!(cfg.root_dir().join("Media").join("foto.jpg").is_file());
 
         // Carpeta huerfana (regla eliminada o nunca creada): su contenido
         // tambien debe volver al escritorio al restaurar, aunque la regla
         // correspondiente ya no este activa.
-        fs::create_dir_all(cfg.root_dir(&desktop).join("Instaladores")).unwrap();
-        fs::write(cfg.root_dir(&desktop).join("Instaladores").join("setup.exe"), b"x").unwrap();
+        fs::create_dir_all(cfg.root_dir().join("Instaladores")).unwrap();
+        fs::write(cfg.root_dir().join("Instaladores").join("setup.exe"), b"x").unwrap();
         cfg.rules[0].enabled = false;
 
         let restore = restore_desktop(&cfg, &desktop);
         assert!(restore.errors.is_empty(), "{:?}", restore.errors);
         assert!(desktop.join("foto.jpg").is_file(), "foto.jpg vuelve a la raiz");
         assert!(desktop.join("setup.exe").is_file(), "la carpeta huerfana se vacia");
-        assert!(!cfg.root_dir(&desktop).exists(), "la raiz interna se retira al quedar vacia");
+        assert!(!cfg.root_dir().exists(), "la raiz interna se retira al quedar vacia");
 
         let _ = fs::remove_dir_all(&desktop);
     }

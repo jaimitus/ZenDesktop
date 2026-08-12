@@ -117,14 +117,9 @@ impl DesktopWatcher {
             .name("zen-fs-coalescer".into())
             .stack_size(64 * 1024) // hilo minimo: solo agrupa y publica mensajes
             .spawn(move || {
-                loop {
+                while let Ok(first) = rx.recv() {
                     // Bloqueo indefinido: el hilo no consume CPU mientras no
                     // ocurra nada en el disco.
-                    let first = match rx.recv() {
-                        Ok(ev) => ev,
-                        Err(_) => break, // watcher soltado -> fin del hilo
-                    };
-
                     let mut batch = 0u32;
                     if accept(&first) {
                         batch += 1;

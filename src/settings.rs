@@ -83,6 +83,7 @@ const ID_EDIT_R_FOLDER: u16 = 5;
 const ID_EDIT_R_COLOR: u16 = 6;
 const ID_EDIT_R_EXTS: u16 = 7;
 const ID_EDIT_R_PATTERNS: u16 = 8;
+const ID_EDIT_R_GROUP_TITLE: u16 = 25;
 const ID_EDIT_A_BG: u16 = 9;
 const ID_EDIT_A_HOVER: u16 = 10;
 const ID_EDIT_A_BORDER: u16 = 11;
@@ -99,6 +100,7 @@ const ID_EDIT_G_ARCHIVE: u16 = 21;
 const ID_EDIT_A_GRID_SIZE: u16 = 22;
 const ID_EDIT_AI_URL: u16 = 23;
 const ID_EDIT_AI_MODEL: u16 = 24;
+const ID_EDIT_A_GRID_ICON: u16 = 26;
 
 const ID_CHECK_ORGANIZE_FOLDERS: u16 = 101;
 const ID_CHECK_ORGANIZE_START: u16 = 102;
@@ -127,6 +129,8 @@ const ID_BTN_DOWN: u16 = 204;
 const ID_BTN_OK: u16 = 205;
 const ID_BTN_CANCEL: u16 = 206;
 const ID_BTN_APPLY: u16 = 207;
+const ID_BTN_GROUP: u16 = 208;
+const ID_BTN_UNGROUP: u16 = 209;
 const ID_BTN_AI_PING: u16 = 210;
 const ID_BTN_AI_DETECT_MODELS: u16 = 211;
 const ID_BTN_AI_REORGANIZE: u16 = 212;
@@ -135,13 +139,13 @@ const ID_BTN_DOWNLOAD_UPDATE: u16 = 214;
 const ID_BTN_EXPORT_CFG: u16 = 215;
 const ID_BTN_IMPORT_CFG: u16 = 216;
 
-const ALL_EDITS: [u16; 24] = [
+const ALL_EDITS: [u16; 26] = [
     ID_EDIT_MAX_AGE, ID_EDIT_MIN_AGE, ID_EDIT_PURGE, ID_EDIT_R_TITLE, ID_EDIT_R_FOLDER,
-    ID_EDIT_R_COLOR, ID_EDIT_R_EXTS, ID_EDIT_R_PATTERNS, ID_EDIT_A_BG, ID_EDIT_A_HOVER,
+    ID_EDIT_R_COLOR, ID_EDIT_R_EXTS, ID_EDIT_R_PATTERNS, ID_EDIT_R_GROUP_TITLE, ID_EDIT_A_BG, ID_EDIT_A_HOVER,
     ID_EDIT_A_BORDER, ID_EDIT_A_TITLE, ID_EDIT_A_TEXT, ID_EDIT_A_MUTED, ID_EDIT_A_SHADOW,
     ID_EDIT_A_RADIUS, ID_EDIT_A_TITLE_SIZE, ID_EDIT_A_TEXT_SIZE, ID_EDIT_A_SNAP,
     ID_EDIT_G_ROOT, ID_EDIT_G_ARCHIVE,
-    ID_EDIT_A_GRID_SIZE, ID_EDIT_AI_URL, ID_EDIT_AI_MODEL,
+    ID_EDIT_A_GRID_SIZE, ID_EDIT_AI_URL, ID_EDIT_AI_MODEL, ID_EDIT_A_GRID_ICON,
 ];
 
 // Valores de teclas para patrones de match (las constantes VK_* no son
@@ -216,6 +220,7 @@ enum Ctrl {
     Swatch(u16),
     RuleRow(usize),
     RuleSort(usize),
+    RuleView(usize, &'static str),
     Btn(u16),
     Folder(u16),
     Close,
@@ -245,6 +250,15 @@ struct Region {
 // ---------------------------------------------------------------------------
 // Estado
 // ---------------------------------------------------------------------------
+
+/// Rectangulo de diseno (DIP): esquina superior izquierda + tamano.
+#[derive(Clone, Copy)]
+struct Rect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
 
 struct Settings {
     cfg: Config,
@@ -366,7 +380,8 @@ impl Settings {
         }
     }
 
-    fn draw_rr(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, color: D2D1_COLOR_F, width: f32) {
+    fn draw_rr(&mut self, rect: Rect, r: f32, color: D2D1_COLOR_F, width: f32) {
+        let Rect { x, y, w, h } = rect;
         self.set(color);
         unsafe {
             self.target()
@@ -409,6 +424,15 @@ impl Settings {
         }
     }
 
+    /// Icono de cadena: dos eslabones entrelazados en diagonal (regla agrupada).
+    fn chain_icon(&mut self, x: f32, y: f32, color: D2D1_COLOR_F) {
+        let w = 8.0;
+        let h = 5.0;
+        let r = 2.5;
+        self.draw_rr(Rect { x, y, w, h }, r, color, 1.3);
+        self.draw_rr(Rect { x: x + 3.6, y: y + 3.6, w, h }, r, color, 1.3);
+    }
+
     fn add_region(&mut self, ctrl: Ctrl, r: D2D_RECT_F) {
         self.regions.push(Region { ctrl, r });
     }
@@ -440,7 +464,7 @@ impl Settings {
     fn panel_bg(&mut self) {
         let (cx, cy, cw, ch) = self.content_area();
         self.fill_rr(cx, cy, cw, ch, 14.0, col(C_CARD));
-        self.draw_rr(cx, cy, cw, ch, 14.0, rgba(C_CARD_BORDER, 0.7), 1.0);
+        self.draw_rr(Rect { x: cx, y: cy, w: cw, h: ch }, 14.0, rgba(C_CARD_BORDER, 0.7), 1.0);
     }
 
     /// Titulo de seccion con barra de acento; devuelve el siguiente y.
@@ -461,19 +485,20 @@ impl Settings {
     }
 
     fn check(&mut self, y: f32, cx: f32, cw: f32, id: u16, label: &str) -> f32 {
-        self.checkbox(cx + 16.0, y, cw - 32.0, 28.0, id, label, self.checked(id), true);
+        self.checkbox(Rect { x: cx + 16.0, y, w: cw - 32.0, h: 28.0 }, id, label, self.checked(id));
         y + 28.0
     }
 
     fn check_inline(&mut self, y: f32, x0: f32, x1: f32, id: u16, label: &str) {
-        self.checkbox(x0 + 8.0, y, (x1 - x0) - 12.0, 26.0, id, label, self.checked(id), true);
+        self.checkbox(Rect { x: x0 + 8.0, y, w: (x1 - x0) - 12.0, h: 26.0 }, id, label, self.checked(id));
     }
 
     fn checked(&self, id: u16) -> bool {
         self.checks.get(&id).copied().unwrap_or(false)
     }
 
-    fn checkbox(&mut self, x: f32, y: f32, w: f32, h: f32, id: u16, label: &str, on: bool, _enabled: bool) {
+    fn checkbox(&mut self, rect: Rect, id: u16, label: &str, on: bool) {
+        let Rect { x, y, w, h } = rect;
         let sw_w = 34.0;
         let sw_h = 18.0;
         let bx = x;
@@ -489,7 +514,7 @@ impl Settings {
         };
         self.fill_rr(bx, by, sw_w, sw_h, sw_h * 0.5, track_bg);
         self.draw_rr(
-            bx, by, sw_w, sw_h, sw_h * 0.5,
+            Rect { x: bx, y: by, w: sw_w, h: sw_h }, sw_h * 0.5,
             if on { col(C_ACCENT) } else { rgba(C_FIELD_BORDER, 0.8) },
             1.0,
         );
@@ -522,33 +547,31 @@ impl Settings {
         );
     }
 
-    fn field_row(&mut self, y: f32, cx: f32, cw: f32, id: u16, label: &str, value: &str, swatch: bool) -> f32 {
+    fn field_row(&mut self, y: f32, content: (f32, f32), id: u16, label: &str, value: &str, swatch: bool) -> f32 {
+        let (cx, cw) = content;
         let label_w = 148.0;
         let field_w = (cw - 32.0 - label_w - if swatch { 40.0 } else { 0.0 }).max(90.0);
-        self.field_at(cx + 16.0, y, label_w, field_w, id, label, value, swatch);
+        self.field_at((cx + 16.0, y), (label_w, field_w), id, label, value, swatch);
         y + 32.0
     }
 
     /// Fila numerica compacta: etiqueta + campo estrecho (2-3 digitos) para
     /// valores como dias o minutos, sin el hueco gigante de antes.
     fn num_row(&mut self, y: f32, cx: f32, id: u16, label: &str, value: &str) -> f32 {
-        self.field_at(cx + 16.0, y, 148.0, 84.0, id, label, value, false);
+        self.field_at((cx + 16.0, y), (148.0, 84.0), id, label, value, false);
         y + 32.0
     }
 
     /// Fila de carpeta: campo de texto + boton de examinar (selector nativo).
     fn folder_row(&mut self, y: f32, cx: f32, cw: f32, id: u16, label: &str, value: &str) -> f32 {
         let total = (430.0_f32).min(cw - 32.0);
-        self.field_at(cx + 16.0, y, 148.0, total - 148.0, id, label, value, false);
+        self.field_at((cx + 16.0, y), (148.0, total - 148.0), id, label, value, false);
         let fw = (total - 148.0).max(90.0);
         let bx = cx + 16.0 + 148.0 + fw + 6.0;
         let over = self.hover == Some(Ctrl::Folder(id));
         self.fill_rr(bx, y, 36.0, 26.0, 7.0, if over { col(C_HOVER) } else { col(C_FIELD) });
         self.draw_rr(
-            bx,
-            y,
-            36.0,
-            26.0,
+            Rect { x: bx, y, w: 36.0, h: 26.0 },
             7.0,
             if over { rgba(C_ACCENT, 0.6) } else { col(C_FIELD_BORDER) },
             1.0,
@@ -576,7 +599,9 @@ impl Settings {
         y + 32.0
     }
 
-    fn field_at(&mut self, x: f32, y: f32, label_w: f32, field_w: f32, id: u16, label: &str, value: &str, swatch: bool) {
+    fn field_at(&mut self, origin: (f32, f32), dims: (f32, f32), id: u16, label: &str, value: &str, swatch: bool) {
+        let (x, y) = origin;
+        let (label_w, field_w) = dims;
         self.text(
             label,
             Fmt::Body,
@@ -592,10 +617,7 @@ impl Settings {
         let focused = self.edits_focused(id);
         self.fill_rr(fx, y, field_w, 26.0, 7.0, col(C_FIELD));
         self.draw_rr(
-            fx,
-            y,
-            field_w,
-            26.0,
+            Rect { x: fx, y, w: field_w, h: 26.0 },
             7.0,
             if focused { col(C_FIELD_FOCUS) } else { col(C_FIELD_BORDER) },
             1.0,
@@ -652,7 +674,7 @@ impl Settings {
             let text = self.edit_text(id).unwrap_or_else(|| value.to_string());
             let valid = valid_color(&text);
             self.fill_rr(sx, y + 3.0, 20.0, 20.0, 5.0, if valid { col(&text) } else { col(C_FIELD) });
-            self.draw_rr(sx, y + 3.0, 20.0, 20.0, 5.0, if valid { rgba(&text, 0.9) } else { rgba(C_DANGER, 0.8) }, 1.0);
+            self.draw_rr(Rect { x: sx, y: y + 3.0, w: 20.0, h: 20.0 }, 5.0, if valid { rgba(&text, 0.9) } else { rgba(C_DANGER, 0.8) }, 1.0);
             self.add_region(
                 Ctrl::Swatch(id),
                 D2D_RECT_F {
@@ -678,22 +700,39 @@ impl Settings {
         let selected = self.rules_selected == Some(idx);
         let over = self.hover == Some(Ctrl::RuleRow(idx));
         let enabled = self.cfg.rules[idx].enabled;
+        // Regla agrupada: se sangra y se dibuja un conector tipo arbol para
+        // dejar claro que pertenece a una caja de pestanas.
+        let is_grouped = self.cfg.is_grouped(self.cfg.rules[idx].id.as_str());
+        let group_label = if is_grouped {
+            self.cfg
+                .group_of(&self.cfg.rules[idx].id)
+                .and_then(|f| f.group_title.clone())
+                .filter(|s| !s.trim().is_empty())
+        } else {
+            None
+        };
+        let indent = if is_grouped { 14.0 } else { 0.0 };
         let bg = if selected { col(C_ACTIVE) } else if over { col(C_HOVER) } else { col("#00000000") };
         self.fill_rr(r.left, r.top, r.right - r.left, r.bottom - r.top, 8.0, bg);
         if selected {
-            self.draw_rr(r.left, r.top, r.right - r.left, r.bottom - r.top, 8.0, rgba(C_ACCENT, 0.5), 1.0);
+            self.draw_rr(Rect { x: r.left, y: r.top, w: r.right - r.left, h: r.bottom - r.top }, 8.0, rgba(C_ACCENT, 0.5), 1.0);
+        }
+        if is_grouped {
+            // Cadena de eslabones: indica que la regla esta unida a un grupo.
+            let cy = r.top + (r.bottom - r.top) * 0.5;
+            self.chain_icon(r.left + 6.0, cy - 4.3, col(C_MUTED));
         }
         let color = if valid_color(&self.cfg.rules[idx].color) {
             col(&self.cfg.rules[idx].color)
         } else {
             col(C_DIM)
         };
-        self.fill_rr(r.left + 10.0, r.top + (r.bottom - r.top - 10.0) / 2.0, 10.0, 10.0, 5.0, color);
+        self.fill_rr(r.left + 10.0 + indent, r.top + (r.bottom - r.top - 10.0) / 2.0, 10.0, 10.0, 5.0, color);
         self.text(
             &self.cfg.rules[idx].title.clone(),
             Fmt::Body,
             D2D_RECT_F {
-                left: r.left + 28.0,
+                left: r.left + 28.0 + indent,
                 top: r.top + 2.0,
                 right: r.right - 110.0,
                 bottom: r.top + 20.0,
@@ -718,13 +757,25 @@ impl Settings {
             action,
             folders,
         );
+        let sub = match &group_label {
+            Some(g) => format!("{sub} · {g}"),
+            None => sub,
+        };
+        // El subtitulo (que incluye el nombre del grupo) se recorta antes de la
+        // pastilla de orden (regla activa) o de la etiqueta "desactivada", para
+        // que el nombre del grupo sea siempre visible en ambos casos.
+        let sub_right = if enabled {
+            r.right - 72.0
+        } else {
+            r.right - 100.0
+        };
         self.text(
             &sub,
             Fmt::Small,
             D2D_RECT_F {
-                left: r.left + 28.0,
+                left: r.left + 28.0 + indent,
                 top: r.top + 16.0,
-                right: r.right - 10.0,
+                right: sub_right,
                 bottom: r.top + 30.0,
             },
             col(C_DIM),
@@ -757,7 +808,7 @@ impl Settings {
             let over = self.hover == Some(Ctrl::RuleSort(idx));
             let bg = if over { col(C_FIELD) } else { col("#00000000") };
             self.fill_rr(px, r.top + 4.0, pw, r.bottom - r.top - 8.0, 6.0, bg);
-            self.draw_rr(px, r.top + 4.0, pw, r.bottom - r.top - 8.0, 6.0, rgba(C_FIELD_BORDER, if over { 0.9 } else { 0.5 }), 1.0);
+            self.draw_rr(Rect { x: px, y: r.top + 4.0, w: pw, h: r.bottom - r.top - 8.0 }, 6.0, rgba(C_FIELD_BORDER, if over { 0.9 } else { 0.5 }), 1.0);
             self.text(
                 label,
                 Fmt::Small,
@@ -782,7 +833,8 @@ impl Settings {
         self.add_region(Ctrl::RuleRow(idx), *r);
     }
 
-    fn icon_button(&mut self, x: f32, y: f32, w: f32, h: f32, label: &str, id: u16, enabled: bool) {
+    fn icon_button(&mut self, rect: Rect, label: &str, id: u16, enabled: bool) {
+        let Rect { x, y, w, h } = rect;
         let over = self.hover == Some(Ctrl::Btn(id));
         let pressed = self.pressed == Some(Ctrl::Btn(id));
         let bg = if pressed && enabled {
@@ -793,7 +845,7 @@ impl Settings {
             col("#00000000")
         };
         self.fill_rr(x, y, w, h, 7.0, bg);
-        self.draw_rr(x, y, w, h, 7.0, rgba(C_FIELD_BORDER, 0.8), 1.0);
+        self.draw_rr(Rect { x, y, w, h }, 7.0, rgba(C_FIELD_BORDER, 0.8), 1.0);
         self.text(
             label,
             Fmt::Small,
@@ -816,7 +868,8 @@ impl Settings {
         );
     }
 
-    fn push_button(&mut self, x: f32, y: f32, w: f32, h: f32, label: &str, id: u16, kind: BtnKind) {
+    fn push_button(&mut self, rect: Rect, label: &str, id: u16, kind: BtnKind) {
+        let Rect { x, y, w, h } = rect;
         let over = self.hover == Some(Ctrl::Btn(id));
         let pressed = self.pressed == Some(Ctrl::Btn(id));
         let focused = self.focused(Ctrl::Btn(id));
@@ -864,14 +917,14 @@ impl Settings {
         };
         self.fill_rr(x, y, w, h, r, bg);
         if kind != BtnKind::Primary {
-            self.draw_rr(x, y, bw, h, r, border, 1.2);
+            self.draw_rr(Rect { x, y, w: bw, h }, r, border, 1.2);
         }
         // Brillo superior sutil (sensacion de cristal).
         if !pressed {
             self.fill_rr(x + 1.5, y + 1.5, bw - 3.0, (h * 0.35).max(3.0), r - 2.0, rgba("#FFFFFF", if over { 0.15 } else { 0.08 }));
         }
         if focused {
-            self.draw_rr(x - 1.5, y - 1.5, w + 3.0, h + 3.0, r + 1.0, rgba(C_ACCENT, 0.8), 1.5);
+            self.draw_rr(Rect { x: x - 1.5, y: y - 1.5, w: w + 3.0, h: h + 3.0 }, r + 1.0, rgba(C_ACCENT, 0.8), 1.5);
         }
         let ty = if pressed { y + 7.0 } else { y + 5.0 };
         self.text(
@@ -961,11 +1014,11 @@ impl Settings {
         for (i, lang) in Lang::ALL.iter().enumerate() {
             self.lang_chip(x0 + i as f32 * (chip_w + chip_gap), y, chip_w, 26.0, *lang);
         }
-        y += 10.0;
+        y += 36.0;
         y = self.section(y, cx, cw, self.tr.sec_backup);
         let bx0 = cx + 16.0;
-        self.icon_button(bx0, y, 220.0, 32.0, self.tr.btn_export_cfg, ID_BTN_EXPORT_CFG, true);
-        self.icon_button(bx0 + 230.0, y, 220.0, 32.0, self.tr.btn_import_cfg, ID_BTN_IMPORT_CFG, true);
+        self.icon_button(Rect { x: bx0, y, w: 220.0, h: 32.0 }, self.tr.btn_export_cfg, ID_BTN_EXPORT_CFG, true);
+        self.icon_button(Rect { x: bx0 + 230.0, y, w: 220.0, h: 32.0 }, self.tr.btn_import_cfg, ID_BTN_IMPORT_CFG, true);
         let _ = y;
     }
 
@@ -982,10 +1035,7 @@ impl Settings {
         };
         self.fill_rr(x, y, w, h, 7.0, bg);
         self.draw_rr(
-            x,
-            y,
-            w,
-            h,
+            Rect { x, y, w, h },
             7.0,
             if selected { rgba(C_ACCENT, 0.7) } else { rgba(C_FIELD_BORDER, 0.6) },
             1.0,
@@ -1032,10 +1082,19 @@ impl Settings {
         // Botones de gestion a la derecha del titulo.
         let bx = cx + cw - 14.0;
         let by = y - 26.0;
-        self.icon_button(bx - 30.0 - 6.0, by, 30.0, 24.0, "▲", ID_BTN_UP, self.rule_can_move(-1));
-        self.icon_button(bx - 2.0 * (30.0 + 6.0) + 6.0, by, 30.0, 24.0, "▼", ID_BTN_DOWN, self.rule_can_move(1));
-        self.icon_button(bx - 2.0 * (30.0 + 6.0) - 56.0 - 6.0, by, 56.0, 24.0, self.tr.btn_new, ID_BTN_NEW, true);
-        self.icon_button(bx - 2.0 * (30.0 + 6.0) - 56.0 - 6.0 - 56.0 - 6.0, by, 56.0, 24.0, self.tr.btn_delete, ID_BTN_DEL, self.rules_selected.is_some());
+        let mut cur_x = bx;
+        cur_x -= 30.0;
+        self.icon_button(Rect { x: cur_x, y: by, w: 30.0, h: 24.0 }, "▲", ID_BTN_UP, self.rule_can_move(-1));
+        cur_x -= 36.0;
+        self.icon_button(Rect { x: cur_x, y: by, w: 30.0, h: 24.0 }, "▼", ID_BTN_DOWN, self.rule_can_move(1));
+        cur_x -= 62.0;
+        self.icon_button(Rect { x: cur_x, y: by, w: 56.0, h: 24.0 }, self.tr.btn_new, ID_BTN_NEW, true);
+        cur_x -= 62.0;
+        self.icon_button(Rect { x: cur_x, y: by, w: 56.0, h: 24.0 }, self.tr.btn_delete, ID_BTN_DEL, self.rules_selected.is_some());
+        cur_x -= 86.0;
+        self.icon_button(Rect { x: cur_x, y: by, w: 80.0, h: 24.0 }, self.tr.btn_ungroup, ID_BTN_UNGROUP, self.selected_is_grouped());
+        cur_x -= 70.0;
+        self.icon_button(Rect { x: cur_x, y: by, w: 64.0, h: 24.0 }, self.tr.btn_group, ID_BTN_GROUP, self.rule_can_group());
 
         // Zona de lista (se recuerda el rect para el scroll por rueda).
         let list_top = y + 4.0;
@@ -1047,7 +1106,7 @@ impl Settings {
             bottom: list_bottom,
         });
         self.fill_rr(cx + 14.0, list_top, cw - 28.0, list_bottom - list_top, 10.0, col("#10162A"));
-        self.draw_rr(cx + 14.0, list_top, cw - 28.0, list_bottom - list_top, 10.0, rgba(C_FIELD_BORDER, 0.6), 1.0);
+        self.draw_rr(Rect { x: cx + 14.0, y: list_top, w: cw - 28.0, h: list_bottom - list_top }, 10.0, rgba(C_FIELD_BORDER, 0.6), 1.0);
 
         let rows = D2D_RECT_F {
             left: cx + 22.0,
@@ -1114,11 +1173,41 @@ impl Settings {
         self.check_inline(y, cx + col_w, cx + 2.0 * col_w, ID_CHECK_R_MOVE, self.tr.chk_r_move);
         self.check_inline(y, cx + 2.0 * col_w, cx + cw - 16.0, ID_CHECK_R_FOLDERS, self.tr.chk_r_folders);
         y += 28.0;
-        y = self.field_row(y, cx, cw, ID_EDIT_R_TITLE, self.tr.fld_title, &rule.title, false);
-        y = self.field_row(y, cx, cw, ID_EDIT_R_FOLDER, self.tr.fld_folder, &rule.folder, false);
-        y = self.field_row(y, cx, cw, ID_EDIT_R_COLOR, self.tr.fld_color, &rule.color, true);
-        y = self.field_row(y, cx, cw, ID_EDIT_R_EXTS, self.tr.fld_exts, &rule.extensions.join(", "), false);
-        let _ = self.field_row(y, cx, cw, ID_EDIT_R_PATTERNS, self.tr.fld_patterns, &rule.name_patterns.join(", "), false);
+        // Vista de la caja: auto (sigue Apariencia), lista o cuadricula.
+        let idx = self.rules_selected.unwrap_or(0);
+        self.text(
+            self.tr.fld_view,
+            Fmt::Small,
+            D2D_RECT_F {
+                left: cx + 16.0,
+                top: y + 6.0,
+                right: cx + 140.0,
+                bottom: y + 26.0,
+            },
+            col(C_MUTED),
+        );
+        let vg = 8.0;
+        let vw = 80.0;
+        let vx = cx + 148.0;
+        self.view_chip(Rect { x: vx, y, w: vw, h: 26.0 }, idx, "auto", self.tr.view_auto);
+        self.view_chip(Rect { x: vx + vw + vg, y, w: vw, h: 26.0 }, idx, "list", self.tr.view_list);
+        self.view_chip(Rect { x: vx + 2.0 * (vw + vg), y, w: vw, h: 26.0 }, idx, "grid", self.tr.view_grid);
+        y += 32.0;
+        y = self.field_row(y, (cx, cw), ID_EDIT_R_TITLE, self.tr.fld_title, &rule.title, false);
+        // Titulo del grupo: solo se muestra si la regla seleccionada esta
+        // agrupada (el campo nativo se oculta/limpieza solo al no renderizarse).
+        let group_title = self
+            .cfg
+            .group_of(&rule.id)
+            .and_then(|f| f.group_title.clone())
+            .unwrap_or_default();
+        if self.cfg.is_grouped(&rule.id) {
+            y = self.field_row(y, (cx, cw), ID_EDIT_R_GROUP_TITLE, self.tr.fld_group, &group_title, false);
+        }
+        y = self.field_row(y, (cx, cw), ID_EDIT_R_FOLDER, self.tr.fld_folder, &rule.folder, false);
+        y = self.field_row(y, (cx, cw), ID_EDIT_R_COLOR, self.tr.fld_color, &rule.color, true);
+        y = self.field_row(y, (cx, cw), ID_EDIT_R_EXTS, self.tr.fld_exts, &rule.extensions.join(", "), false);
+        let _ = self.field_row(y, (cx, cw), ID_EDIT_R_PATTERNS, self.tr.fld_patterns, &rule.name_patterns.join(", "), false);
     }
 
     fn panel_appearance(&mut self, cy: f32) {
@@ -1140,7 +1229,7 @@ impl Settings {
         ];
         for (i, (id, name, value)) in colors.iter().enumerate() {
             let (dx, row) = (if i % 2 == 0 { 0.0 } else { col_w + 20.0 }, i / 2);
-            self.field_at(cx + 16.0 + dx, y + row as f32 * 32.0, 148.0, (col_w - 36.0 - 148.0 - 40.0).max(60.0), *id, name, value, true);
+            self.field_at((cx + 16.0 + dx, y + row as f32 * 32.0), (148.0, (col_w - 36.0 - 148.0 - 40.0).max(60.0)), *id, name, value, true);
         }
         y += 4.0 * 32.0 + 12.0;
 
@@ -1153,7 +1242,7 @@ impl Settings {
         ];
         for (i, (id, name, value)) in nums.iter().enumerate() {
             let (dx, row) = (if i % 2 == 0 { 0.0 } else { col_w + 20.0 }, i / 2);
-            self.field_at(cx + 16.0 + dx, y + row as f32 * 32.0, 148.0, (col_w - 36.0 - 148.0).max(60.0), *id, name, value, false);
+            self.field_at((cx + 16.0 + dx, y + row as f32 * 32.0), (148.0, (col_w - 36.0 - 148.0).max(60.0)), *id, name, value, false);
         }
         y += 2.0 * 32.0 + 12.0;
 
@@ -1165,6 +1254,7 @@ impl Settings {
         y = self.section(y, cx, cw, self.tr.sec_grid);
         y = self.check(y, cx, cw, ID_CHECK_A_GRID, self.tr.chk_grid);
         y = self.num_row(y, cx, ID_EDIT_A_GRID_SIZE, self.tr.fld_grid_size, &format!("{}", self.cfg.appearance.grid_item_size as u32));
+        y = self.num_row(y, cx, ID_EDIT_A_GRID_ICON, self.tr.fld_grid_icon, &format!("{}", self.cfg.appearance.grid_icon_size as u32));
         y += 10.0;
         // Selector de tema visual: chips debajo de todo.
         y = self.section(y, cx, cw, self.tr.sec_theme);
@@ -1191,7 +1281,7 @@ impl Settings {
         };
         self.fill_rr(x, y, w, h, 7.0, bg);
         self.draw_rr(
-            x, y, w, h, 7.0,
+            Rect { x, y, w, h }, 7.0,
             if selected { rgba(C_ACCENT, 0.7) } else { rgba(C_FIELD_BORDER, 0.6) },
             1.0,
         );
@@ -1207,6 +1297,31 @@ impl Settings {
         );
     }
 
+    /// Chip de vista de la caja (auto / lista / cuadricula) para una regla.
+    fn view_chip(&mut self, rect: Rect, idx: usize, value: &'static str, label: &str) {
+        let Rect { x, y, w, h } = rect;
+        let current = self.cfg.rules.get(idx).map(|r| r.view_mode.as_str()).filter(|s| !s.is_empty()).unwrap_or("auto");
+        let selected = current == value;
+        let over = self.hover == Some(Ctrl::RuleView(idx, value));
+        let bg = if selected { col(C_ACTIVE) } else if over { col(C_HOVER) } else { col("#00000000") };
+        self.fill_rr(x, y, w, h, 7.0, bg);
+        self.draw_rr(
+            Rect { x, y, w, h }, 7.0,
+            if selected { rgba(C_ACCENT, 0.7) } else { rgba(C_FIELD_BORDER, 0.6) },
+            1.0,
+        );
+        self.text(
+            label,
+            Fmt::Small,
+            D2D_RECT_F { left: x + 4.0, top: y + 4.0, right: x + w - 4.0, bottom: y + h - 2.0 },
+            if selected { col(C_TEXT) } else { col(C_MUTED) },
+        );
+        self.add_region(
+            Ctrl::RuleView(idx, value),
+            D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h },
+        );
+    }
+
     fn panel_ai(&mut self, cy: f32) {
         let (cx, _, cw, _) = self.content_area();
         let mut y = cy + 10.0;
@@ -1217,19 +1332,19 @@ impl Settings {
         y += 10.0;
         y = self.section(y, cx, cw, tr.sec_ai_connection);
         let url = self.cfg.ai.ollama_url.clone();
-        y = self.field_row(y, cx, cw, ID_EDIT_AI_URL, tr.fld_ai_url, &url, false);
+        y = self.field_row(y, (cx, cw), ID_EDIT_AI_URL, tr.fld_ai_url, &url, false);
 
         let model = self.cfg.ai.model.clone();
-        y = self.field_row(y, cx, cw, ID_EDIT_AI_MODEL, tr.fld_ai_model, &model, false);
+        y = self.field_row(y, (cx, cw), ID_EDIT_AI_MODEL, tr.fld_ai_model, &model, false);
 
         y += 8.0;
         let bx0 = cx + 16.0;
-        self.icon_button(bx0, y, 200.0, 30.0, tr.btn_ai_ping, ID_BTN_AI_PING, true);
-        self.icon_button(bx0 + 210.0, y, 220.0, 30.0, tr.btn_ai_detect, ID_BTN_AI_DETECT_MODELS, true);
+        self.icon_button(Rect { x: bx0, y, w: 200.0, h: 30.0 }, tr.btn_ai_ping, ID_BTN_AI_PING, true);
+        self.icon_button(Rect { x: bx0 + 210.0, y, w: 220.0, h: 30.0 }, tr.btn_ai_detect, ID_BTN_AI_DETECT_MODELS, true);
 
         y += 42.0;
         y = self.section(y, cx, cw, tr.sec_ai_organize);
-        self.icon_button(bx0, y, 430.0, 34.0, tr.btn_ai_reorganize, ID_BTN_AI_REORGANIZE, true);
+        self.icon_button(Rect { x: bx0, y, w: 430.0, h: 34.0 }, tr.btn_ai_reorganize, ID_BTN_AI_REORGANIZE, true);
     }
 
     fn panel_updates(&mut self, cy: f32) {
@@ -1238,15 +1353,26 @@ impl Settings {
         y = self.section(y, cx, cw, self.tr.sec_updates);
 
         let ver = crate::updater::current_version();
-        let ver_label = format!("v{}", ver);
-        y = self.field_row(y, cx, cw, 0, self.tr.lbl_version, &ver_label, true);
+        let ver_label = format!("{}: v{}", self.tr.lbl_version, ver);
+        self.text(
+            &ver_label,
+            Fmt::Body,
+            D2D_RECT_F {
+                left: cx + 16.0,
+                top: y + 4.0,
+                right: cx + cw - 16.0,
+                bottom: y + 28.0,
+            },
+            col(C_TEXT),
+        );
+        y += 34.0;
 
         y = self.check(y, cx, cw, ID_CHECK_AUTO_UPDATE, self.tr.chk_auto_check_updates);
 
         let bx0 = cx + 16.0;
         y += 8.0;
-        self.icon_button(bx0, y, 220.0, 32.0, self.tr.btn_check_updates, ID_BTN_CHECK_UPDATES, true);
-        self.icon_button(bx0 + 230.0, y, 220.0, 32.0, self.tr.btn_download_update, ID_BTN_DOWNLOAD_UPDATE, true);
+        self.icon_button(Rect { x: bx0, y, w: 220.0, h: 32.0 }, self.tr.btn_check_updates, ID_BTN_CHECK_UPDATES, true);
+        self.icon_button(Rect { x: bx0 + 230.0, y, w: 220.0, h: 32.0 }, self.tr.btn_download_update, ID_BTN_DOWNLOAD_UPDATE, true);
     }
 }
 
@@ -1278,7 +1404,7 @@ impl Settings {
             D2D_RECT_F { left: tx, top: 28.0, right: w - 60.0, bottom: 44.0 },
             col(C_MUTED),
         );
-        self.draw_rr(0.0, HEADER_H - 1.0, w, 1.0, 0.0, rgba(C_CARD_BORDER, 0.8), 1.0);
+        self.draw_rr(Rect { x: 0.0, y: HEADER_H - 1.0, w, h: 1.0 }, 0.0, rgba(C_CARD_BORDER, 0.8), 1.0);
 
         // Botones de ventana: minimizar (—) y cerrar (×).
         let (b, s2) = (w - 44.0, 26.0);
@@ -1309,7 +1435,7 @@ impl Settings {
         let y0 = HEADER_H;
         let h = self.size.1 - HEADER_H - BAR_H;
         self.fill_rr(0.0, y0, SIDEBAR_W, h, 0.0, col(C_SIDEBAR));
-        self.draw_rr(SIDEBAR_W - 1.0, y0, 1.0, h, 0.0, rgba(C_CARD_BORDER, 0.6), 1.0);
+        self.draw_rr(Rect { x: SIDEBAR_W - 1.0, y: y0, w: 1.0, h }, 0.0, rgba(C_CARD_BORDER, 0.6), 1.0);
         let items: [(Panel, &'static str); 5] = [
             (Panel::General, self.tr.nav_general),
             (Panel::Rules, self.tr.nav_rules),
@@ -1338,7 +1464,7 @@ impl Settings {
         }
         // Pie de la barra lateral: version.
         self.text(
-            "v1.0.1",
+            "v1.0.2",
             Fmt::Small,
             D2D_RECT_F {
                 left: 12.0,
@@ -1354,14 +1480,14 @@ impl Settings {
         let w = self.size.0;
         let y0 = self.size.1 - BAR_H;
         self.fill_rr(0.0, y0, w, BAR_H, 0.0, col("#0B101D"));
-        self.draw_rr(0.0, y0, w, 1.0, 0.0, rgba(C_CARD_BORDER, 0.8), 1.0);
+        self.draw_rr(Rect { x: 0.0, y: y0, w, h: 1.0 }, 0.0, rgba(C_CARD_BORDER, 0.8), 1.0);
         let (bw, bh) = (112.0, 36.0);
         let bx = w - 24.0 - bw;
         let by = y0 + (BAR_H - bh) / 2.0;
         // Aplicar guarda y aplica en caliente sin cerrar el dialogo.
-        self.push_button(bx - 16.0 - bw - 16.0 - bw, by, bw, bh, self.tr.btn_cancel, ID_BTN_CANCEL, BtnKind::Ghost);
-        self.push_button(bx - 16.0 - bw, by, bw, bh, self.tr.btn_apply, ID_BTN_APPLY, BtnKind::Outline);
-        self.push_button(bx, by, bw, bh, self.tr.btn_save, ID_BTN_OK, BtnKind::Primary);
+        self.push_button(Rect { x: bx - 16.0 - bw - 16.0 - bw, y: by, w: bw, h: bh }, self.tr.btn_cancel, ID_BTN_CANCEL, BtnKind::Ghost);
+        self.push_button(Rect { x: bx - 16.0 - bw, y: by, w: bw, h: bh }, self.tr.btn_apply, ID_BTN_APPLY, BtnKind::Outline);
+        self.push_button(Rect { x: bx, y: by, w: bw, h: bh }, self.tr.btn_save, ID_BTN_OK, BtnKind::Primary);
     }
 
     // --- Selector de color visual (HSB) ---
@@ -1385,7 +1511,7 @@ impl Settings {
         let (pw, ph) = (264.0, 290.0);
 
         self.fill_rr(x0, y0, pw, ph, 14.0, col("#10162A"));
-        self.draw_rr(x0, y0, pw, ph, 14.0, col(C_FIELD_BORDER), 1.0);
+        self.draw_rr(Rect { x: x0, y: y0, w: pw, h: ph }, 14.0, col(C_FIELD_BORDER), 1.0);
         self.text(
             self.tr.picker_title,
             Fmt::Small,
@@ -1413,7 +1539,7 @@ impl Settings {
                 bottom: y0 + 9.0 + bs,
             },
         );
-        self.draw_rr(x0 + 10.0, y0 + 42.0, pw - 20.0, 1.0, 0.0, rgba(C_FIELD_BORDER, 0.8), 1.0);
+        self.draw_rr(Rect { x: x0 + 10.0, y: y0 + 42.0, w: pw - 20.0, h: 1.0 }, 0.0, rgba(C_FIELD_BORDER, 0.8), 1.0);
 
         // Cuadro Saturacion/Valor: rejilla de celdas calculada al vuelo.
         let (sx, sy, sw, sh) = (x0 + 14.0, y0 + 52.0, 200.0, 170.0);
@@ -1433,10 +1559,10 @@ impl Settings {
                 );
             }
         }
-        self.draw_rr(sx, sy, sw, sh, 4.0, rgba(C_FIELD_BORDER, 0.9), 1.0);
+        self.draw_rr(Rect { x: sx, y: sy, w: sw, h: sh }, 4.0, rgba(C_FIELD_BORDER, 0.9), 1.0);
         let ix = sx + p.sat * sw;
         let iy = sy + (1.0 - p.val) * sh;
-        self.draw_rr(ix - 4.5, iy - 4.5, 9.0, 9.0, 4.5, D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.95 }, 1.5);
+        self.draw_rr(Rect { x: ix - 4.5, y: iy - 4.5, w: 9.0, h: 9.0 }, 4.5, D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.95 }, 1.5);
         self.add_region(
             Ctrl::Picker(PickerPart::Sv),
             D2D_RECT_F {
@@ -1455,9 +1581,9 @@ impl Settings {
             let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
             self.fill_rr(hx, hy + j as f32 * 2.5, hw, 2.5, 0.0, D2D1_COLOR_F { r, g, b, a: 1.0 });
         }
-        self.draw_rr(hx, hy, hw, hh, 4.0, rgba(C_FIELD_BORDER, 0.9), 1.0);
+        self.draw_rr(Rect { x: hx, y: hy, w: hw, h: hh }, 4.0, rgba(C_FIELD_BORDER, 0.9), 1.0);
         let hyy = hy + (p.hue / 360.0) * hh;
-        self.draw_rr(hx - 2.0, hyy - 4.0, hw + 4.0, 8.0, 4.0, D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.95 }, 1.5);
+        self.draw_rr(Rect { x: hx - 2.0, y: hyy - 4.0, w: hw + 4.0, h: 8.0 }, 4.0, D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.95 }, 1.5);
         self.add_region(
             Ctrl::Picker(PickerPart::Hue),
             D2D_RECT_F {
@@ -1471,7 +1597,7 @@ impl Settings {
         // Muestra + hex + boton Usar.
         let hex = hsv_to_hex(p.hue, p.sat, p.val);
         self.fill_rr(x0 + 16.0, y0 + 236.0, 26.0, 26.0, 6.0, col(&hex));
-        self.draw_rr(x0 + 16.0, y0 + 236.0, 26.0, 26.0, 6.0, rgba(C_FIELD_BORDER, 0.9), 1.0);
+        self.draw_rr(Rect { x: x0 + 16.0, y: y0 + 236.0, w: 26.0, h: 26.0 }, 6.0, rgba(C_FIELD_BORDER, 0.9), 1.0);
         self.text(
             &hex,
             Fmt::Body,
@@ -1723,6 +1849,23 @@ impl Settings {
         }
     }
 
+    /// true si la regla seleccionada puede agruparse con la que esta por
+    /// encima en la lista (necesita una regla anterior).
+    fn rule_can_group(&self) -> bool {
+        match self.rules_selected {
+            Some(i) => i > 0,
+            None => false,
+        }
+    }
+
+    /// true si la regla seleccionada forma parte de un grupo de pestanas.
+    fn selected_is_grouped(&self) -> bool {
+        match self.rules_selected {
+            Some(i) => self.cfg.is_grouped(self.cfg.rules[i].id.as_str()),
+            None => false,
+        }
+    }
+
     fn edit_text(&self, id: u16) -> Option<String> {
         let hwnd = self.edits.get(&id).copied()?;
         Some(get_text(hwnd))
@@ -1760,6 +1903,8 @@ impl Settings {
                 order.extend([
                     Ctrl::Btn(ID_BTN_NEW),
                     Ctrl::Btn(ID_BTN_DEL),
+                    Ctrl::Btn(ID_BTN_GROUP),
+                    Ctrl::Btn(ID_BTN_UNGROUP),
                     Ctrl::Btn(ID_BTN_UP),
                     Ctrl::Btn(ID_BTN_DOWN),
                     Ctrl::RuleRow(0),
@@ -1767,6 +1912,7 @@ impl Settings {
                     Ctrl::Check(ID_CHECK_R_MOVE),
                     Ctrl::Check(ID_CHECK_R_FOLDERS),
                     Ctrl::Field(ID_EDIT_R_TITLE),
+                    Ctrl::Field(ID_EDIT_R_GROUP_TITLE),
                     Ctrl::Field(ID_EDIT_R_FOLDER),
                     Ctrl::Field(ID_EDIT_R_COLOR),
                     Ctrl::Field(ID_EDIT_R_EXTS),
@@ -1851,6 +1997,8 @@ impl Settings {
             Ctrl::RuleRow(0) => !self.cfg.rules.is_empty(),
             Ctrl::RuleSort(0) => !self.cfg.rules.is_empty(),
             Ctrl::Btn(ID_BTN_DEL) => self.rules_selected.is_some(),
+            Ctrl::Btn(ID_BTN_GROUP) => self.rule_can_group(),
+            Ctrl::Btn(ID_BTN_UNGROUP) => self.selected_is_grouped(),
             Ctrl::Btn(ID_BTN_UP) | Ctrl::Btn(ID_BTN_DOWN) => self.rule_can_move(if c == Ctrl::Btn(ID_BTN_UP) { -1 } else { 1 }),
             _ => true,
         }
@@ -1887,6 +2035,8 @@ impl Settings {
             Ctrl::Folder(id) => self.pick_folder(id),
             Ctrl::Btn(ID_BTN_NEW) => self.new_rule(),
             Ctrl::Btn(ID_BTN_DEL) => self.delete_rule(),
+            Ctrl::Btn(ID_BTN_GROUP) => self.group_rule(),
+            Ctrl::Btn(ID_BTN_UNGROUP) => self.ungroup_rule(),
             Ctrl::Btn(ID_BTN_UP) => self.move_rule(-1),
             Ctrl::Btn(ID_BTN_DOWN) => self.move_rule(1),
             Ctrl::RuleSort(idx) => {
@@ -1900,6 +2050,12 @@ impl Settings {
                     }
                     self.invalidate();
                 }
+            Ctrl::RuleView(idx, value) => {
+                if let Some(rule) = self.cfg.rules.get_mut(idx) {
+                    rule.view_mode = value.to_string();
+                }
+                self.invalidate();
+            }
             Ctrl::RuleRow(idx) => {
                 self.sync_rule_fields();
                 self.rules_selected = Some(idx);
@@ -2093,6 +2249,7 @@ impl Settings {
                 move_files: true,
                 include_folders: true,
                 color: if sug.color.starts_with('#') { sug.color.clone() } else { "#38BDF8".into() },
+                view_mode: "auto".into(),
             });
         }
 
@@ -2283,13 +2440,16 @@ impl Settings {
 
     fn new_rule(&mut self) {
         self.sync_rule_fields();
-        let mut rule = Rule::default();
-        rule.id = format!("regla-{}", self.cfg.rules.len() + 1);
-        rule.title = self.tr.new_rule_title.into();
-        rule.enabled = true;
-        rule.move_files = true;
-        rule.folder = "Nueva".into();
-        rule.color = "#38BDF8".into();
+        let rule = Rule {
+            id: format!("regla-{}", self.cfg.rules.len() + 1),
+            title: self.tr.new_rule_title.into(),
+            enabled: true,
+            move_files: true,
+            folder: "Nueva".into(),
+            color: "#38BDF8".into(),
+            view_mode: "auto".into(),
+            ..Default::default()
+        };
         self.cfg.rules.push(rule);
         self.rules_selected = Some(self.cfg.rules.len() - 1);
         self.rules_scroll = usize::MAX;
@@ -2297,9 +2457,152 @@ impl Settings {
         self.invalidate();
     }
 
+
+    /// Saca `rule_id` de cualquier grupo al que pertenezca. Si el grupo se
+    /// queda con una sola pestana, vuelve a ser una caja independiente para esa
+    /// pestana; si se queda vacio, se elimina. El `id` de cada grupo se
+    /// mantiene siempre alineado con su primera pestana.
+    fn remove_rule_from_groups(&mut self, rule_id: &str) {
+        let mut touched: Vec<usize> = Vec::new();
+        for (i, f) in self.cfg.fences.iter_mut().enumerate() {
+            if f.tabs.iter().any(|t| t == rule_id) {
+                f.tabs.retain(|t| t != rule_id);
+                touched.push(i);
+            }
+        }
+        // De mayor a menor para poder eliminar sin descolocar los indices.
+        touched.sort_unstable_by(|a, b| b.cmp(a));
+        for i in touched {
+            let len = self.cfg.fences[i].tabs.len();
+            if len >= 2 {
+                let first = self.cfg.fences[i].tabs[0].clone();
+                self.cfg.fences[i].id = crate::config::String32::new(&first);
+            } else if len == 1 {
+                let only = self.cfg.fences[i].tabs[0].clone();
+                self.cfg.fences[i].id = crate::config::String32::new(&only);
+                self.cfg.fences[i].tabs.clear();
+                self.cfg.fences[i].group_title = None;
+            } else {
+                self.cfg.fences.remove(i);
+            }
+        }
+    }
+
+    /// Agrupa la regla seleccionada con la inmediatamente superior, creando (o
+    /// ampliando) una caja de pestanas. Si la regla ya estaba agrupada, sale de
+    /// su grupo anterior antes de unirse al nuevo.
+    fn group_rule(&mut self) {
+        self.sync_rule_fields();
+        let Some(idx) = self.rules_selected else { return };
+        if idx == 0 {
+            return;
+        }
+        let current_id = self.cfg.rules[idx].id.clone();
+        let prev_id = self.cfg.rules[idx - 1].id.clone();
+        if current_id == prev_id {
+            return;
+        }
+        // Si ya estan agrupadas juntas, no hay nada que hacer (evita reordenar).
+        if self
+            .cfg
+            .group_of(&current_id)
+            .is_some_and(|g| g.tabs.iter().any(|t| t == &prev_id))
+        {
+            return;
+        }
+
+        // 1) Saca `current_id` de cualquier grupo previo.
+        self.remove_rule_from_groups(&current_id);
+
+        // 2) Busca la caja de `prev_id`.
+        let prev_group = self
+            .cfg
+            .fences
+            .iter()
+            .position(|f| f.tabs.iter().any(|t| t == &prev_id));
+        let prev_standalone = if prev_group.is_none() {
+            self.cfg
+                .fences
+                .iter()
+                .position(|f| f.id.as_str() == prev_id.as_str() && f.tabs.is_empty())
+        } else {
+            None
+        };
+
+        if let Some(gi) = prev_group {
+            // prev ya es un grupo: anade current como pestana.
+            if !self.cfg.fences[gi].tabs.contains(&current_id) {
+                self.cfg.fences[gi].tabs.push(current_id.clone());
+            }
+        } else if let Some(si) = prev_standalone {
+            // prev es una caja independiente: conviertela en grupo [prev, current].
+            self.cfg.fences[si].tabs = vec![prev_id.clone(), current_id.clone()];
+            self.cfg.fences[si].group_title = None;
+        } else {
+            // prev no tiene caja persistida: crea un grupo nuevo.
+            let fl = crate::config::FenceLayout {
+                id: crate::config::String32::new(&prev_id),
+                tabs: vec![prev_id.clone(), current_id.clone()],
+                ..Default::default()
+            };
+            self.cfg.fences.push(fl);
+        }
+
+        // 3) Elimina la caja independiente de `current` (si existia).
+        self.cfg
+            .fences
+            .retain(|f| !(f.id.as_str() == current_id.as_str() && f.tabs.is_empty()));
+
+        self.refresh_rule_fields();
+        self.invalidate();
+    }
+
+    /// Desagrupa la regla seleccionada: sale del grupo y se convierte en una
+    /// caja independiente (posicionada junto al grupo original).
+    fn ungroup_rule(&mut self) {
+        self.sync_rule_fields();
+        let Some(idx) = self.rules_selected else { return };
+        let current_id = self.cfg.rules[idx].id.clone();
+
+        // Geometria del grupo para colocar la nueva caja junto a el.
+        let (gx, gy, gw, gh) = match self
+            .cfg
+            .fences
+            .iter()
+            .find(|f| f.tabs.iter().any(|t| t == &current_id))
+        {
+            Some(f) => (f.x, f.y, f.width, f.height),
+            None => return, // no esta agrupada
+        };
+
+        // Saca la regla del grupo; si queda una sola pestana, el grupo se
+        // disuelve en una caja independiente para esa pestana.
+        self.remove_rule_from_groups(&current_id);
+
+        // Crea la caja independiente de `current` junto al grupo.
+        let fl = crate::config::FenceLayout {
+            id: crate::config::String32::new(&current_id),
+            x: gx + gw + 20,
+            y: gy,
+            width: gw.max(320),
+            height: gh.max(260),
+            ..Default::default()
+        };
+        self.cfg.fences.push(fl);
+
+        self.refresh_rule_fields();
+        self.invalidate();
+    }
+
     fn delete_rule(&mut self) {
         let Some(index) = self.rules_selected else { return };
+        let removed_id = self.cfg.rules[index].id.clone();
         self.cfg.rules.remove(index);
+        // Limpia grupos y cajas que referencien la regla eliminada.
+        self.remove_rule_from_groups(&removed_id);
+        self.cfg
+            .fences
+            .retain(|f| !(f.id.as_str() == removed_id.as_str() && f.tabs.is_empty()));
         self.rules_selected = if self.cfg.rules.is_empty() {
             None
         } else {
@@ -2348,6 +2651,12 @@ impl Settings {
         rule.extensions = split_csv(&get_text(self.edits.get(&ID_EDIT_R_EXTS).copied().unwrap_or_default()));
         rule.name_patterns = split_csv(&get_text(self.edits.get(&ID_EDIT_R_PATTERNS).copied().unwrap_or_default()));
         self.cfg.rules[index] = rule;
+        // Persiste el titulo del grupo (solo si la regla esta agrupada).
+        let gt = get_text(self.edits.get(&ID_EDIT_R_GROUP_TITLE).copied().unwrap_or_default());
+        let rule_id = self.cfg.rules[index].id.clone();
+        if let Some(group) = self.cfg.fences.iter_mut().find(|f| f.tabs.iter().any(|t| t == &rule_id)) {
+            group.group_title = if gt.trim().is_empty() { None } else { Some(gt.trim().to_string()) };
+        }
     }
 
     fn refresh_rule_fields(&mut self) {
@@ -2366,6 +2675,15 @@ impl Settings {
             if let Some(edit) = self.edits.get(&id).copied() {
                 set_text(edit, value);
             }
+        }
+        // Titulo del grupo: se rellena solo si la regla seleccionada esta agrupada.
+        let gt = rule
+            .as_ref()
+            .and_then(|x| self.cfg.group_of(&x.id))
+            .and_then(|f| f.group_title.clone())
+            .unwrap_or_default();
+        if let Some(edit) = self.edits.get(&ID_EDIT_R_GROUP_TITLE).copied() {
+            set_text(edit, &gt);
         }
     }
 
@@ -2493,6 +2811,9 @@ impl Settings {
         cfg.appearance.grid_mode = self.checked(ID_CHECK_A_GRID);
         if let Some(v) = self.edit_text(ID_EDIT_A_GRID_SIZE).and_then(|s| s.parse::<f32>().ok()) {
             cfg.appearance.grid_item_size = v.clamp(48.0, 128.0);
+        }
+        if let Some(v) = self.edit_text(ID_EDIT_A_GRID_ICON).and_then(|s| s.parse::<f32>().ok()) {
+            cfg.appearance.grid_icon_size = v.clamp(16.0, 96.0);
         }
 
         // Idioma elegido en el selector.
@@ -2694,7 +3015,7 @@ extern "system" fn dlg_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                         .min(work_h / 780.0)
                         .min(work_w / 880.0);
                     state.scale = scale.max(0.5);
-                    let _ = state.target().SetDpi(dpi as f32, dpi as f32);
+                    state.target().SetDpi(dpi as f32, dpi as f32);
                     // La ventana se redimensiona con la nueva escala para que
                     // el contenido no quede cortado ni se solape al cambiar
                     // de monitor (SWP_NOZORDER: se ignora el insert-after).
@@ -3024,14 +3345,14 @@ fn browse_folder(owner: HWND, initial: &str, title: &str) -> Option<String> {
         };
         let pidl = SHBrowseForFolderW(&bi);
         if !start_pidl.is_null() {
-            let _ = CoTaskMemFree(Some(start_pidl as *const c_void));
+            CoTaskMemFree(Some(start_pidl as *const c_void));
         }
         if pidl.is_null() {
             return None;
         }
         let mut out = [0u16; 260];
         let ok = SHGetPathFromIDListW(pidl, &mut out);
-        let _ = CoTaskMemFree(Some(pidl as *const c_void));
+        CoTaskMemFree(Some(pidl as *const c_void));
         if ok.as_bool() {
             let s = String::from_utf16_lossy(&out);
             let s = s.trim_end_matches('\0').to_string();
@@ -3445,12 +3766,14 @@ pub fn open_dialog(current: &Config, app: *mut App) -> Option<Config> {
         if settings.result {
             for (rule_idx, sort_opt) in settings.rules_sort.iter() {
                 if let Some(rule) = settings.cfg.rules.get(*rule_idx) {
-                    match settings.cfg.fences.iter_mut().find(|f| f.id.as_str() == rule.id) {
+                    match settings.cfg.fences.iter_mut().find(|f| f.id.as_str() == rule.id || f.tabs.iter().any(|t| t == &rule.id)) {
                         Some(slot) => slot.sort_by = sort_opt.clone(),
                         None => {
-                            let mut fl = crate::config::FenceLayout::default();
-                            fl.id = crate::config::String32::new(&rule.id);
-                            fl.sort_by = sort_opt.clone();
+                            let fl = crate::config::FenceLayout {
+                                id: crate::config::String32::new(&rule.id),
+                                sort_by: sort_opt.clone(),
+                                ..Default::default()
+                            };
                             settings.cfg.fences.push(fl);
                         }
                     }
@@ -3482,6 +3805,8 @@ fn seed_edits(s: &Settings) {
         (ID_EDIT_A_TITLE_SIZE, format!("{}", s.cfg.appearance.title_size)),
         (ID_EDIT_A_TEXT_SIZE, format!("{}", s.cfg.appearance.text_size)),
         (ID_EDIT_A_SNAP, format!("{}", s.cfg.appearance.snap_grid)),
+        (ID_EDIT_A_GRID_SIZE, format!("{}", s.cfg.appearance.grid_item_size as u32)),
+        (ID_EDIT_A_GRID_ICON, format!("{}", s.cfg.appearance.grid_icon_size as u32)),
         (ID_EDIT_AI_URL, s.cfg.ai.ollama_url.clone()),
         (ID_EDIT_AI_MODEL, s.cfg.ai.model.clone()),
     ];

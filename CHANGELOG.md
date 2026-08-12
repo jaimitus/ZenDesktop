@@ -7,6 +7,23 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.2] - 2026-08-12
+
+### Added
+- **Tab grouping controls**: link/unlink rules into tabs from Settings, and name each group with a title shown in the fence header.
+- **Per-rule view mode**: choose List or Grid per rule, with a configurable icon size for grid cells.
+- **Sharp icons at high DPI**: large and grid icons now come from the system image list (EXTRALARGE/JUMBO), staying crisp at 150%+ scaling.
+
+### Changed
+- **Bounded icon cache**: the icon cache is now a real LRU with per-size memory caps for paths and extensions.
+
+### Fixed
+- **Default folders**: ZenDesktop and ZenArchive now default to the Documents folder instead of the desktop.
+- **Settings layout**: languages no longer overlap export/import; the Updates tab was tidied.
+- **Toasts**: added padding so text is no longer clipped.
+
+---
+
 ## [1.0.1] - 2026-08-12
 
 ### Added
@@ -67,5 +84,6 @@ desktop organizer built from scratch in Rust.
 
 ---
 
+[1.0.2]: https://github.com/jaimitus/ZenDesktop/releases/tag/v1.0.2
 [1.0.1]: https://github.com/jaimitus/ZenDesktop/releases/tag/v1.0.1
 [1.0.0]: https://github.com/jaimitus/ZenDesktop/releases/tag/v1.0.0

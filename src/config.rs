@@ -22,7 +22,8 @@ use windows::Win32::System::Registry::{
     KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
 };
 use windows::Win32::UI::Shell::{
-    SHGetKnownFolderPath, FOLDERID_Desktop, FOLDERID_PublicDesktop, KF_FLAG_DEFAULT,
+    SHGetKnownFolderPath, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_PublicDesktop,
+    KF_FLAG_DEFAULT,
 };
 
 pub const CONFIG_FILE: &str = "config.toml";
@@ -132,9 +133,11 @@ impl Default for AiConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct General {
-    /// Carpeta raiz (relativa al Escritorio) donde viven las cajas fisicas.
+    /// Carpeta raiz donde viven las cajas fisicas. Por defecto es la ruta
+    /// absoluta de Mis Documentos\ZenDesktop; admite rutas absolutas o
+    /// relativas a Mis Documentos.
     pub root_folder: String,
-    /// Carpeta de archivos caducados (relativa al Escritorio).
+    /// Carpeta de archivos caducados. Por defecto Mis Documentos\ZenArchive.
     pub archive_folder: String,
     /// Vigilar tambien el escritorio publico (C:\Users\Public\Desktop).
     pub watch_public_desktop: bool,
@@ -206,6 +209,8 @@ pub struct Appearance {
     pub grid_mode: bool,
     /// Tamano de cada celda en el modo cuadricula (px, 48..128).
     pub grid_item_size: f32,
+    /// Tamano del icono dentro de cada celda (px, 16..96).
+    pub grid_icon_size: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,13 +242,17 @@ pub struct Rule {
     pub extensions: Vec<String>,
     /// Patrones de nombre adicionales (soporta * y ?), p. ej. "factura*".
     pub name_patterns: Vec<String>,
-    /// true  -> los archivos se MUEVEN a <Escritorio>\<root_folder>\<folder>
+    /// true  -> los archivos se MUEVEN a <Documentos>\<root_folder>\<folder>
     /// false -> caja virtual: los archivos siguen en el escritorio, solo se listan.
     pub move_files: bool,
     pub folder: String,
     pub color: String,
     /// Incluir carpetas ademas de archivos en la caja virtual.
     pub include_folders: bool,
+    /// Vista de la caja: "auto" (sigue el ajuste global de Apariencia),
+    /// "list" (lista) o "grid" (cuadricula de iconos).
+    #[serde(default = "default_view_mode")]
+    pub view_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -338,8 +347,8 @@ impl Default for FenceLayout {
 impl Default for General {
     fn default() -> Self {
         General {
-            root_folder: "ZenDesktop".into(),
-            archive_folder: "ZenArchive".into(),
+            root_folder: default_boxes_path("ZenDesktop"),
+            archive_folder: default_boxes_path("ZenArchive"),
             watch_public_desktop: true,
             debounce_ms: 400,
             organize_on_start: true,
@@ -391,6 +400,7 @@ impl Default for Appearance {
             show_search: true,
             grid_mode: false,
             grid_item_size: 72.0,
+            grid_icon_size: 48.0,
         }
     }
 }
@@ -427,6 +437,10 @@ fn default_language() -> String {
     "en".into()
 }
 
+fn default_view_mode() -> String {
+    "auto".into()
+}
+
 /// Reglas por defecto: Media, Documentos, Instaladores y Varios (cajon de sastre
 /// virtual, no mueve nada). Ampliables sin recompilar desde config.toml.
 /// Valor por defecto para opciones booleanas nuevas que deben nacer activadas.
@@ -453,6 +467,7 @@ pub fn default_rules() -> Vec<Rule> {
             folder: "Media".into(),
             color: "#38BDF8".into(),
             include_folders: false,
+            view_mode: "auto".into(),
         },
         Rule {
             id: "docs".into(),
@@ -470,6 +485,7 @@ pub fn default_rules() -> Vec<Rule> {
             folder: "Documentos".into(),
             color: "#A78BFA".into(),
             include_folders: false,
+            view_mode: "auto".into(),
         },
         Rule {
             id: "setup".into(),
@@ -487,6 +503,7 @@ pub fn default_rules() -> Vec<Rule> {
             folder: "Instaladores".into(),
             color: "#F472B6".into(),
             include_folders: false,
+            view_mode: "auto".into(),
         },
         Rule {
             id: "misc".into(),
@@ -500,6 +517,7 @@ pub fn default_rules() -> Vec<Rule> {
             folder: "Varios".into(),
             color: "#34D399".into(),
             include_folders: true,
+            view_mode: "auto".into(),
         },
     ]
 }
@@ -581,10 +599,10 @@ impl Config {
         g.debounce_ms = g.debounce_ms.clamp(50, 10_000);
         g.sweep_interval_minutes = g.sweep_interval_minutes.clamp(1, 24 * 60);
         if g.root_folder.trim().is_empty() {
-            g.root_folder = "ZenDesktop".into();
+            g.root_folder = default_boxes_path("ZenDesktop");
         }
         if g.archive_folder.trim().is_empty() {
-            g.archive_folder = "ZenArchive".into();
+            g.archive_folder = default_boxes_path("ZenArchive");
         }
 
         let a = &mut self.appearance;
@@ -597,6 +615,7 @@ impl Config {
         a.row_height = a.row_height.clamp(14.0, 64.0);
         a.snap_grid = a.snap_grid.min(128);
         a.grid_item_size = a.grid_item_size.clamp(48.0, 128.0);
+        a.grid_icon_size = a.grid_icon_size.clamp(16.0, 96.0);
         if a.font_family.trim().is_empty() {
             a.font_family = "Segoe UI".into();
         }
@@ -623,6 +642,9 @@ impl Config {
             for ext in &mut r.extensions {
                 *ext = ext.trim_start_matches('.').to_ascii_lowercase();
             }
+            if !matches!(r.view_mode.as_str(), "auto" | "list" | "grid") {
+                r.view_mode = "auto".into();
+            }
         }
         // Descarta geometrias huerfanas de reglas eliminadas.
         let ids: Vec<String> = self.rules.iter().map(|r| r.id.clone()).collect();
@@ -643,6 +665,19 @@ impl Config {
         }
     }
 
+    /// Devuelve la caja agrupada (si la hay) que contiene `rule_id` como
+    /// pestana. `None` si la regla no esta agrupada (es independiente).
+    pub fn group_of(&self, rule_id: &str) -> Option<&FenceLayout> {
+        self.fences
+            .iter()
+            .find(|f| f.tabs.iter().any(|t| t == rule_id))
+    }
+
+    /// true si la regla `rule_id` forma parte de un grupo de pestanas.
+    pub fn is_grouped(&self, rule_id: &str) -> bool {
+        self.group_of(rule_id).is_some()
+    }
+
     /// Duracion maxima de vida de un archivo en el escritorio.
     /// Idioma de la interfaz, normalizado a un valor conocido.
     pub fn lang(&self) -> crate::i18n::Lang {
@@ -654,12 +689,16 @@ impl Config {
         std::time::Duration::from_secs_f64(secs)
     }
 
-    pub fn root_dir(&self, desktop: &Path) -> PathBuf {
-        desktop.join(&self.general.root_folder)
+    /// Carpeta raiz de las cajas fisicas (por defecto en "Mis Documentos").
+    /// Si `root_folder` es una ruta absoluta, se usa tal cual.
+    pub fn root_dir(&self) -> PathBuf {
+        resolve_folder(&self.general.root_folder)
     }
 
-    pub fn archive_dir(&self, desktop: &Path) -> PathBuf {
-        desktop.join(&self.general.archive_folder)
+    /// Carpeta de archivo historico (por defecto en "Mis Documentos").
+    /// Si `archive_folder` es una ruta absoluta, se usa tal cual.
+    pub fn archive_dir(&self) -> PathBuf {
+        resolve_folder(&self.general.archive_folder)
     }
 }
 
@@ -824,8 +863,37 @@ pub fn desktop_dir() -> Result<PathBuf, ConfigError> {
     known_folder(&FOLDERID_Desktop)
 }
 
+pub fn documents_dir() -> Result<PathBuf, ConfigError> {
+    known_folder(&FOLDERID_Documents)
+}
+
 pub fn public_desktop_dir() -> Option<PathBuf> {
     known_folder(&FOLDERID_PublicDesktop).ok()
+}
+
+/// Base de las carpetas internas (ZenDesktop / ZenArchive). Por defecto en
+/// "Mis Documentos", con retroceso al Escritorio si falla la resolucion.
+fn boxes_base() -> PathBuf {
+    documents_dir()
+        .or_else(|_| desktop_dir())
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Ruta por defecto (absoluta) de una carpeta interna dentro de Mis Documentos.
+fn default_boxes_path(name: &str) -> String {
+    boxes_base().join(name).to_string_lossy().into_owned()
+}
+
+/// Resuelve la carpeta interna: una ruta absoluta se usa tal cual (permite a
+/// los tests aislarse en un directorio temporal); una relativa se cuelga de
+/// la base (Mis Documentos).
+fn resolve_folder(folder: &str) -> PathBuf {
+    let p = Path::new(folder);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        boxes_base().join(p)
+    }
 }
 
 fn known_folder(id: &GUID) -> Result<PathBuf, ConfigError> {

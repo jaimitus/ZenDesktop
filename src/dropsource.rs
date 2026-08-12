@@ -38,8 +38,8 @@ unsafe extern "system" fn drop_source_qi(
     riid: *const GUID,
     ppv: *mut *mut std::ffi::c_void,
 ) -> windows::core::HRESULT {
-    const IID_UNK: GUID = GUID::from_u128(0x0000_0000_0000_0000_c000_000000000046);
-    const IID_DS: GUID = GUID::from_u128(0x0000_0121_0000_0000_c000_000000000046);
+    const IID_UNK: GUID = GUID::from_u128(0x0000_0000_0000_0000_c000_0000_0000_0046);
+    const IID_DS: GUID = GUID::from_u128(0x0000_0121_0000_0000_c000_0000_0000_0046);
     if riid.is_null() || ppv.is_null() {
         return windows::core::HRESULT(0x8000_4002u32 as i32);
     }
