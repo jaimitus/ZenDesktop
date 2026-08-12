@@ -7,6 +7,13 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.9] - 2026-08-12
+
+### Changed
+- Test release to verify the end-to-end automatic update flow from an
+  installed build (1.0.8 -> 1.0.9: detection, download with retries,
+  signature verification, UAC elevation, mutex handoff and restart).
+
 ## [1.0.8] - 2026-08-12
 
 ### Fixed
