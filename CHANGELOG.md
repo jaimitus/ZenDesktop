@@ -7,6 +7,13 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.4] - 2026-08-12
+
+### Fixed
+- **Update detection works now**: the version comparison in the update
+  check was inverted, so the app always reported "you are up to date" even
+  when a newer release existed. It now correctly offers the new version.
+
 ## [1.0.3] - 2026-08-12
 
 ### Fixed
@@ -95,6 +102,7 @@ desktop organizer built from scratch in Rust.
 
 ---
 
+[1.0.4]: https://github.com/jaimitus/ZenDesktop/releases/tag/v1.0.4
 [1.0.3]: https://github.com/jaimitus/ZenDesktop/releases/tag/v1.0.3
 [1.0.2]: https://github.com/jaimitus/ZenDesktop/releases/tag/v1.0.2
 [1.0.1]: https://github.com/jaimitus/ZenDesktop/releases/tag/v1.0.1

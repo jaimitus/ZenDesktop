@@ -91,7 +91,7 @@ pub fn check_update() -> UpdateStatus {
     };
 
     let latest = release.tag_name.trim_start_matches('v');
-    if version_at_least(latest, CURRENT_VERSION) {
+    if is_up_to_date(CURRENT_VERSION, latest) {
         return UpdateStatus::UpToDate;
     }
 
@@ -218,6 +218,12 @@ fn version_at_least(a: &str, b: &str) -> bool {
     parts(a) >= parts(b)
 }
 
+/// True si la version instalada (`current`) ya tiene (o supera) la ultima
+/// publicada (`latest`): no hay nada que actualizar.
+fn is_up_to_date(current: &str, latest: &str) -> bool {
+    version_at_least(current, latest)
+}
+
 fn hex_decode(hex: &str) -> Option<[u8; 32]> {
     let hex = hex.trim();
     if hex.len() != 64 {
@@ -233,7 +239,7 @@ fn hex_decode(hex: &str) -> Option<[u8; 32]> {
 
 #[cfg(test)]
 mod tests {
-    use super::version_at_least;
+    use super::{is_up_to_date, version_at_least};
 
     #[test]
     fn version_compares_multi_digit_segments() {
@@ -254,5 +260,15 @@ mod tests {
     fn version_handles_missing_segments() {
         assert!(version_at_least("1.0", "0.9.9"));
         assert!(version_at_least("2", "1.9.9"));
+    }
+
+    #[test]
+    fn update_detection_is_not_inverted() {
+        // Regresion: esta comparacion estuvo invertida y la app siempre
+        // decia "al dia" aunque hubiera una version nueva publicada.
+        assert!(!is_up_to_date("1.0.2", "1.0.3"), "1.0.2 instalada y 1.0.3 publicada => hay update");
+        assert!(is_up_to_date("1.0.3", "1.0.3"), "misma version => al dia");
+        assert!(is_up_to_date("1.0.4", "1.0.3"), "instalada superior => al dia");
+        assert!(!is_up_to_date("1.0.9", "1.0.10"), "multi-digito: 1.0.9 < 1.0.10 => hay update");
     }
 }
