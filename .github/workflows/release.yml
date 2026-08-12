@@ -80,6 +80,8 @@ jobs:
           cd installer
           ~/.dotnet/tools/wix build -arch x64 -d Version=${V} -d SrcDir=staging \
             zendesktop.wxs -o "../release/ZenDesktop-v${V}-x64.msi"
+          # WiX also emits a debug .wixpdb next to the MSI — not a release asset.
+          rm -f "../release/ZenDesktop-v${V}-x64.wixpdb"
 
       - name: Install Inno Setup
         shell: bash
