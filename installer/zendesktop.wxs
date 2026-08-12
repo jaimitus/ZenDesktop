@@ -23,10 +23,6 @@
     <Property Id="ARPCOMMENTS" Value="Ultra-lightweight native desktop organizer for Windows" />
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
 
-    <!-- Professional install UI with license agreement -->
-    <WixVariable Id="WixUILicenseRtf" Value="$(var.SrcDir)\LICENSE.rtf" />
-    <UIRef Id="WixUI_Minimal" />
-
     <!-- Install to Program Files\ZenDesktop -->
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="ZenDesktop">

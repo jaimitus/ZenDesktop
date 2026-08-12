@@ -71,14 +71,11 @@ if ($wixExe) {
     Copy-Item "$Target\zendesktop.exe" "$staging\ZenDesktop.exe" -Force
     Copy-Item "$Root\assets\icons\zendesktop.ico" "$staging\zendesktop.ico" -Force
     Copy-Item "$Root\LICENSE" "$staging\LICENSE" -Force
-    Copy-Item "$InstallerDir\LICENSE.rtf" "$staging\LICENSE.rtf" -Force
     Copy-Item "$Root\README.md" "$staging\README.md" -Force
 
-    # Paths in the .wxs resolve relative to the .wxs file, so run from
-    # installer/ with SrcDir=staging. -ext WixToolset.UI.wixext is required
-    # for WixUI_Minimal (license dialog).
+    # Paths in the .wxs resolve relative to the .wxs file.
     & $wixExe build -d Version=$Version -d SrcDir=staging `
-        -ext WixToolset.UI.wixext "$InstallerDir\zendesktop.wxs" `
+        "$InstallerDir\zendesktop.wxs" `
         -o "$ReleaseDir\ZenDesktop-v$Version-x64.msi"
     if ($LASTEXITCODE -ne 0) { throw "WiX build failed" }
 
