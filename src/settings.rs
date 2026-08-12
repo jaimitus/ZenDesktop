@@ -1197,25 +1197,26 @@ impl Settings {
     fn panel_ai(&mut self, cy: f32) {
         let (cx, _, cw, _) = self.content_area();
         let mut y = cy + 10.0;
-        y = self.section(y, cx, cw, "🤖 Clasificación Inteligente con IA Local (Ollama)");
-        y = self.check(y, cx, cw, ID_CHECK_AI_ENABLE, "Habilitar organización semántica por IA");
+        let tr = self.tr;
+        y = self.section(y, cx, cw, tr.sec_ai_title);
+        y = self.check(y, cx, cw, ID_CHECK_AI_ENABLE, tr.chk_ai_enable);
 
         y += 10.0;
-        y = self.section(y, cx, cw, "Conexión Ollama (Servidor Local)");
+        y = self.section(y, cx, cw, tr.sec_ai_connection);
         let url = self.cfg.ai.ollama_url.clone();
-        y = self.field_row(y, cx, cw, ID_EDIT_AI_URL, "Servidor (URL/IP):", &url, false);
+        y = self.field_row(y, cx, cw, ID_EDIT_AI_URL, tr.fld_ai_url, &url, false);
 
         let model = self.cfg.ai.model.clone();
-        y = self.field_row(y, cx, cw, ID_EDIT_AI_MODEL, "Modelo local:", &model, false);
+        y = self.field_row(y, cx, cw, ID_EDIT_AI_MODEL, tr.fld_ai_model, &model, false);
 
         y += 8.0;
         let bx0 = cx + 16.0;
-        self.icon_button(bx0, y, 200.0, 30.0, "🟢 Comprobar Conexión", ID_BTN_AI_PING, true);
-        self.icon_button(bx0 + 210.0, y, 220.0, 30.0, "🔍 Autodetectar Modelos", ID_BTN_AI_DETECT_MODELS, true);
+        self.icon_button(bx0, y, 200.0, 30.0, tr.btn_ai_ping, ID_BTN_AI_PING, true);
+        self.icon_button(bx0 + 210.0, y, 220.0, 30.0, tr.btn_ai_detect, ID_BTN_AI_DETECT_MODELS, true);
 
         y += 42.0;
-        y = self.section(y, cx, cw, "Organización Autónoma Total");
-        self.icon_button(bx0, y, 430.0, 34.0, "⚡ Reorganizar Escritorio Desde Cero con IA", ID_BTN_AI_REORGANIZE, true);
+        y = self.section(y, cx, cw, tr.sec_ai_organize);
+        self.icon_button(bx0, y, 430.0, 34.0, tr.btn_ai_reorganize, ID_BTN_AI_REORGANIZE, true);
     }
 
     fn panel_updates(&mut self, cy: f32) {

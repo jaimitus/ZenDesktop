@@ -188,6 +188,16 @@ pub struct Tr {
     #[allow(dead_code)]
     pub lbl_update_available: &'static str,
     pub btn_download_update: &'static str,
+    // AI
+    pub sec_ai_title: &'static str,
+    pub chk_ai_enable: &'static str,
+    pub sec_ai_connection: &'static str,
+    pub fld_ai_url: &'static str,
+    pub fld_ai_model: &'static str,
+    pub btn_ai_ping: &'static str,
+    pub btn_ai_detect: &'static str,
+    pub sec_ai_organize: &'static str,
+    pub btn_ai_reorganize: &'static str,
 }
 
 macro_rules! tr {
@@ -302,6 +312,15 @@ pub static EN: Tr = tr! {
     lbl_up_to_date: "ZenDesktop is up to date",
     lbl_update_available: "New version available",
     btn_download_update: "Download & Install",
+        sec_ai_title: "Intelligent Classification with Local AI (Ollama)",
+        chk_ai_enable: "Enable AI-powered semantic organization",
+        sec_ai_connection: "Ollama Connection (Local Server)",
+        fld_ai_url: "Server (URL/IP):",
+        fld_ai_model: "Local model:",
+        btn_ai_ping: "Test Connection",
+        btn_ai_detect: "Auto-Detect Models",
+        sec_ai_organize: "Full Autonomous Organization",
+        btn_ai_reorganize: "Reorganize Desktop From Scratch with AI",
 };
 
 pub static ES: Tr = tr! {
@@ -408,6 +427,15 @@ pub static ES: Tr = tr! {
     lbl_up_to_date: "ZenDesktop está actualizado",
     lbl_update_available: "Nueva versión disponible",
     btn_download_update: "Descargar e instalar",
+        sec_ai_title: "Clasificación Inteligente con IA Local (Ollama)",
+        chk_ai_enable: "Habilitar organización semántica por IA",
+        sec_ai_connection: "Conexión Ollama (Servidor Local)",
+        fld_ai_url: "Servidor (URL/IP):",
+        fld_ai_model: "Modelo local:",
+        btn_ai_ping: "Comprobar Conexión",
+        btn_ai_detect: "Autodetectar Modelos",
+        sec_ai_organize: "Organización Autónoma Total",
+        btn_ai_reorganize: "Reorganizar Escritorio Desde Cero con IA",
 };
 
 pub static DE: Tr = tr! {
@@ -514,6 +542,15 @@ pub static DE: Tr = tr! {
     lbl_up_to_date: "ZenDesktop ist aktuell",
     lbl_update_available: "Neue Version verfügbar",
     btn_download_update: "Herunterladen & Installieren",
+        sec_ai_title: "Intelligente Klassifizierung mit lokaler KI (Ollama)",
+        chk_ai_enable: "KI-gestützte semantische Organisation aktivieren",
+        sec_ai_connection: "Ollama-Verbindung (Lokaler Server)",
+        fld_ai_url: "Server (URL/IP):",
+        fld_ai_model: "Lokales Modell:",
+        btn_ai_ping: "Verbindung testen",
+        btn_ai_detect: "Modelle automatisch erkennen",
+        sec_ai_organize: "Vollständige autonome Organisation",
+        btn_ai_reorganize: "Desktop von Grund auf mit KI reorganisieren",
 };
 
 pub static FR: Tr = tr! {
@@ -620,6 +657,15 @@ pub static FR: Tr = tr! {
     lbl_up_to_date: "ZenDesktop est à jour",
     lbl_update_available: "Nouvelle version disponible",
     btn_download_update: "Télécharger & Installer",
+        sec_ai_title: "Classification intelligente avec IA locale (Ollama)",
+        chk_ai_enable: "Activer l'organisation sémantique par IA",
+        sec_ai_connection: "Connexion Ollama (Serveur local)",
+        fld_ai_url: "Serveur (URL/IP) :",
+        fld_ai_model: "Modèle local :",
+        btn_ai_ping: "Tester la connexion",
+        btn_ai_detect: "Détecter automatiquement les modèles",
+        sec_ai_organize: "Organisation autonome complète",
+        btn_ai_reorganize: "Réorganiser le bureau avec l'IA",
 };
 
 pub static PT: Tr = tr! {
@@ -726,6 +772,15 @@ pub static PT: Tr = tr! {
     lbl_up_to_date: "ZenDesktop está atualizado",
     lbl_update_available: "Nova versão disponível",
     btn_download_update: "Baixar e instalar",
+        sec_ai_title: "Classificação inteligente com IA local (Ollama)",
+        chk_ai_enable: "Ativar organização semântica por IA",
+        sec_ai_connection: "Conexão Ollama (Servidor local)",
+        fld_ai_url: "Servidor (URL/IP):",
+        fld_ai_model: "Modelo local:",
+        btn_ai_ping: "Testar conexão",
+        btn_ai_detect: "Detectar modelos automaticamente",
+        sec_ai_organize: "Organização autônoma completa",
+        btn_ai_reorganize: "Reorganizar área de trabalho com IA",
 };
 
 pub static IT: Tr = tr! {
@@ -832,6 +887,15 @@ pub static IT: Tr = tr! {
     lbl_up_to_date: "ZenDesktop è aggiornato",
     lbl_update_available: "Nuova versione disponibile",
     btn_download_update: "Scarica e installa",
+        sec_ai_title: "Classificazione intelligente con IA locale (Ollama)",
+        chk_ai_enable: "Abilita organizzazione semantica con IA",
+        sec_ai_connection: "Connessione Ollama (Server locale)",
+        fld_ai_url: "Server (URL/IP):",
+        fld_ai_model: "Modello locale:",
+        btn_ai_ping: "Testa connessione",
+        btn_ai_detect: "Rileva modelli automaticamente",
+        sec_ai_organize: "Organizzazione autonoma completa",
+        btn_ai_reorganize: "Riorganizza il desktop con l'IA",
 };
 
 impl Tr {

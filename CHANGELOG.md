@@ -9,52 +9,46 @@ and versioning follows [SemVer](https://semver.org/).
 
 ## [1.0.0] - 2026-08-12
 
-### 🎉 First stable release
+### Initial Release
 
-After months of development, ZenDesktop 1.0.0 is production-ready.
+ZenDesktop 1.0.0 is the first stable release — a lightweight, native Windows
+desktop organizer built from scratch in Rust.
 
-### ✨ Features
+### Features
 
-- **Floating translucent fences** with Direct2D + DirectWrite rendering
-- **Manual Drag & Drop** between fences, subfolders, and to the desktop
-- **Visual highlight** when dragging over target subfolders
-- **Explorer drop** via OLE `IDropTarget` (RegisterDragDrop)
-- **Auto-organization** by rules (extension, name, pattern)
-- **AI classification** via Ollama (local)
-- **Zen Mode** with double-click on desktop or `Ctrl+Alt+Z`
-- **6 languages**: English, Spanish, German, French, Portuguese, Italian
-- **Toast notifications** with contextual icon (🟢 green for drops, 🔵 blue for organize)
-- **Integrated search** in each fence
-- **Grid and list** view modes
-- **Sorting** by name, size, type, date, or custom
-- **Customizable themes**: colors, borders, typography, icons
-- **Auto-archiving** by file age
-- **Multi-desktop support** (OneDrive, Public, etc.)
-- **System tray** with context menu
-- **Ultralight binary**: ~780 KB, ~4 MB RAM idle
-- **Auto-update** via GitHub Releases API
-- **6-language i18n** with static translation system
+- **Floating translucent fences** — Direct2D + DirectWrite rendering with per-pixel alpha
+- **Drag & Drop** — Move files between fences, into subfolders, or back to the desktop with visual feedback
+- **Explorer integration** — Drop files from any folder directly into fences via native OLE `IDropTarget`
+- **Auto-organization** — Rule-based classification by extension, name, or pattern with optional local AI
+- **AI classification** — Semantic file organization using Ollama (local LLM, fully offline)
+- **Zen Mode** — Instant hide/show all fences with `Ctrl+Alt+Z` or double-click on desktop
+- **Multi-language** — 6 languages: English, Spanish, German, French, Portuguese, Italian
+- **Toast notifications** — Contextual feedback with color-coded icons (green for drops, blue for organization)
+- **Integrated search** — Real-time file filtering within each fence
+- **Grid & List views** — Sortable by name, size, type, date, or custom order
+- **Full customization** — Colors, borders, corner radius, fonts, icons, item counter
+- **Auto-archiving** — Move stale files to an archive folder by configurable age
+- **Multi-desktop** — Public desktop, OneDrive, and custom folder support
+- **System tray** — Minimizes to tray with full context menu
+- **Ultra-lightweight** — ~780 KB binary, ~4 MB RAM idle, 0% CPU (event-driven, zero polling)
+- **Auto-update** — One-click updates from GitHub Releases with Ed25519 signature verification
+- **MSI installer** — System-wide installation with Start Menu shortcuts via WiX v4
 
-### 🔧 Improvements
+### Technical Highlights
 
-- MSI installer via WiX v4 with Start Menu shortcuts
-- Toast uses GDI `DrawTextW` for full Unicode support
-- Toast width dynamically measured with `GetTextExtentPoint32W`
-- Green checkmark icon on drop toasts
-- Blue icon for organization toasts
-- Settings → Updates panel with check/download buttons
-- Auto-restart after update (portable + installed)
-- Dead code removed (COM drag fallback, bitmap font, unused imports)
-- Zero compiler warnings
+- Pure Win32: Direct2D, DirectWrite, layered windows — no Electron, no browser runtime
+- Native file watching via `ReadDirectoryChangesW` — zero CPU when idle
+- Manual drag & drop with `SetCapture` + `WM_MOUSEMOVE` for inter-fence operations
+- OLE drag target (`IDropTarget`) for accepting drops from Explorer and other apps
+- Static i18n system with zero runtime allocations across 6 languages
+- Ed25519 cryptographic signature verification for secure auto-updates
+- Zero compiler warnings in release profile
 
-### 🐛 Fixes
+### Known Limitations
 
-- Drag crash fixed (manual capture without COM)
-- Desktop drops no longer auto-reorganized
-- Empty toast fixed (now uses GDI DrawTextW)
-- Cursor changes to hand + file icon during drag
-- Auto-organizer no longer reverts manual desktop drops
-- Subfolder detection during drag-and-drop
+- AI features require [Ollama](https://ollama.com) running locally
+- SmartScreen may show a warning on portable builds (MSI installer is unaffected)
+- Works on Windows 10 and 11 only
 
 ---
 
