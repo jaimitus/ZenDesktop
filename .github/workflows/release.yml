@@ -12,6 +12,9 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # Secrets no se pueden leer en `if:`; se exponen via env de job.
+      SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -38,11 +41,9 @@ jobs:
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
       - name: Sign portable EXE (Ed25519)
-        if: ${{ secrets.SIGNING_KEY != '' }}
+        if: env.SIGNING_KEY != ''
         shell: bash
         run: cargo run --release --bin sign-release -- target/release/zendesktop.exe
-        env:
-          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
 
       - name: Collect portable artifacts
         shell: bash
