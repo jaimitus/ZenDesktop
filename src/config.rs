@@ -287,6 +287,10 @@ pub struct Rule {
     /// Patron regex sobre el nombre completo del archivo (sin ruta).
     #[serde(default)]
     pub regex: Option<String>,
+    /// Rutas completas de los archivos fijados (favoritos): siempre flotan
+    /// arriba de la caja, por encima del orden normal.
+    #[serde(default)]
+    pub pinned: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -592,6 +596,7 @@ pub fn default_rules() -> Vec<Rule> {
             newer_than_days: None,
             older_than_days: None,
             regex: None,
+            pinned: Vec::new(),
         },
         Rule {
             id: "docs".into(),
@@ -616,6 +621,7 @@ pub fn default_rules() -> Vec<Rule> {
             newer_than_days: None,
             older_than_days: None,
             regex: None,
+            pinned: Vec::new(),
         },
         Rule {
             id: "setup".into(),
@@ -640,6 +646,7 @@ pub fn default_rules() -> Vec<Rule> {
             newer_than_days: None,
             older_than_days: None,
             regex: None,
+            pinned: Vec::new(),
         },
         Rule {
             id: "misc".into(),
@@ -656,11 +663,13 @@ pub fn default_rules() -> Vec<Rule> {
             view_mode: "auto".into(),
             icon_size: None,
             min_size_bytes: None,
-            max_size_bytes: None,
-            newer_than_days: None,
+            max_size_bytes: None,            newer_than_days: None,
             older_than_days: None,
             regex: None,
+            pinned: Vec::new(),
         },
+
+
     ]
 }
 

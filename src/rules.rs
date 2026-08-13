@@ -36,6 +36,9 @@ pub struct FileItem {
     pub size: u64,
     pub modified: SystemTime,
     pub is_dir: bool,
+    /// Fijado arriba de la caja (favorito): lo marca `collect_fences` a partir
+    /// de `Rule.pinned` y la ordenacion lo mantiene siempre al principio.
+    pub pinned: bool,
 }
 
 impl FileItem {
@@ -52,6 +55,7 @@ impl FileItem {
             size: meta.len(),
             modified: meta.modified().unwrap_or(UNIX_EPOCH),
             is_dir: meta.is_dir(),
+            pinned: false,
             path,
         })
     }
@@ -614,6 +618,13 @@ pub fn collect_fences(cfg: &Config, desktop: &Path, sort_overrides: &std::collec
             (None, read_items(desktop, cfg, desktop, Some(rule)))
         };
 
+        // Marca los favoritos (fijados) de la regla antes de ordenar.
+        let pinned_set: std::collections::HashSet<&str> =
+            rule.pinned.iter().map(|s| s.as_str()).collect();
+        for item in &mut items {
+            let path = item.path.to_string_lossy();
+            item.pinned = pinned_set.contains(path.as_ref());
+        }
         let sort_mode = sort_overrides.get(&rule.id).and_then(|m| m.as_deref()).unwrap_or(&cfg.appearance.sort_by);
         sort_items(&mut items, sort_mode);
         fences.push(FenceContent {
@@ -691,20 +702,26 @@ pub fn sort_items_slice(items: &mut [FileItem], mode: &str) {
 
 fn sort_items(items: &mut [FileItem], mode: &str) {
     if mode == "custom" {
-        return; // mantener el orden manual actual
+        // Manual: los fijados suben arriba conservando el orden relativo.
+        items.sort_by_key(|b| std::cmp::Reverse(b.pinned));
+        return;
     }
-    items.sort_by(|a, b| match mode {
-        "modified" => b.modified.cmp(&a.modified),
-        "size" => b.size.cmp(&a.size),
-        "extension" => a
-            .ext
-            .cmp(&b.ext)
-            .then_with(|| natural_cmp(&a.name, &b.name)),
-        _ => a
-            .is_dir
-            .cmp(&b.is_dir)
-            .reverse()
-            .then_with(|| natural_cmp(&a.name, &b.name)),
+    items.sort_by(|a, b| {
+        b.pinned
+            .cmp(&a.pinned)
+            .then_with(|| match mode {
+                "modified" => b.modified.cmp(&a.modified),
+                "size" => b.size.cmp(&a.size),
+                "extension" => a
+                    .ext
+                    .cmp(&b.ext)
+                    .then_with(|| natural_cmp(&a.name, &b.name)),
+                _ => a
+                    .is_dir
+                    .cmp(&b.is_dir)
+                    .reverse()
+                    .then_with(|| natural_cmp(&a.name, &b.name)),
+            })
     });
 }
 
@@ -1003,6 +1020,28 @@ mod tests {
     }
 
     #[test]
+    fn pinned_items_float_to_top() {
+        let mk = |name: &str, pinned: bool| FileItem {
+            name: name.into(),
+            path: PathBuf::from(name),
+            ext: String::new(),
+            size: 0,
+            modified: UNIX_EPOCH,
+            is_dir: false,
+            pinned,
+        };
+        let mut items = vec![
+            mk("beta", false),
+            mk("zeta", true),
+            mk("alpha", false),
+            mk("gamma", false),
+        ];
+        sort_items_slice(&mut items, "name");
+        let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["zeta", "alpha", "beta", "gamma"]);
+    }
+
+    #[test]
     fn civil_dates() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(19_723), (2024, 1, 1));
@@ -1043,6 +1082,7 @@ mod tests {
             newer_than_days: None,
             older_than_days: None,
             regex: Some(r"^factura-.*\.pdf$".into()),
+            pinned: Vec::new(),
         }];
         // regex ok + tamano ok -> casa
         assert!(classify(&cfg, "factura-2024.pdf", "pdf", false, Some(2 * 1024 * 1024), None).is_some());
@@ -1095,6 +1135,7 @@ mod tests {
                 newer_than_days: None,
                 older_than_days: None,
                 regex: None,
+                pinned: Vec::new(),
             },
             Rule {
                 id: "misc".into(),
@@ -1113,6 +1154,7 @@ mod tests {
                 newer_than_days: None,
                 older_than_days: None,
                 regex: None,
+                pinned: Vec::new(),
             },
         ];
 
@@ -1159,6 +1201,7 @@ mod tests {
                 newer_than_days: None,
                 older_than_days: None,
                 regex: None,
+                pinned: Vec::new(),
         }];
         ensure_layout(&cfg).unwrap();
         let report = organize(&cfg, &desktop);
@@ -1196,6 +1239,7 @@ mod tests {
                 newer_than_days: None,
                 older_than_days: None,
                 regex: None,
+                pinned: Vec::new(),
             },
             Rule {
                 id: "misc".into(),
@@ -1214,6 +1258,7 @@ mod tests {
                 newer_than_days: None,
                 older_than_days: None,
                 regex: None,
+                pinned: Vec::new(),
             },
         ];
         ensure_layout(&cfg).unwrap();
@@ -1255,6 +1300,7 @@ mod tests {
                 newer_than_days: None,
                 older_than_days: None,
                 regex: None,
+                pinned: Vec::new(),
         }];
         ensure_layout(&cfg).unwrap();
         organize(&cfg, &desktop);
@@ -1297,6 +1343,7 @@ mod tests {
                 newer_than_days: None,
                 older_than_days: None,
                 regex: None,
+                pinned: Vec::new(),
         }];
         ensure_layout(&cfg).unwrap();
         organize(&cfg, &desktop);

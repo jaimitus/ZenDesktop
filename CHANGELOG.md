@@ -7,6 +7,24 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.16] - 2026-08-13
+
+### Added
+- **File favorites (pin to top)**: pin important files so they always float
+  above a fence, regardless of the sort order. Toggle with `Ctrl+P` on the
+  selected item or by clicking the pin button that appears on hover; pinned
+  files show a pin badge in list and grid view and persist per rule (including
+  virtual and tabbed fences).
+- **Dedicated language tab**: Settings now has its own 🌐 Language panel with
+  flag cards, instead of crowding the General tab (which also fixes the overlap
+  with the export/import configuration section).
+
+### Fixed
+- **Settings scroll residue**: scrolling the settings panels no longer leaves
+  black lines over the input fields. Native edit controls are now repositioned
+  and shown/hidden outside the Direct2D draw cycle (before/after `EndDraw`),
+  so their previous positions are always repainted.
+
 ## [1.0.15] - 2026-08-13
 
 ### Added

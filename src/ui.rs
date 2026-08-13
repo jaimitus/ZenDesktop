@@ -239,6 +239,52 @@ fn pin_rect(w: f32, theme: &Theme, show_counter: bool, item_count: usize) -> D2D
     }
 }
 
+/// Dibuja la chincheta de un item fijado (favorito): cabeza circular + eje + punta.
+fn draw_pin_glyph(
+    target: &ID2D1DCRenderTarget,
+    brush: &ID2D1SolidColorBrush,
+    cx: f32,
+    cy: f32,
+    scale: f32,
+    color: D2D1_COLOR_F,
+) {
+    unsafe {
+        brush.SetColor(&color);
+        // Cabeza (circulo relleno).
+        target.FillEllipse(
+            &D2D1_ELLIPSE {
+                point: D2D_POINT_2F { x: cx, y: cy - 2.8 * scale },
+                radiusX: 1.7 * scale,
+                radiusY: 1.7 * scale,
+            },
+            brush,
+        );
+        // Eje vertical.
+        target.DrawLine(
+            D2D_POINT_2F { x: cx, y: cy - 1.4 * scale },
+            D2D_POINT_2F { x: cx, y: cy + 3.2 * scale },
+            brush,
+            1.3 * scale,
+            None,
+        );
+        // Punta (dos trazos divergentes).
+        target.DrawLine(
+            D2D_POINT_2F { x: cx, y: cy + 3.2 * scale },
+            D2D_POINT_2F { x: cx + 1.2 * scale, y: cy + 4.4 * scale },
+            brush,
+            1.3 * scale,
+            None,
+        );
+        target.DrawLine(
+            D2D_POINT_2F { x: cx, y: cy + 3.2 * scale },
+            D2D_POINT_2F { x: cx - 1.2 * scale, y: cy + 4.4 * scale },
+            brush,
+            1.3 * scale,
+            None,
+        );
+    }
+}
+
 /// Rectangulo de la barra de busqueda en la cabecera (coordenadas de la caja, sin escalar).
 /// Se posiciona a la izquierda del candado y contador, adaptando su tamano para no solaparse nunca.
 fn search_rect(w: f32, theme: &Theme, show_counter: bool, item_count: usize) -> Option<D2D_RECT_F> {
@@ -924,6 +970,9 @@ struct Fence {
     reorder_drop: Option<usize>,
     sort_mode: Option<String>,
     hit_row_h: f32,
+    /// Rect (pixeles) del boton de chincheta del item en hover (modo lista),
+    /// para el hit-test del clic que fija/desfija sin arrancar un drag.
+    item_pin_btn: Option<D2D_RECT_F>,
     pub anim_step: u8,
     pub anim_kind: u8,
 }
@@ -1593,6 +1642,7 @@ impl App {
                 reorder_drop: None,
                 sort_mode: layout.sort_by.clone(),
                 hit_row_h: self.theme.row,
+                item_pin_btn: None,
                 anim_step: 0,
                 anim_kind: 0,
             };
@@ -2314,6 +2364,7 @@ impl App {
             }
 
             let mut icon_jobs: Vec<(i32, i32, i32, HICON)> = Vec::new();
+            fence.item_pin_btn = None;
 
             if !fence.layout.collapsed || fence.is_mouse_over {
                 let content_rect = rect(0.0, fence.header_h(theme) * scale, w * scale, h * scale);
@@ -2400,6 +2451,17 @@ impl App {
                                 &rect(cx + cell_pad, cy_val + cell * 0.70, cx + cell - cell_pad, cy_val + cell - cell_pad),
                                 brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL,
                             );
+                            // Chincheta de favorito en la esquina superior derecha.
+                            if item.pinned {
+                                draw_pin_glyph(
+                                    &surface.target,
+                                    brush,
+                                    cx + cell - 8.0 * scale,
+                                    cy_val + 8.0 * scale,
+                                    scale,
+                                    fence.accent,
+                                );
+                            }
                         }
                     }
                     // Scrollbar en modo cuadricula.
@@ -2506,6 +2568,7 @@ impl App {
                     let mapped = filtered[first + offset];
                     if mapped >= fence.tabs[fence.active_tab].content.items.len() { break; }
                     let item = &fence.tabs[fence.active_tab].content.items[mapped];
+                    let item_pinned = item.pinned;
                     let index_abs = mapped;
                     let fractional = fence.tabs[fence.active_tab].smooth_scroll - first as f32;
                     let top = (fence.header_h(theme) + (offset as f32 - fractional) * theme.row) * scale;
@@ -2597,6 +2660,28 @@ impl App {
                         D2D1_DRAW_TEXT_OPTIONS_CLIP,
                         DWRITE_MEASURING_MODE_NATURAL,
                     );
+
+                    // Chincheta de favorito: fija en color de acento; al hover
+                    // se dibuja tenue y hace de boton para fijar/desfijar.
+                    if item_pinned || is_hov {
+                        let meta_left = (w - theme.padding - 46.0) * scale;
+                        let cx = meta_left - 13.0 * scale;
+                        let cy = top + theme.row * scale * 0.5;
+                        let color = if item_pinned {
+                            fence.accent
+                        } else {
+                            with_alpha(theme.muted, 0.45)
+                        };
+                        draw_pin_glyph(&surface.target, brush, cx, cy, scale, color);
+                        if is_hov {
+                            fence.item_pin_btn = Some(D2D_RECT_F {
+                                left: meta_left - 26.0 * scale,
+                                top,
+                                right: meta_left - 2.0 * scale,
+                                bottom,
+                            });
+                        }
+                    }
                 }
 
                 // Indicador de reordenacion: linea de acento en la posicion de insercion.
@@ -4015,6 +4100,68 @@ impl App {
         }
     }
 
+    /// Fija o desfija un item (favorito): actualiza `Rule.pinned`, guarda la
+    /// config y reordena la caja en caliente, conservando la seleccion por ruta
+    /// (los indices cambian al subir/bajar el item).
+    fn toggle_pin(&mut self, fence_idx: usize, item_idx: usize) {
+        let active = self.fences[fence_idx].active_tab;
+        let selected_paths: HashSet<PathBuf> = {
+            let tab = &self.fences[fence_idx].tabs[active];
+            tab.selected
+                .iter()
+                .filter_map(|&i| tab.content.items.get(i).map(|it| it.path.clone()))
+                .collect()
+        };
+        let (rule_id, path_str, was_pinned) = {
+            let tab = &self.fences[fence_idx].tabs[active];
+            let item = &tab.content.items[item_idx];
+            (
+                tab.content.id.clone(),
+                item.path.to_string_lossy().into_owned(),
+                item.pinned,
+            )
+        };
+        if let Some(rule) = self.cfg.rules.iter_mut().find(|r| r.id == rule_id) {
+            if was_pinned {
+                rule.pinned.retain(|p| p != &path_str);
+            } else if !rule.pinned.contains(&path_str) {
+                rule.pinned.push(path_str);
+            }
+        }
+        let _ = self.cfg.save(&self.cfg_path);
+
+        // Re-marca y reordena en caliente sin releer el disco.
+        let mode = self.fences[fence_idx]
+            .sort_mode
+            .as_deref()
+            .unwrap_or(&self.cfg.appearance.sort_by)
+            .to_string();
+        let pinned_set: HashSet<String> = self
+            .cfg
+            .rules
+            .iter()
+            .find(|r| r.id == rule_id)
+            .map(|r| r.pinned.iter().cloned().collect())
+            .unwrap_or_default();
+        {
+            let tab = &mut self.fences[fence_idx].tabs[active];
+            for item in &mut tab.content.items {
+                let p = item.path.to_string_lossy().into_owned();
+                item.pinned = pinned_set.contains(&p);
+            }
+            rules::sort_items_slice(&mut tab.content.items, &mode);
+            tab.selected = tab
+                .content
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, it)| selected_paths.contains(&it.path))
+                .map(|(i, _)| i)
+                .collect();
+        }
+        let _ = self.render(fence_idx);
+    }
+
     // -- bandeja y hooks ----------------------------------------------------
 
     unsafe fn install_tray(&mut self) {
@@ -5156,6 +5303,21 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 let shift_down = (GetKeyState(VK_SHIFT.0 as i32) as u32) & 0x8000 != 0;
 
                 if let Some(idx) = item_idx {
+                    // Boton de chincheta del item en hover: fija/desfija sin
+                    // arrancar un drag ni cambiar la seleccion.
+                    let hit_pin = app.fences[index]
+                        .item_pin_btn
+                        .map(|btn| {
+                            (x as f32) >= btn.left
+                                && (x as f32) <= btn.right
+                                && (y as f32) >= btn.top
+                                && (y as f32) <= btn.bottom
+                        })
+                        .unwrap_or(false);
+                    if hit_pin {
+                        app.toggle_pin(index, idx);
+                        return LRESULT(0);
+                    }
                     let fence = &mut app.fences[index];
                     fence.tabs[fence.active_tab].search_focused = false;
                     if ctrl_down {
@@ -5621,6 +5783,16 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                         let _ = SetForegroundWindow(hwnd);
                         let _ = SetFocus(hwnd);
                         let _ = app.render(index);
+                    }
+                    0x50 if ctrl => { // Ctrl + P (Fijar/desfijar favorito)
+                        let active = app.fences[index].active_tab;
+                        let target = {
+                            let tab = &app.fences[index].tabs[active];
+                            tab.cursor.or_else(|| tab.selected.iter().next().copied())
+                        };
+                        if let Some(i) = target {
+                            app.toggle_pin(index, i);
+                        }
                     }
                     0x2E => { // VK_DELETE (Enviar a la papelera de reciclaje)
                         let active = app.fences[index].active_tab;

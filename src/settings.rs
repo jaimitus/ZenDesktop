@@ -33,7 +33,8 @@ use windows::Win32::Graphics::Direct2D::Common::{
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
-    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_CAP_STYLE_ROUND, D2D1_DRAW_TEXT_OPTIONS_NONE,
+    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_CAP_STYLE_ROUND,
+    D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
     D2D1_FACTORY_TYPE_SINGLE_THREADED,
     D2D1_FEATURE_LEVEL_DEFAULT, D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE,
     D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
@@ -248,6 +249,7 @@ enum Panel {
     General,
     Rules,
     Appearance,
+    Language,
     Ai,
     Updates,
 }
@@ -338,6 +340,10 @@ struct Settings {
     // verdad, y la visibilidad solo cambia en transiciones (no en cada frame).
     edit_rects: HashMap<u16, (i32, i32, i32, i32)>,
     edit_visible: HashSet<u16>,
+    /// Rects deseados por campo en el frame actual: se aplican en
+    /// `sync_edits_post` tras el present D2D, para no mover ventanas hijas
+    /// durante el dibujado (deja residuos negros al hacer scroll).
+    edit_next_rects: HashMap<u16, (i32, i32, i32, i32)>,
 
     regions: Vec<Region>,
     focus_order: Vec<Ctrl>,
@@ -458,7 +464,7 @@ impl Settings {
                 &format,
                 &r,
                 self.brush(),
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT | windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_CLIP,
                 DWRITE_MEASURING_MODE_NATURAL,
             );
         }
@@ -605,14 +611,14 @@ impl Settings {
         let label_w = 148.0;
         let field_w = (cw - 32.0 - label_w - if swatch { 40.0 } else { 0.0 }).max(90.0);
         self.field_at((cx + 16.0, y), (label_w, field_w), id, label, value, swatch);
-        y + 32.0
+        y + 38.0
     }
 
     /// Fila numerica compacta: etiqueta + campo estrecho (2-3 digitos) para
     /// valores como dias o minutos, sin el hueco gigante de antes.
     fn num_row(&mut self, y: f32, cx: f32, id: u16, label: &str, value: &str) -> f32 {
         self.field_at((cx + 16.0, y), (148.0, 84.0), id, label, value, false);
-        y + 32.0
+        y + 38.0
     }
 
     /// Fila de carpeta: campo de texto + boton de examinar (selector nativo).
@@ -649,7 +655,7 @@ impl Settings {
                 bottom: y + 26.0,
             },
         );
-        y + 32.0
+        y + 38.0
     }
 
     fn field_at(&mut self, origin: (f32, f32), dims: (f32, f32), id: u16, label: &str, value: &str, swatch: bool) {
@@ -691,11 +697,12 @@ impl Settings {
                 },
                 col(C_TEXT),
             );
-        } else if let Some(edit) = self.edits.get(&id).copied() {
-            // Con scroll, un campo fuera del area visible se oculta (si no, el
-            // EDIT nativo quedaria flotando sobre la cabecera o la barra).
+        } else if self.edits.contains_key(&id) {
             let (_, cyt, _, chb) = self.content_rect;
-            if y >= cyt && y + 26.0 <= chb {
+            // Un campo EDIT solo es visible si su bounding box cae integro dentro del area de contenido visible.
+            let field_top = y;
+            let field_bottom = y + 26.0;
+            if field_top >= cyt && field_bottom <= chb {
                 let s = self.scale;
                 let rect = (
                     ((fx + 8.0) * s) as i32,
@@ -703,22 +710,10 @@ impl Settings {
                     (((field_w - 14.0) * s).max(40.0)) as i32,
                     (21.0 * s) as i32,
                 );
-                // Solo se reposiciona si la geometria cambio (evita repintados
-                // inducidos por SetWindowPos en cada frame de hover).
-                if self.edit_rects.get(&id) != Some(&rect) {
-                    unsafe {
-                        let _ = SetWindowPos(
-                            edit,
-                            HWND_TOP,
-                            rect.0,
-                            rect.1,
-                            rect.2,
-                            rect.3,
-                            SWP_NOZORDER | SWP_NOACTIVATE,
-                        );
-                    }
-                    self.edit_rects.insert(id, rect);
-                }
+                // Se registra el rect y se aplica tras el present D2D
+                // (sync_edits_post): mover la ventana hija durante el
+                // dibujado deja residuos negros al hacer scroll.
+                self.edit_next_rects.insert(id, rect);
                 self.edits_shown.push(id);
             }
         }
@@ -765,7 +760,7 @@ impl Settings {
             None
         };
         let indent = if is_grouped { 14.0 } else { 0.0 };
-        let bg = if selected { col(C_ACTIVE) } else if over { col(C_HOVER) } else { col("#00000000") };
+        let bg = if selected { col(C_ACTIVE) } else if over { col(C_HOVER) } else { col("#131B2E") };
         self.fill_rr(r.left, r.top, r.right - r.left, r.bottom - r.top, 8.0, bg);
         if selected {
             self.draw_rr(Rect { x: r.left, y: r.top, w: r.right - r.left, h: r.bottom - r.top }, 8.0, rgba(C_ACCENT, 0.5), 1.0);
@@ -1088,16 +1083,6 @@ impl Settings {
         y = self.check(y, cx, cw, ID_CHECK_BY_MONTH, self.tr.chk_by_month);
         y = self.num_row(y, cx, ID_EDIT_PURGE, self.tr.fld_purge, &format!("{}", self.cfg.ephemeral.purge_archive_after_days));
         y += 10.0;
-        y = self.section(y, cx, cw, self.tr.sec_language);
-        // Seis chips de idioma en una sola fila; el clic cambia el idioma en
-        // caliente y se persiste al guardar.
-        let chip_gap = 8.0;
-        let x0 = cx + 16.0;
-        let chip_w = (cw - 32.0 - 5.0 * chip_gap) / 6.0;
-        for (i, lang) in Lang::ALL.iter().enumerate() {
-            self.lang_chip(x0 + i as f32 * (chip_w + chip_gap), y, chip_w, 26.0, *lang);
-        }
-        y += 36.0;
         y = self.section(y, cx, cw, self.tr.sec_backup);
         let bx0 = cx + 16.0;
         self.icon_button(Rect { x: bx0, y, w: 220.0, h: 32.0 }, self.tr.btn_export_cfg, ID_BTN_EXPORT_CFG, true);
@@ -1176,8 +1161,8 @@ impl Settings {
         );
     }
 
-    /// Chip de idioma (selector de i18n en el panel General).
-    fn lang_chip(&mut self, x: f32, y: f32, w: f32, h: f32, lang: Lang) {
+    /// Card de idioma con insignia/bandera visual dibujada con Direct2D.
+    fn lang_card(&mut self, x: f32, y: f32, w: f32, h: f32, lang: Lang) {
         let selected = self.lang == lang;
         let over = self.hover == Some(Ctrl::Lang(lang));
         let bg = if selected {
@@ -1185,23 +1170,78 @@ impl Settings {
         } else if over {
             col(C_HOVER)
         } else {
-            col("#00000000")
+            col(C_FIELD)
         };
-        self.fill_rr(x, y, w, h, 7.0, bg);
+        self.fill_rr(x, y, w, h, 10.0, bg);
         self.draw_rr(
             Rect { x, y, w, h },
-            7.0,
-            if selected { rgba(C_ACCENT, 0.7) } else { rgba(C_FIELD_BORDER, 0.6) },
-            1.0,
+            10.0,
+            if selected { rgba(C_ACCENT, 0.85) } else { rgba(C_FIELD_BORDER, 0.6) },
+            if selected { 1.5 } else { 1.0 },
         );
+
+        // Insignia de Bandera Visual Dibujada en D2D
+        let bx = x + 12.0;
+        let by = y + (h - 20.0) / 2.0;
+        let (bw, bh) = (30.0, 20.0);
+
+        match lang {
+            Lang::Es => {
+                // España: Rojo - Amarillo - Rojo
+                self.fill_rr(bx, by, bw, bh, 3.0, col("#AA151B"));
+                self.fill_rr(bx, by + 5.0, bw, 10.0, 0.0, col("#F1BF00"));
+            }
+            Lang::En => {
+                // Reino Unido / Union Jack: Azul fondo, diagonales blancas/rojas y cruz central
+                self.fill_rr(bx, by, bw, bh, 3.0, col("#00247D"));
+                // Diagonales (St Andrew / St Patrick)
+                self.line(bx, by, bx + bw, by + bh, col("#FFFFFF"), 3.5);
+                self.line(bx + bw, by, bx, by + bh, col("#FFFFFF"), 3.5);
+                self.line(bx, by, bx + bw, by + bh, col("#CF142B"), 1.5);
+                self.line(bx + bw, by, bx, by + bh, col("#CF142B"), 1.5);
+                // Cruz de San Jorge (Borde blanco)
+                self.fill_rr(bx + 11.0, by, 8.0, bh, 0.0, col("#FFFFFF"));
+                self.fill_rr(bx, by + 6.0, bw, 8.0, 0.0, col("#FFFFFF"));
+                // Cruz de San Jorge (Centro rojo)
+                self.fill_rr(bx + 13.0, by, 4.0, bh, 0.0, col("#CF142B"));
+                self.fill_rr(bx, by + 8.0, bw, 4.0, 0.0, col("#CF142B"));
+            }
+            Lang::De => {
+                // Alemania: Negro - Rojo - Amarillo
+                self.fill_rr(bx, by, bw, bh, 3.0, col("#000000"));
+                self.fill_rr(bx, by + 6.6, bw, 6.7, 0.0, col("#DD0000"));
+                self.fill_rr(bx, by + 13.3, bw, 6.7, 3.0, col("#FFCC00"));
+            }
+            Lang::Fr => {
+                // Francia: Azul - Blanco - Rojo
+                self.fill_rr(bx, by, bw, bh, 3.0, col("#0055A5"));
+                self.fill_rr(bx + 10.0, by, 10.0, bh, 0.0, col("#FFFFFF"));
+                self.fill_rr(bx + 20.0, by, 10.0, bh, 3.0, col("#EF4135"));
+            }
+            Lang::It => {
+                // Italia: Verde - Blanco - Rojo
+                self.fill_rr(bx, by, bw, bh, 3.0, col("#009246"));
+                self.fill_rr(bx + 10.0, by, 10.0, bh, 0.0, col("#FFFFFF"));
+                self.fill_rr(bx + 20.0, by, 10.0, bh, 3.0, col("#CE2B37"));
+            }
+            Lang::Pt => {
+                // Portugal: Verde - Rojo
+                self.fill_rr(bx, by, bw, bh, 3.0, col("#006600"));
+                self.fill_rr(bx + 12.0, by, 18.0, bh, 3.0, col("#FF0000"));
+                self.fill_rr(bx + 9.0, by + 6.0, 6.0, 8.0, 3.0, col("#FFFF00"));
+            }
+        }
+        self.draw_rr(Rect { x: bx, y: by, w: bw, h: bh }, 3.0, rgba("#FFFFFF", 0.3), 1.0);
+
+        // Texto del idioma a la derecha de la bandera dibujada
         self.text(
             lang.label(),
-            Fmt::Small,
+            Fmt::Body,
             D2D_RECT_F {
-                left: x + 4.0,
-                top: y + 4.0,
-                right: x + w - 4.0,
-                bottom: y + h - 2.0,
+                left: bx + bw + 12.0,
+                top: y + (h - 20.0) / 2.0,
+                right: x + w - 12.0,
+                bottom: y + h,
             },
             if selected { col(C_TEXT) } else { col(C_MUTED) },
         );
@@ -1214,6 +1254,25 @@ impl Settings {
                 bottom: y + h,
             },
         );
+    }
+
+    fn panel_language(&mut self, cy: f32) {
+        let (cx, _, cw, _) = self.content_area();
+        let mut y = cy + 10.0;
+        y = self.section(y, cx, cw, self.tr.sec_language);
+
+        let card_gap = 12.0;
+        let x0 = cx + 16.0;
+        let card_w = (cw - 32.0 - card_gap) / 2.0;
+        let card_h = 44.0;
+
+        for (i, lang) in Lang::ALL.iter().enumerate() {
+            let row = i / 2;
+            let col = i % 2;
+            let px = x0 + col as f32 * (card_w + card_gap);
+            let py = y + row as f32 * (card_h + card_gap);
+            self.lang_card(px, py, card_w, card_h, *lang);
+        }
     }
 
     fn panel_rules(&mut self, cy: f32) {
@@ -1259,20 +1318,32 @@ impl Settings {
             right: cx + cw - 14.0,
             bottom: list_bottom,
         });
-        self.fill_rr(cx + 14.0, list_top, cw - 28.0, list_bottom - list_top, 10.0, col("#10162A"));
-        self.draw_rr(Rect { x: cx + 14.0, y: list_top, w: cw - 28.0, h: list_bottom - list_top }, 10.0, rgba(C_FIELD_BORDER, 0.6), 1.0);
-
         let rows = D2D_RECT_F {
             left: cx + 22.0,
             top: list_top + 6.0,
             right: cx + cw - 34.0,
             bottom: list_bottom - 6.0,
         };
+        self.fill_rr(cx + 14.0, list_top, cw - 28.0, list_bottom - list_top, 10.0, col("#10162A"));
+        self.draw_rr(Rect { x: cx + 14.0, y: list_top, w: cw - 28.0, h: list_bottom - list_top }, 10.0, rgba(C_FIELD_BORDER, 0.6), 1.0);
+
         let row_h = 32.0;
         let visible = ((rows.bottom - rows.top) / row_h).floor() as usize;
         let total = self.cfg.rules.len();
         let max_scroll = total.saturating_sub(visible);
         self.rules_scroll = self.rules_scroll.min(max_scroll);
+        unsafe {
+            self.target().PushAxisAlignedClip(
+                &D2D_RECT_F {
+                    left: rows.left.floor(),
+                    top: rows.top.floor(),
+                    right: rows.right.ceil(),
+                    bottom: rows.bottom.ceil(),
+                },
+                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            );
+        }
+        self.fill_rr(rows.left, rows.top, rows.right - rows.left, rows.bottom - rows.top, 0.0, col("#10162A"));
         for offset in 0..visible.min(total.saturating_sub(self.rules_scroll)) {
             let idx = self.rules_scroll + offset;
             let r = D2D_RECT_F {
@@ -1282,6 +1353,9 @@ impl Settings {
                 bottom: rows.top + (offset as f32 + 1.0) * row_h,
             };
             self.rule_row(&r, idx);
+        }
+        unsafe {
+            self.target().PopAxisAlignedClip();
         }
         if total == 0 {
             self.text(
@@ -1639,10 +1713,11 @@ impl Settings {
         let h = self.size.1 - HEADER_H - BAR_H;
         self.fill_rr(0.0, y0, SIDEBAR_W, h, 0.0, col(C_SIDEBAR));
         self.draw_rr(Rect { x: SIDEBAR_W - 1.0, y: y0, w: 1.0, h }, 0.0, rgba(C_CARD_BORDER, 0.6), 1.0);
-        let items: [(Panel, &'static str); 5] = [
+        let items: [(Panel, &'static str); 6] = [
             (Panel::General, self.tr.nav_general),
             (Panel::Rules, self.tr.nav_rules),
             (Panel::Appearance, self.tr.nav_appearance),
+            (Panel::Language, "🌐 Idioma"),
             (Panel::Ai, "🤖 IA (Ollama)"),
             (Panel::Updates, "🔄 Updates"),
         ];
@@ -1917,6 +1992,7 @@ impl Settings {
     fn render(&mut self) {
         self.regions.clear();
         self.edits_shown.clear();
+        self.edit_next_rects.clear();
         // El timer del spinner se sincroniza cada frame, independiente del panel.
         self.sync_busy_timer();
 
@@ -1948,23 +2024,22 @@ impl Settings {
         self.build_focus_order();
         self.draw_header();
         self.draw_sidebar();
-        self.panel_bg();
-
         // Area de contenido (sin desplazar) y recorte del scroll.
         let (cx, cy, cw, ch) = self.content_area();
-        self.content_rect = (cx, cy, cw, ch);
+        self.content_rect = (cx, cy, cx + cw, cy + ch);
         self.list_rect = None;
         unsafe {
             self.target().PushAxisAlignedClip(
                 &D2D_RECT_F {
-                    left: cx,
-                    top: cy,
-                    right: cx + cw,
-                    bottom: cy + ch,
+                    left: cx.floor(),
+                    top: cy.floor(),
+                    right: (cx + cw).ceil(),
+                    bottom: (cy + ch).ceil(),
                 },
                 D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
             );
         }
+        self.panel_bg();
         // Los paneles dibujan desplazados: si la ventana se encoge, el
         // contenido sobrante queda oculto bajo el borde inferior en vez de
         // solaparse con la barra de acciones.
@@ -1974,6 +2049,7 @@ impl Settings {
             Panel::General => self.panel_general(scy),
             Panel::Rules => self.panel_rules(scy),
             Panel::Appearance => self.panel_appearance(scy),
+            Panel::Language => self.panel_language(scy),
             Panel::Ai => self.panel_ai(scy),
             Panel::Updates => self.panel_updates(scy),
         }
@@ -2011,32 +2087,61 @@ impl Settings {
             self.draw_picker();
         }
 
+        // Sincroniza los EDIT nativos FUERA del ciclo de dibujado D2D: primero
+        // se ocultan los que van a moverse o desaparecer (con WS_CLIPCHILDREN,
+        // el present de EndDraw respeta las regiones de los hijos visibles; si
+        // un EDIT se mueve a mitad de ciclo su posicion antigua quedaria sin
+        // pintar, dejando un residuo negro), y tras EndDraw se reposicionan y
+        // muestran los visibles.
+        self.sync_edits_pre();
         unsafe {
             let _ = self.target().EndDraw(None, None);
         }
+        self.sync_edits_post();
+    }
 
-        // Visibilidad transicional: solo se llaman ShowWindow/SW_HIDE cuando el
-        // estado cambia, nunca por frame. Esto elimina el parpadeo de los
-        // campos al mover el raton o alternar paneles.
+    /// Oculta los EDIT que van a moverse o desaparecer ANTES del present D2D.
+    fn sync_edits_pre(&mut self) {
         let next_visible: HashSet<u16> = self.edits_shown.iter().copied().collect();
-        let mut newly_hidden: Vec<u16> = Vec::new();
-        for id in self.edit_visible.iter() {
-            if !next_visible.contains(id) {
-                newly_hidden.push(*id);
-            }
-        }
-        for id in &newly_hidden {
-            if let Some(hwnd) = self.edits.get(id).copied() {
-                unsafe { let _ = ShowWindow(hwnd, SW_HIDE); }
-            }
-            self.edit_visible.remove(id);
-        }
-        for id in &next_visible {
-            if !self.edit_visible.contains(id) {
-                if let Some(hwnd) = self.edits.get(id).copied() {
-                    unsafe { let _ = ShowWindow(hwnd, SW_SHOWNA); }
+        for id in self.edit_visible.iter().copied().collect::<Vec<_>>() {
+            let must_hide = !next_visible.contains(&id);
+            let moved = next_visible.contains(&id)
+                && self.edit_next_rects.get(&id).copied()
+                    != self.edit_rects.get(&id).copied();
+            if must_hide || moved {
+                if let Some(hwnd) = self.edits.get(&id).copied() {
+                    unsafe { let _ = ShowWindow(hwnd, SW_HIDE); }
                 }
-                self.edit_visible.insert(*id);
+                self.edit_visible.remove(&id);
+            }
+        }
+    }
+
+    /// Tras el present D2D, reposiciona y muestra los EDIT visibles.
+    fn sync_edits_post(&mut self) {
+        let next_visible: HashSet<u16> = self.edits_shown.iter().copied().collect();
+        for (id, &hwnd) in &self.edits {
+            if next_visible.contains(id) {
+                if let Some(&rect) = self.edit_next_rects.get(id) {
+                    if self.edit_rects.get(id) != Some(&rect) {
+                        unsafe {
+                            let _ = SetWindowPos(
+                                hwnd,
+                                HWND_TOP,
+                                rect.0,
+                                rect.1,
+                                rect.2,
+                                rect.3,
+                                SWP_NOZORDER | SWP_NOACTIVATE,
+                            );
+                        }
+                        self.edit_rects.insert(*id, rect);
+                    }
+                }
+                if !self.edit_visible.contains(id) {
+                    unsafe { let _ = ShowWindow(hwnd, SW_SHOWNA); }
+                    self.edit_visible.insert(*id);
+                }
             }
         }
     }
@@ -2098,6 +2203,7 @@ impl Settings {
             Ctrl::Nav(Panel::General),
             Ctrl::Nav(Panel::Rules),
             Ctrl::Nav(Panel::Appearance),
+            Ctrl::Nav(Panel::Language),
             Ctrl::Nav(Panel::Ai),
             Ctrl::Nav(Panel::Updates),
         ];
@@ -2171,6 +2277,7 @@ impl Settings {
                     Ctrl::Check(ID_CHECK_A_GRID),
                 ]);
             }
+            Panel::Language => {}
             Panel::Ai => {
                 order.extend([
                     Ctrl::Check(ID_CHECK_AI_ENABLE),
@@ -2575,6 +2682,7 @@ impl Settings {
                 newer_than_days: None,
                 older_than_days: None,
                 regex: None,
+                pinned: Vec::new(),
             });
         }
 
@@ -4185,6 +4293,7 @@ pub fn open_dialog(current: &Config, app: *mut App) -> Option<Config> {
             edits_shown: Vec::new(),
             edit_rects: HashMap::new(),
             edit_visible: HashSet::new(),
+            edit_next_rects: HashMap::new(),
             regions: Vec::new(),
             focus_order: Vec::new(),
             focus: None,
