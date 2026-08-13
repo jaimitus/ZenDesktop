@@ -1,6 +1,6 @@
 [package]
 name          = "zendesktop"
-version       = "1.0.16"
+version       = "1.0.17"
 edition       = "2021"
 rust-version  = "1.75"
 authors       = ["ZenDesktop Core Team"]
@@ -35,6 +35,16 @@ rand = "0.8"
 
 # Filtros avanzados por regex en las reglas (patrones sobre el nombre del archivo).
 regex = "1"
+
+# Widgets programables en Lua (cajas a medida por el usuario).
+mlua = { version = "0.12", features = ["lua54", "vendored"] }
+
+# Widget Spotify: PKCE (sha256 + base64url) y decodificacion de la portada (JPEG).
+# `image` tambien decodifica las imagenes de los widgets Lua (ctx:image), por
+# eso se habilitan tambien PNG/GIF/BMP ademas de JPEG.
+sha2 = "0.10"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp"] }
 
 # Bindings Win32 / Direct2D / DirectWrite generados a partir de metadatos oficiales.
 # Se fija la version exacta: la forma de los handles (HWND, HDC...) cambia entre releases.

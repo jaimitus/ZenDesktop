@@ -22,9 +22,11 @@ mod config;
 mod i18n;
 mod rules;
 mod settings;
+mod spotify;
 mod ui;
 mod updater;
 mod watcher;
+mod widgets;
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};

@@ -91,6 +91,8 @@ pub struct Report {
     pub skipped: u32,
     pub errors: Vec<String>,
     pub elapsed_ms: u128,
+    /// Movimientos realizados (origen, destino final) para poder deshacerlos.
+    pub moves: Vec<(PathBuf, PathBuf)>,
 }
 
 impl Report {
@@ -361,14 +363,13 @@ pub fn organize(cfg: &Config, desktop: &Path) -> Report {
             report.push_error(&format!("crear {}", target_dir.display()), &err);
             continue;
         }
-        let result = if is_dir {
-            move_into_dir(&path, &target_dir)
-        } else {
-            move_into(&path, &target_dir)
-        };
+        let result = move_into_impl(&path, &target_dir, !is_dir);
         match result {
-            Ok(true) => report.organized += 1,
-            Ok(false) => report.skipped += 1,
+            Ok(Some(dest)) => {
+                report.organized += 1;
+                report.moves.push((path.clone(), dest));
+            }
+            Ok(None) => report.skipped += 1,
             Err(err) => report.push_error(&name, &err),
         }
     }
@@ -547,9 +548,12 @@ pub fn sweep_ephemeral(cfg: &Config, desktop: &Path) -> Report {
                 report.push_error(&format!("crear {}", target.display()), &err);
                 continue;
             }
-            match move_into(&path, &target) {
-                Ok(true) => report.archived += 1,
-                Ok(false) => report.skipped += 1,
+            match move_into_impl(&path, &target, true) {
+                Ok(Some(dest)) => {
+                    report.archived += 1;
+                    report.moves.push((path.clone(), dest));
+                }
+                Ok(None) => report.skipped += 1,
                 Err(err) => report.push_error(&name, &err),
             }
         }
@@ -789,37 +793,45 @@ fn natural_cmp(a: &str, b: &str) -> CmpOrdering {
 // Utilidades de sistema de archivos
 // ---------------------------------------------------------------------------
 
-/// Mueve `src` dentro de `dir` resolviendo colisiones.
-/// Devuelve `Ok(false)` si el archivo estaba bloqueado y hay que reintentar.
-pub fn move_into(src: &Path, dir: &Path) -> io::Result<bool> {
+/// Nucleo comun de movimiento: mueve `src` dentro de `dir` resolviendo
+/// colisiones. Devuelve la ruta de destino final (para poder deshacer) o None
+/// si no hubo movimiento. `cross_volume` permite copiar+borrar cuando origen y
+/// destino estan en volumenes distintos (solo para archivos).
+fn move_into_impl(src: &Path, dir: &Path, cross_volume: bool) -> io::Result<Option<PathBuf>> {
     let name = match src.file_name() {
         Some(n) => n.to_os_string(),
-        None => return Ok(false),
+        None => return Ok(None),
     };
     // Si el archivo ya esta en la carpeta destino, no hacer nada.
-    // Evita duplicados (2) por doble drop o por arrastrar un archivo a su propia carpeta.
+    // Evita duplicados (2) por doble drop o por arrastrar a su propia carpeta.
     if src.parent() == Some(dir) {
-        return Ok(false);
+        return Ok(None);
     }
     let dest = unique_path(dir, &name);
 
     match fs::rename(src, &dest) {
-        Ok(()) => Ok(true),
+        Ok(()) => Ok(Some(dest)),
         Err(err) => {
             let code = err.raw_os_error().unwrap_or(0);
             match code {
                 // ERROR_NOT_SAME_DEVICE: escritorio y destino en volumenes distintos.
-                17 => {
+                17 if cross_volume => {
                     fs::copy(src, &dest)?;
                     fs::remove_file(src)?;
-                    Ok(true)
+                    Ok(Some(dest))
                 }
                 // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION / ERROR_ACCESS_DENIED
-                32 | 33 | 5 => Ok(false),
+                17 | 32 | 33 | 5 => Ok(None),
                 _ => Err(err),
             }
         }
     }
+}
+
+/// Mueve `src` dentro de `dir` resolviendo colisiones.
+/// Devuelve `Ok(false)` si el archivo estaba bloqueado y hay que reintentar.
+pub fn move_into(src: &Path, dir: &Path) -> io::Result<bool> {
+    Ok(move_into_impl(src, dir, true)?.is_some())
 }
 
 /// Mueve una carpeta completa dentro de `dir` resolviendo colisiones.
@@ -827,40 +839,42 @@ pub fn move_into(src: &Path, dir: &Path) -> io::Result<bool> {
 /// carpetas enteras seria demasiado arriesgado); en ese caso se omite y se
 /// reintentara en la siguiente rafaga.
 pub fn move_into_dir(src: &Path, dir: &Path) -> io::Result<bool> {
-    let name = match src.file_name() {
-        Some(n) => n.to_os_string(),
-        None => return Ok(false),
-    };
-    // Si la carpeta ya esta en el destino, no hacer nada.
-    if src.parent() == Some(dir) {
-        return Ok(false);
-    }
-    let dest = unique_path(dir, &name);
-
-    match fs::rename(src, &dest) {
-        Ok(()) => Ok(true),
-        Err(err) => {
-            let code = err.raw_os_error().unwrap_or(0);
-            match code {
-                // ERROR_NOT_SAME_DEVICE: volumen distinto; no copiar arboles.
-                17 => Ok(false),
-                // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION / ERROR_ACCESS_DENIED
-                32 | 33 | 5 => Ok(false),
-                _ => Err(err),
-            }
-        }
-    }
+    Ok(move_into_impl(src, dir, false)?.is_some())
 }
 
 /// Mueve un archivo O una carpeta entera dentro de `dir` (usado al soltar
 /// elementos sobre una caja). Los ficheros aceptan copia entre volumenes;
 /// las carpetas solo se renombran en el mismo volumen (cruzar volumenes con
 /// arboles enteros seria demasiado arriesgado) y se omiten en ese caso.
-pub fn move_into_any(src: &Path, dir: &Path) -> io::Result<bool> {
-    if src.is_dir() {
-        move_into_dir(src, dir)
-    } else {
-        move_into(src, dir)
+/// Devuelve la ruta de destino final (para registrar el movimiento en el
+/// historial de deshacer) o None si no hubo movimiento.
+pub fn move_into_any_tracked(src: &Path, dir: &Path) -> io::Result<Option<PathBuf>> {
+    move_into_impl(src, dir, !src.is_dir())
+}
+
+/// Deshace un movimiento: devuelve `to` a su carpeta original con el nombre
+/// original de `from` (resolviendo colisiones). Devuelve true si se movio.
+pub fn undo_move(from: &Path, to: &Path) -> bool {
+    let (Some(parent), Some(name)) = (from.parent(), from.file_name()) else {
+        return false;
+    };
+    let dest = unique_path(parent, name);
+    match fs::rename(to, &dest) {
+        Ok(()) => true,
+        Err(err) => {
+            let code = err.raw_os_error().unwrap_or(0);
+            match code {
+                // Volumen distinto: copiar y borrar.
+                17 => {
+                    let ok = fs::copy(to, &dest).is_ok();
+                    if ok {
+                        let _ = fs::remove_file(to);
+                    }
+                    ok
+                }
+                _ => false,
+            }
+        }
     }
 }
 
@@ -1039,6 +1053,25 @@ mod tests {
         sort_items_slice(&mut items, "name");
         let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["zeta", "alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn undo_move_restores_original_path() {
+        let base = test_desktop("undo");
+        let src = base.join("nota.txt");
+        let target_dir = base.join("Destino");
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::write(&src, b"x").unwrap();
+
+        // Mueve el fichero dentro de Destino y guarda la ruta final.
+        let dest = move_into_any_tracked(&src, &target_dir).unwrap().unwrap();
+        assert!(!src.exists());
+        assert!(dest.exists());
+
+        // Deshace: el fichero vuelve a su ruta original.
+        assert!(undo_move(&src, &dest));
+        assert!(src.exists());
+        assert!(!dest.exists());
     }
 
     #[test]

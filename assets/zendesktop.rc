@@ -23,12 +23,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "ZenDesktop Core Team"
             VALUE "FileDescription",  "Organizador dinamico de escritorio"
-            VALUE "FileVersion",      "1.0.16"
+            VALUE "FileVersion",      "1.0.17"
             VALUE "InternalName",     "zendesktop"
             VALUE "LegalCopyright",   "MIT"
             VALUE "OriginalFilename", "zendesktop.exe"
             VALUE "ProductName",      "ZenDesktop"
-            VALUE "ProductVersion",   "1.0.16"
+            VALUE "ProductVersion",   "1.0.17"
         END
     END
     BLOCK "VarFileInfo"

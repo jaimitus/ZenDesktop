@@ -117,6 +117,11 @@ pub struct Config {
     /// Idioma de la interfaz: en, es, de, fr, pt, it (ingles por defecto).
     #[serde(default = "default_language")]
     pub language: String,
+    /// Nombres de widgets desactivados (no se crea su caja).
+    #[serde(default)]
+    pub widgets_disabled: Vec<String>,
+    /// Configuracion del widget de Spotify (OAuth PKCE).
+    pub spotify: SpotifyConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +130,8 @@ pub struct AiConfig {
     pub enabled: bool,
     pub ollama_url: String,
     pub model: String,
+    /// Modelo de embeddings para clustering semantico (pequeno y rapido).
+    pub embed_model: String,
     pub timeout_ms: u64,
 }
 
@@ -134,7 +141,29 @@ impl Default for AiConfig {
             enabled: false,
             ollama_url: String::from("http://127.0.0.1:11434"),
             model: String::from("llama3.2"),
+            embed_model: String::from("nomic-embed-text"),
             timeout_ms: 1500,
+        }
+    }
+}
+
+/// Client ID del widget de Spotify (OAuth PKCE, no requiere Client Secret).
+/// Se define aqui en el codigo, no en la interfaz: pega el tuyo de
+/// https://developer.spotify.com/dashboard (Redirect URI: http://127.0.0.1:8899/callback).
+pub const SPOTIFY_CLIENT_ID: &str = "";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpotifyConfig {
+    /// Client ID de la aplicacion registrada en developer.spotify.com (PKCE,
+    /// no requiere Client Secret). Vacio => usa el de `SPOTIFY_CLIENT_ID`.
+    pub client_id: String,
+}
+
+impl Default for SpotifyConfig {
+    fn default() -> Self {
+        SpotifyConfig {
+            client_id: SPOTIFY_CLIENT_ID.into(),
         }
     }
 }
@@ -313,6 +342,9 @@ pub struct FenceLayout {
     pub sort_by: Option<String>,
     pub group_title: Option<String>,
     pub tabs: Vec<String>,
+    /// Nombre del widget (script .lua en la carpeta widgets/) si esta caja es
+    /// un widget en vez de una caja de archivos. None => caja normal.
+    pub widget: Option<String>,
     /// Monitor donde vive la caja (limites de pantalla completa): lo rellena
     /// la captura de plantillas para reposicionar en disposiciones distintas.
     pub monitor: Option<MonitorRect>,
@@ -454,6 +486,7 @@ impl Default for FenceLayout {
             sort_by: None,
             tabs: Vec::new(),
             group_title: None,
+            widget: None,
             monitor: None,
         }
     }
@@ -551,6 +584,8 @@ impl Default for Config {
             templates: Vec::new(),
             last_monitors: Vec::new(),
             language: "en".into(),
+            widgets_disabled: Vec::new(),
+            spotify: SpotifyConfig::default(),
         }
     }
 }
@@ -771,6 +806,12 @@ impl Config {
             }
         }
 
+        // El Client ID de Spotify vive en el codigo; solo se sobreescribe por
+        // config.toml si se puso un valor ahi.
+        if self.spotify.client_id.trim().is_empty() {
+            self.spotify.client_id = SPOTIFY_CLIENT_ID.into();
+        }
+
         let a = &mut self.appearance;
         a.title_size = a.title_size.clamp(8.0, 40.0);
         a.text_size = a.text_size.clamp(7.0, 32.0);
@@ -791,6 +832,8 @@ impl Config {
             e.max_age_days = 14.0;
         }
         e.max_age_days = e.max_age_days.clamp(0.02, 3650.0);
+
+        self.spotify.client_id = self.spotify.client_id.trim().to_string();
 
         // Idioma valido: desconocido o vacio -> ingles.
         self.language = crate::i18n::Lang::from_code(&self.language).code().into();
@@ -840,10 +883,15 @@ impl Config {
                 }
             }
         }
-        // Descarta geometrias huerfanas de reglas eliminadas.
+        // Descarta geometrias huerfanas de reglas eliminadas. Las cajas de
+        // widgets (id "widget:<script>") no corresponden a reglas y se
+        // conservan siempre: si no, un normalize() (p.ej. al recoger la
+        // config del dialogo) las borra y la caja desaparece tras crearla.
         let ids: Vec<String> = self.rules.iter().map(|r| r.id.clone()).collect();
-        self.fences
-            .retain(|f| ids.iter().any(|id| id == f.id.as_str()));
+        self.fences.retain(|f| {
+            f.widget.is_some() || f.tabs.iter().any(|t| ids.iter().any(|id| id == t))
+                || ids.iter().any(|id| id == f.id.as_str())
+        });
     }
 
 
@@ -1342,5 +1390,36 @@ mod tests {
         let mut ephemeral = Config::default();
         ephemeral.ephemeral.max_age_days = 7.0;
         assert!(ephemeral.organize_relevant_changed(&base));
+    }
+
+    #[test]
+    fn normalize_keeps_widget_fences() {
+        // Regression: "Añadir como caja" creaba la caja widget y un
+        // normalize() posterior (collect_cfg -> flush_preview) la borraba
+        // porque su id "widget:<script>" no coincide con ninguna regla.
+        let mut cfg = Config::default();
+        cfg.fences.push(FenceLayout {
+            id: String32::new("widget:clima"),
+            widget: Some("clima".into()),
+            ..Default::default()
+        });
+        cfg.normalize();
+        assert_eq!(
+            cfg.fences
+                .iter()
+                .filter(|f| f.widget.is_some())
+                .count(),
+            1,
+            "normalize() no debe borrar las cajas de widgets"
+        );
+
+        // Las geometrias huerfanas de reglas eliminadas siguen descartandose.
+        let mut cfg = Config::default();
+        cfg.fences.push(FenceLayout {
+            id: String32::new("regla-eliminada"),
+            ..Default::default()
+        });
+        cfg.normalize();
+        assert!(cfg.fences.is_empty());
     }
 }

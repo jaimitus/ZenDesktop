@@ -25,8 +25,14 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
 
 use windows::core::{w, GUID, Interface, Result as WinResult, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{
@@ -34,11 +40,13 @@ use windows::Win32::Foundation::{
     POINTL, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
+    D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+    D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory1, ID2D1SolidColorBrush,
-    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
+    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
     D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
     D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE, D2D1_ELLIPSE, D2D1_ROUNDED_RECT,
 };
@@ -47,8 +55,8 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_MEASURING_MODE_NATURAL,
     DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
-    DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-    DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS, DWRITE_TRIMMING,
+    DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
@@ -110,7 +118,9 @@ use crate::config::{parse_color, wide, Config, FenceLayout, String32};
 use crate::i18n::Tr;
 use crate::rules::{self, FenceContent};
 use crate::settings;
+use crate::spotify;
 use crate::updater;
+use crate::widgets::{self, DrawCmd};
 use crate::watcher::DesktopWatcher;
 
 /// Carpetas que debe vigilar el watcher para una configuracion dada:
@@ -153,8 +163,28 @@ const TIMER_ANIM: usize = 5;
 const TIMER_SCROLL: usize = 6;
 /// Temporizador de retraso de inicio: muestra las cajas tras N segundos.
 const TIMER_STARTUP: usize = 7;
+/// Temporizador periodico (1s) para re-renderizar los widgets (reloj, etc.).
+const TIMER_WIDGET: usize = 8;
 /// Pasos de interpolacion por animacion (8 pasos a 10ms = 80ms).
 const ANIM_STEPS: u8 = 16;
+
+/// El navegador devolvio el codigo de autorizacion de Spotify (hilo redirect -> UI).
+const WM_ZEN_SPOTIFY_AUTH: u32 = WM_APP + 0x17;
+/// Nueva instantanea de "now playing" lista (hilo poller -> UI).
+const WM_ZEN_SPOTIFY_NP: u32 = WM_APP + 0x18;
+/// Cola de reproduccion lista (hilo de trabajo -> UI).
+const WM_ZEN_SPOTIFY_QUEUE: u32 = WM_APP + 0x19;
+
+/// Codigo de autorizacion capturado por el listener de redireccion local.
+static SPOTIFY_AUTH_CODE: Mutex<Option<String>> = Mutex::new(None);
+/// Ultima instantanea de reproduccion (incluye la portada decodificada).
+static SPOTIFY_SNAPSHOT: Mutex<Option<SpotifySnapshot>> = Mutex::new(None);
+/// Evita lanzar varios polls de "now playing" a la vez.
+static SPOTIFY_POLLING: AtomicBool = AtomicBool::new(false);
+/// URL de la ultima portada descargada (evita re-descargar la misma imagen).
+static SPOTIFY_LAST_COVER: Mutex<Option<String>> = Mutex::new(None);
+/// Cola de reproduccion: (context_uri, siguientes pistas).
+static SPOTIFY_QUEUE: Mutex<Option<(String, Vec<spotify::QueueItem>)>> = Mutex::new(None);
 /// Identificador del atajo global Ctrl+Alt+Z ("ZE" en ASCII).
 const HOTKEY_ID: i32 = 0x5A45;
 /// Identificador unico del icono de bandeja ("ZD" en ASCII).
@@ -345,6 +375,17 @@ fn color(hex: &str) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
 }
 
+/// Convierte un ARGB empaquetado (0xAARRGGBB, lo que emiten los widgets Lua)
+/// a un color D2D no premultiplicado.
+fn argb_color(v: u32) -> D2D1_COLOR_F {
+    D2D1_COLOR_F {
+        a: ((v >> 24) & 0xFF) as f32 / 255.0,
+        r: ((v >> 16) & 0xFF) as f32 / 255.0,
+        g: ((v >> 8) & 0xFF) as f32 / 255.0,
+        b: (v & 0xFF) as f32 / 255.0,
+    }
+}
+
 fn with_alpha(c: D2D1_COLOR_F, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F {
         r: c.r,
@@ -396,6 +437,7 @@ impl Theme {
 
 struct Graphics {
     d2d: ID2D1Factory1,
+    font_family: String,
     title_format: IDWriteTextFormat,
     text_format: IDWriteTextFormat,
     meta_format: IDWriteTextFormat,
@@ -466,13 +508,14 @@ impl Graphics {
             meta_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
             center_meta_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
 
-            Ok(Graphics {
-                d2d,
-                title_format,
-                text_format,
-                meta_format,
-                center_meta_format,
-            })
+        Ok(Graphics {
+            d2d,
+            font_family: cfg.appearance.font_family.clone(),
+            title_format,
+            text_format,
+            meta_format,
+            center_meta_format,
+        })
         }
     }
 }
@@ -928,6 +971,236 @@ unsafe fn query_icon_index(path: &[u16], use_attributes: bool) -> Option<i32> {
 // Caja
 // ---------------------------------------------------------------------------
 
+/// Portada decodificada (BGRA premultiplicado no; JPEG opaco => A=255) lista
+/// para construir un ID2D1Bitmap.
+struct CoverData {
+    width: u32,
+    height: u32,
+    bgra: Vec<u8>,
+}
+
+/// Instantanea del estado de reproduccion que el poller entrega a la UI.
+struct SpotifySnapshot {
+    np: spotify::NowPlaying,
+    cover: Option<CoverData>,
+}
+
+/// Geometria (DIP, relativa al contenido bajo la cabecera) del widget Spotify,
+/// compartida por el render y el hit-testing de los controles.
+struct SpotifyLayout {
+    cover: D2D_RECT_F,
+    progress: D2D_RECT_F,
+    volume: D2D_RECT_F,
+    connect: D2D_RECT_F,
+    prev: D2D_RECT_F,
+    play: D2D_RECT_F,
+    next: D2D_RECT_F,
+    text_x: f32,
+    text_w: f32,
+}
+
+fn spotify_layout(w: f32, h: f32) -> SpotifyLayout {
+    let pad = 12.0;
+    let cs = (h - pad * 2.0 - 34.0).clamp(40.0, 96.0);
+    let cover = D2D_RECT_F { left: pad, top: pad, right: pad + cs, bottom: pad + cs };
+    let text_x = pad + cs + pad;
+    let text_w = (w - text_x - pad).max(40.0);
+    // La barra de progreso deja hueco a los lados para los tiempos (mm:ss).
+    let time_w = 34.0;
+    let progress = D2D_RECT_F { left: pad + time_w, top: h - 62.0, right: w - pad - time_w, bottom: h - 57.0 };
+    let volume = D2D_RECT_F { left: pad + 26.0, top: h - 46.0, right: w - pad, bottom: h - 38.0 };
+    let controls_y = h - 32.0;
+    let controls_h = 26.0;
+    let btn_w = ((w - pad * 2.0) / 3.0).clamp(32.0, 56.0);
+    let total_w = btn_w * 3.0;
+    let start_x = pad + ((w - pad * 2.0) - total_w) / 2.0;
+    let prev = D2D_RECT_F { left: start_x, top: controls_y, right: start_x + btn_w, bottom: controls_y + controls_h };
+    let play = D2D_RECT_F { left: start_x + btn_w, top: controls_y, right: start_x + btn_w * 2.0, bottom: controls_y + controls_h };
+    let next = D2D_RECT_F { left: start_x + btn_w * 2.0, top: controls_y, right: start_x + btn_w * 3.0, bottom: controls_y + controls_h };
+    let connect = D2D_RECT_F { left: pad, top: h / 2.0 - 14.0, right: w - pad, bottom: h / 2.0 + 14.0 };
+    SpotifyLayout { cover, progress, volume, connect, prev, play, next, text_x, text_w }
+}
+
+fn point_in(r: &D2D_RECT_F, x: f32, y: f32) -> bool {
+    x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
+}
+
+/// Volumen (0..100) a partir de la posicion X (DIP) sobre el slider.
+fn volume_from_x(lay: &SpotifyLayout, x: f32) -> u8 {
+    let w = (lay.volume.right - lay.volume.left).max(1.0);
+    let t = ((x - lay.volume.left) / w).clamp(0.0, 1.0);
+    (t * 100.0).round() as u8
+}
+
+/// Milisegundos -> "m:ss" (p. ej. 83_000 -> "1:23").
+fn format_time(ms: u32) -> String {
+    let secs = ms / 1000;
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// Boton de cerrar sesion (⏻) en la esquina superior derecha de la cabecera.
+/// Coordenadas DIP relativas a la cabecera (no al contenido).
+fn spotify_logout_rect(w: f32, header_dip: f32) -> D2D_RECT_F {
+    let s = 20.0;
+    D2D_RECT_F {
+        left: w - s - 10.0,
+        top: (header_dip - s) / 2.0,
+        right: w - 10.0,
+        bottom: (header_dip - s) / 2.0 + s,
+    }
+}
+
+/// Boton de cola (☰) a la izquierda del de cerrar sesion en la cabecera.
+fn spotify_queue_btn_rect(w: f32, header_dip: f32) -> D2D_RECT_F {
+    let s = 20.0;
+    D2D_RECT_F {
+        left: w - s * 2.0 - 10.0 - 6.0,
+        top: (header_dip - s) / 2.0,
+        right: w - s - 10.0 - 6.0,
+        bottom: (header_dip - s) / 2.0 + s,
+    }
+}
+
+/// Alto de cada fila de la cola de Spotify (DIP).
+const SPOTIFY_QUEUE_ROW_H: f32 = 34.0;
+
+/// Rectangulo (DIP, relativo al contenido bajo la cabecera) de la fila `idx`
+/// de la cola, teniendo en cuenta el desplazamiento `scroll`. `None` si queda
+/// completamente fuera del area visible `content_h`.
+fn spotify_queue_row_rect(idx: usize, scroll: i32, w: f32, content_h: f32) -> Option<D2D_RECT_F> {
+    let pad = 10.0;
+    let y = pad + idx as f32 * SPOTIFY_QUEUE_ROW_H - scroll as f32 * SPOTIFY_QUEUE_ROW_H;
+    let bottom = y + SPOTIFY_QUEUE_ROW_H;
+    if bottom <= 0.0 || y >= content_h {
+        return None;
+    }
+    Some(D2D_RECT_F { left: pad, top: y, right: w - pad, bottom })
+}
+
+/// Descarga y decodifica la portada (JPEG) a BGRA opaco.
+fn download_cover(url: &str) -> Option<CoverData> {
+    if url.is_empty() {
+        return None;
+    }
+    let resp = ureq::get(url).timeout(Duration::from_secs(8)).call().ok()?;
+    let mut bytes = Vec::new();
+    resp.into_reader().read_to_end(&mut bytes).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let mut bgra = Vec::with_capacity((width * height * 4) as usize);
+    for p in rgba.pixels() {
+        bgra.extend_from_slice(&[p[2], p[1], p[0], 255]);
+    }
+    Some(CoverData { width, height, bgra })
+}
+
+/// Consulta "now playing" y publica el resultado a la UI. Se ejecuta en un
+/// hilo de trabajo (nunca en el hilo de interfaz). `controller` es el valor
+/// crudo del HWND (los handles no son `Send`).
+fn fetch_spotify_and_post(sp: spotify::Spotify, controller: isize) {
+    let np = sp.now_playing().ok().flatten();
+    let snapshot = np.map(|n| {
+        // Solo se descarga/decodifica la portada cuando cambia de URL.
+        let cover = {
+            let mut last = SPOTIFY_LAST_COVER.lock().unwrap();
+            if *last != Some(n.cover_url.clone()) {
+                *last = Some(n.cover_url.clone());
+                download_cover(&n.cover_url)
+            } else {
+                None
+            }
+        };
+        SpotifySnapshot { cover, np: n }
+    });
+    *SPOTIFY_SNAPSHOT.lock().unwrap() = snapshot;
+    let _ = unsafe { PostMessageW(HWND(controller as *mut c_void), WM_ZEN_SPOTIFY_NP, WPARAM(0), LPARAM(0)) };
+}
+
+/// Consulta la cola de reproduccion y publica el resultado a la UI.
+fn fetch_spotify_queue(sp: spotify::Spotify, controller: isize) {
+    thread::spawn(move || {
+        let q = sp.queue().ok().unwrap_or_default();
+        *SPOTIFY_QUEUE.lock().unwrap() = Some((q.context_uri, q.next));
+        let _ = unsafe { PostMessageW(HWND(controller as *mut c_void), WM_ZEN_SPOTIFY_QUEUE, WPARAM(0), LPARAM(0)) };
+    });
+}
+
+/// Poll de "now playing" con guarda anti-solapamiento (un solo poll en vuelo).
+fn poll_spotify_now(sp: spotify::Spotify, controller: isize) {
+    if SPOTIFY_POLLING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    thread::spawn(move || {
+        fetch_spotify_and_post(sp, controller);
+        SPOTIFY_POLLING.store(false, Ordering::SeqCst);
+    });
+}
+
+fn url_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn parse_code_from_request(req: &str) -> Option<String> {
+    let first = req.lines().next()?;
+    let path = first.split_whitespace().nth(1)?;
+    let query = path.split('?').nth(1)?;
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=')?;
+        if k == "code" {
+            let code = url_decode(v.trim());
+            if !code.is_empty() {
+                return Some(code);
+            }
+        }
+    }
+    None
+}
+
+/// Escucha UNA conexion en 127.0.0.1:8899 (la redireccion del navegador),
+/// extrae el codigo y lo entrega a la UI por mensaje.
+fn start_spotify_redirect(controller: isize) {
+    thread::spawn(move || {
+        let listener = match TcpListener::bind(("127.0.0.1", spotify::REDIRECT_PORT)) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let Ok((mut stream, _)) = listener.accept() else { return };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut buf = [0u8; 4096];
+        let Ok(n) = stream.read(&mut buf) else { return };
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let code = parse_code_from_request(&req);
+        let (status, html) = match &code {
+            Some(_) => ("200 OK", "ZenDesktop: ya puedes cerrar esta pestaña."),
+            None => ("400 Bad Request", "No se pudo completar la autorización."),
+        };
+        let body = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+            html.len()
+        );
+        let _ = stream.write_all(body.as_bytes());
+        if let Some(code) = code {
+            *SPOTIFY_AUTH_CODE.lock().unwrap() = Some(code);
+            let _ = unsafe { PostMessageW(HWND(controller as *mut c_void), WM_ZEN_SPOTIFY_AUTH, WPARAM(0), LPARAM(0)) };
+        }
+    });
+}
+
 #[derive(Clone, PartialEq)]
 enum DragMode {
     None,
@@ -1110,6 +1383,13 @@ impl Fence {
 // Aplicacion
 // ---------------------------------------------------------------------------
 
+/// Operacion reversible de archivo (para Ctrl+Z). `from` es la ruta original
+/// y `to` la ruta actual tras mover o renombrar.
+struct UndoOp {
+    from: PathBuf,
+    to: PathBuf,
+}
+
 pub struct App {
     cfg: Config,
     cfg_path: PathBuf,
@@ -1185,6 +1465,28 @@ pub struct App {
     deferred_config: Option<Config>,
     /// Archivos devueltos al escritorio: saltar el proximo organize.
     skip_next_organize: bool,
+    /// Historial de operaciones de archivo reversibles (Ctrl+Z).
+    undo_stack: Vec<UndoOp>,
+    /// Widgets programables en Lua (cajas a medida).
+    widget_host: widgets::WidgetHost,
+    /// Backend del widget de Spotify (PKCE + Web API).
+    spotify: spotify::Spotify,
+    /// Ultima reproduccion conocida (para pintar el widget nativo).
+    spotify_np: Option<spotify::NowPlaying>,
+    /// Portada decodificada de la ultima reproduccion conocida.
+    spotify_cover: Option<CoverData>,
+    /// Marca de tiempo (ms) del ultimo poll de "now playing" (para throttling).
+    spotify_last_poll: u64,
+    /// true mientras se arrastra el slider de volumen del widget Spotify.
+    spotify_volume_drag: bool,
+    /// Cola de reproduccion (contexto + siguientes pistas).
+    spotify_queue: Vec<spotify::QueueItem>,
+    /// URI del contexto de la cola (para saltar manteniendola).
+    spotify_context_uri: String,
+    /// true si el widget muestra la cola en vez del "now playing".
+    spotify_show_queue: bool,
+    /// Desplazamiento (en filas) de la lista de la cola de Spotify.
+    spotify_queue_scroll: i32,
     /// Salir al cerrar el dialogo de configuracion (tras instalar una
     /// actualizacion desde el panel de Updates).
     quit_after_settings: bool,
@@ -1316,6 +1618,21 @@ impl App {
             let gfx = Graphics::new(&cfg)?;
             let theme = Theme::from_config(&cfg);
             let tr = Tr::get(cfg.lang());
+            // Los widgets viven en <carpeta de config>/widgets/*.lua. Si aun no
+            // hay ninguno, se instalan los ejemplos empaquetados (reloj, notas,
+            // clima); los de la fase CONFIG retirada se restauran.
+            let widgets_dir = cfg_path
+                .parent()
+                .map(|p| p.join("widgets"))
+                .unwrap_or_else(|| PathBuf::from("widgets"));
+            widgets::install_bundled_examples(&widgets_dir);
+            let widget_host = widgets::WidgetHost::load_dir(&widgets_dir);
+            // Tokens de Spotify viven junto a la config (no en config.toml).
+            let spotify_store = cfg_path
+                .parent()
+                .map(|p| p.join("spotify.json"))
+                .unwrap_or_else(|| PathBuf::from("spotify.json"));
+            let spotify = spotify::Spotify::new(cfg.spotify.client_id.clone(), spotify_store);
 
             let mut app = Box::new(App {
                 cfg,
@@ -1365,6 +1682,17 @@ impl App {
                 pending_toast: None,
                 deferred_config: None,
                 skip_next_organize: false,
+                undo_stack: Vec::new(),
+                widget_host,
+                spotify,
+                spotify_np: None,
+                spotify_cover: None,
+                spotify_last_poll: 0,
+                spotify_volume_drag: false,
+                spotify_queue: Vec::new(),
+                spotify_context_uri: String::new(),
+                spotify_show_queue: false,
+                spotify_queue_scroll: 0,
                 quit_after_settings: false,
                 startup_pending: false,
             });
@@ -1399,6 +1727,8 @@ impl App {
                 Some(ptr as *const c_void),
             )?;
             (*ptr).controller = controller;
+            // Los widgets Lua repintan cuando termina una descarga en segundo plano.
+            widgets::set_widget_controller(controller.0 as isize);
 
             let delay_secs = (*ptr).cfg.general.startup_delay_seconds;
             (*ptr).startup_pending = delay_secs > 0;
@@ -1469,6 +1799,9 @@ impl App {
                 let _ = SetTimer(controller, TIMER_STARTUP, delay_secs * 1000, None);
             }
 
+            // Tick de widgets: 1s para refrescar relojes y similares.
+            let _ = SetTimer(controller, TIMER_WIDGET, 1000, None);
+
             Ok(AppHandle { app: ptr })
         }
     }
@@ -1477,6 +1810,21 @@ impl App {
 
     fn watch_paths(&self) -> Vec<PathBuf> {
         watch_paths_for(&self.cfg, &self.desktop, &self.extra_desktops)
+    }
+
+    /// Carpeta de scripts de widgets (`<dir de config>/widgets`).
+    pub fn widgets_dir(&self) -> PathBuf {
+        self.cfg_path
+            .parent()
+            .map(|p| p.join("widgets"))
+            .unwrap_or_else(|| PathBuf::from("widgets"))
+    }
+
+    /// Recarga los scripts Lua (los cambios de codigo surten efecto en el
+    /// siguiente render, sin reconstruir las cajas).
+    pub fn reload_widgets(&mut self) {
+        let dir = self.widgets_dir();
+        self.widget_host = widgets::WidgetHost::load_dir(&dir);
     }
 
     /// Crea una ventana por regla activa y calcula la geometria inicial.
@@ -1589,6 +1937,7 @@ impl App {
                 sort_by: None,
                 tabs: Vec::new(),
                 group_title: None,
+                widget: None,
                 monitor: None,
             };
             let tabs = vec![make_tab(content)];
@@ -1670,6 +2019,99 @@ impl App {
             DragAcceptFiles(hwnd, true);
         }
 
+        // Cajas widget: layouts con `widget: Some(nombre)` que no corresponden
+        // a reglas de archivo. Cada una ejecuta su script Lua en `render`.
+        let widget_layouts: Vec<FenceLayout> = self
+            .cfg
+            .fences
+            .iter()
+            .filter(|l| {
+                l.widget
+                    .as_ref()
+                    .is_some_and(|w| !self.cfg.widgets_disabled.iter().any(|d| d == w))
+            })
+            .cloned()
+            .collect();
+        for layout in widget_layouts {
+            let widget_name = layout.widget.clone().unwrap_or_default();
+            let title = self
+                .widget_host
+                .get(&widget_name)
+                .map(|w| w.title.clone())
+                .unwrap_or(widget_name.clone());
+            let content = FenceContent {
+                id: format!("widget:{widget_name}"),
+                title,
+                color: "#38BDF8".into(),
+                view_mode: "list".into(),
+                icon_size: None,
+                folder: None,
+                items: Vec::new(),
+            };
+            let tab = FenceTab {
+                content,
+                selected: HashSet::new(),
+                cursor: None,
+                scroll: 0,
+                smooth_scroll: 0.0,
+                search_focused: false,
+                search_text: String::new(),
+                rename_item: None,
+                rename_text: String::new(),
+                rename_path: None,
+            };
+            let hwnd = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                CLASS_FENCE,
+                w!("ZenDesktop Fence"),
+                WS_POPUP,
+                layout.x,
+                layout.y,
+                layout.width,
+                layout.height,
+                None,
+                None,
+                self.instance,
+                Some(self as *mut App as *const c_void),
+            )?;
+            let dpi = GetDpiForWindow(hwnd) as f32;
+            let fence = Fence {
+                hwnd,
+                tabs: vec![tab],
+                active_tab: 0,
+                accent: color("#38BDF8"),
+                layout: layout.clone(),
+                surface: None,
+                hover: -1,
+                hover_lock: false,
+                hover_pin: false,
+                is_mouse_over: false,
+                rubberband: None,
+                drag: DragMode::None,
+                anchor: POINT::default(),
+                origin: layout.clone(),
+                scale: if dpi > 0.0 { dpi / 96.0 } else { 1.0 },
+                reorder_drop: None,
+                sort_mode: None,
+                hit_row_h: self.theme.row,
+                item_pin_btn: None,
+                anim_step: 0,
+                anim_kind: 0,
+            };
+            self.fences.push(fence);
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_BOTTOM,
+                layout.x,
+                layout.y,
+                layout.width,
+                layout.height,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+            let _ = ShowWindow(hwnd, SW_SHOWNA);
+            self.fences.last_mut().unwrap().layout = layout;
+        }
+
         // Mientras el retraso de inicio este pendiente, las cajas reconstruidas
         // (p.ej. por el watcher durante el arranque) se vuelven a ocultar.
         if self.startup_pending {
@@ -1711,7 +2153,8 @@ impl App {
         };
         let mut moved = 0usize;
         for src in paths {
-            if rules::move_into_any(&src, &folder).unwrap_or(false) {
+            if let Ok(Some(dest)) = rules::move_into_any_tracked(&src, &folder) {
+                self.undo_stack.push(UndoOp { from: src, to: dest });
                 moved += 1;
             }
         }
@@ -1734,7 +2177,8 @@ impl App {
     unsafe fn drop_to_desktop(&mut self, paths: Vec<PathBuf>) -> usize {
         let mut moved = 0usize;
         for src in paths {
-            if rules::move_into_any(&src, &self.desktop).unwrap_or(false) {
+            if let Ok(Some(dest)) = rules::move_into_any_tracked(&src, &self.desktop) {
+                self.undo_stack.push(UndoOp { from: src, to: dest });
                 moved += 1;
             }
         }
@@ -1759,7 +2203,8 @@ impl App {
     unsafe fn move_paths_to(&mut self, dest: &Path, dest_name: &str, paths: Vec<PathBuf>) -> usize {
         let mut moved = 0usize;
         for src in paths {
-            if rules::move_into_any(&src, dest).unwrap_or(false) {
+            if let Ok(Some(final_dest)) = rules::move_into_any_tracked(&src, dest) {
+                self.undo_stack.push(UndoOp { from: src, to: final_dest });
                 moved += 1;
             }
         }
@@ -1821,6 +2266,9 @@ impl App {
         let mut sort_overrides: std::collections::HashMap<String, Option<String>> = std::collections::HashMap::new();
         let mut total_tabs = 0;
         for fence in &self.fences {
+            if fence.layout.widget.is_some() {
+                continue; // las cajas widget no tienen contenido de archivos.
+            }
             for tab in &fence.tabs {
                 sort_overrides.insert(tab.content.id.clone(), fence.sort_mode.clone());
                 total_tabs += 1;
@@ -1840,6 +2288,9 @@ impl App {
             content_map.insert(c.id.clone(), c);
         }
         for fence in &mut self.fences {
+            if fence.layout.widget.is_some() {
+                continue; // las cajas widget no se tocan aqui.
+            }
             for tab in &mut fence.tabs {
                 if let Some(c) = content_map.remove(&tab.content.id) {
                     tab.content = c;
@@ -1887,6 +2338,9 @@ impl App {
     fn render(&mut self, index: usize) -> WinResult<()> {
         if self.zen || index >= self.fences.len() {
             return Ok(());
+        }
+        if self.fences[index].layout.widget.is_some() {
+            return self.render_widget_fence(index);
         }
         let theme_ptr: *const Theme = &self.theme;
         let gfx_ptr: *const Graphics = &self.gfx;
@@ -2893,6 +3347,805 @@ impl App {
         Ok(())
     }
 
+    /// Dibuja texto de widget con tamano y alineacion exactos (medidos con
+    /// DirectWrite), en vez de usar los formatos fijos de la UI. `align`:
+    /// 0 = izquierda, 1 = centrado, 2 = derecha.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_widget_text(
+        target: &ID2D1DCRenderTarget,
+        brush: &ID2D1SolidColorBrush,
+        family: &str,
+        scale: f32,
+        text: &str,
+        x: f32,
+        y: f32,
+        size: f32,
+        color: u32,
+        align: u8,
+    ) {
+        unsafe {
+            let Ok(dwrite) = DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED) else {
+                return;
+            };
+            let fw = wide(family);
+            let Ok(fmt) = dwrite.CreateTextFormat(
+                PCWSTR(fw.as_ptr()),
+                None,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                size.max(6.0),
+                w!(""),
+            ) else {
+                return;
+            };
+            let Ok(layout) = dwrite.CreateTextLayout(&wide_str(text), &fmt, 4096.0, 4096.0) else {
+                return;
+            };
+            let mut metrics = std::mem::MaybeUninit::<DWRITE_TEXT_METRICS>::uninit();
+            if layout.GetMetrics(metrics.as_mut_ptr()).is_err() {
+                return;
+            }
+            let metrics = metrics.assume_init();
+            let (tw, _th) = (metrics.width, metrics.height);
+            let (mut x0, y0) = (x, y);
+            match align {
+                1 => x0 = x - tw * 0.5,
+                2 => x0 = x - tw,
+                _ => {}
+            }
+            brush.SetColor(&argb_color(color));
+            target.DrawTextLayout(
+                D2D_POINT_2F { x: x0 * scale, y: y0 * scale },
+                &layout,
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+            );
+        }
+    }
+
+    /// Renderiza una caja widget: marco + cabecera + escena emitida por el
+    /// script Lua. Reutiliza la misma superficie DIB que una caja normal.
+    fn render_widget_fence(&mut self, index: usize) -> WinResult<()> {
+        let widget_name = self.fences[index].layout.widget.clone().unwrap_or_default();
+        // El widget de Spotify se pinta nativo (portada, controles, etc.).
+        if widget_name == "spotify" {
+            return self.render_spotify_fence(index);
+        }
+        let theme_ptr: *const Theme = &self.theme;
+        let gfx_ptr: *const Graphics = &self.gfx;
+        let theme = unsafe { &*theme_ptr };
+        let gfx = unsafe { &*gfx_ptr };
+
+        // Geometria en DIP para el script, antes de tomar la caja en prestamo.
+        let (w_dip, h_dip) = {
+            let f = &self.fences[index];
+            let s = f.scale;
+            let width = f.layout.width.max(80);
+            let visual = f.visible_height(theme).max(28);
+            (width as f32 / s, visual as f32 / s)
+        };
+        let scene = match self.widget_host.get_mut(&widget_name) {
+            Some(w) => w.render(w_dip, h_dip),
+            None => Vec::new(),
+        };
+
+        let fence = &mut self.fences[index];
+        let width = fence.layout.width.max(80);
+        let visual_height = fence.visible_height(theme).max(28);
+        let scale = fence.scale;
+
+        unsafe {
+            let recreate = match &fence.surface {
+                Some(s) => s.width != width || s.height != visual_height,
+                None => true,
+            };
+            if recreate {
+                fence.surface = Some(Surface::new(gfx, width, visual_height)?);
+            }
+            let surface = match fence.surface.as_ref() {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+            let bounds = RECT {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: visual_height,
+            };
+            surface.target.BindDC(surface.dc, &bounds)?;
+            surface.target.BeginDraw();
+            surface.target.Clear(Some(&D2D1_COLOR_F {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            }));
+
+            let w = width as f32 / scale;
+            let h = visual_height as f32 / scale;
+            let radius = theme.radius;
+            let brush = &surface.brush;
+
+            // Sombra, fondo y borde (identicos a una caja normal).
+            brush.SetColor(&theme.shadow);
+            surface.target.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: rect(1.5 * scale, 2.5 * scale, (w - 1.5) * scale, (h - 0.5) * scale),
+                    radiusX: radius * scale,
+                    radiusY: radius * scale,
+                },
+                brush,
+            );
+            brush.SetColor(&theme.background);
+            let body = D2D1_ROUNDED_RECT {
+                rect: rect(0.0, 0.0, (w - 1.0) * scale, (h - 1.5) * scale),
+                radiusX: radius * scale,
+                radiusY: radius * scale,
+            };
+            surface.target.FillRoundedRectangle(&body, brush);
+            brush.SetColor(&theme.border);
+            surface.target.DrawRoundedRectangle(&body, brush, theme.border_width * scale, None);
+
+            // Cabecera: fondo + divisoria + titulo.
+            let header_h = fence.header_h(theme) * scale;
+            let base_h = theme.header * scale;
+            brush.SetColor(&with_alpha(theme.text, 0.035));
+            surface.target.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: rect(0.0, 0.0, w * scale, header_h),
+                    radiusX: radius * scale,
+                    radiusY: radius * scale,
+                },
+                brush,
+            );
+            let pad = theme.padding * scale;
+            brush.SetColor(&with_alpha(theme.border, 0.30));
+            surface.target.DrawLine(
+                D2D_POINT_2F { x: pad * 0.5, y: header_h },
+                D2D_POINT_2F { x: (w - theme.padding * 0.5) * scale, y: header_h },
+                brush,
+                1.0 * scale,
+                None,
+            );
+            let title = wide_str(&fence.tabs[0].content.title);
+            brush.SetColor(&theme.title);
+            surface.target.DrawText(
+                &title,
+                &gfx.title_format,
+                &rect(pad + 10.0 * scale, 0.0, (w - pad) * scale, base_h),
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+
+            // Escena del widget, desplazada bajo la cabecera.
+            for cmd in &scene {
+                match cmd {
+                    DrawCmd::FillRect { x, y, w: cw, h: ch, color: c } => {
+                        brush.SetColor(&argb_color(*c));
+                        surface.target.FillRectangle(
+                            &rect(x * scale, header_h + y * scale, (x + cw) * scale, header_h + (y + ch) * scale),
+                            brush,
+                        );
+                    }
+                    DrawCmd::Text { x, y, text, size, color: c } => {
+                        let fmt = if *size >= 20.0 { &gfx.title_format } else { &gfx.text_format };
+                        brush.SetColor(&argb_color(*c));
+                        let txt = wide_str(text);
+                        surface.target.DrawText(
+                            &txt,
+                            fmt,
+                            &rect(x * scale, header_h + y * scale, w * scale, header_h + (y + size) * scale),
+                            brush,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                    }
+                    DrawCmd::Progress { x, y, w: cw, h: ch, value, color: c, bg } => {
+                        let px = x * scale;
+                        let py = header_h + y * scale;
+                        let pw = cw * scale;
+                        let ph = ch * scale;
+                        let half = ph * 0.5;
+                        brush.SetColor(&argb_color(*bg));
+                        surface.target.FillRoundedRectangle(
+                            &D2D1_ROUNDED_RECT {
+                                rect: rect(px, py, px + pw, py + ph),
+                                radiusX: half,
+                                radiusY: half,
+                            },
+                            brush,
+                        );
+                        brush.SetColor(&argb_color(*c));
+                        let fw = (pw * value.clamp(0.0, 1.0)).max(ph);
+                        surface.target.FillRoundedRectangle(
+                            &D2D1_ROUNDED_RECT {
+                                rect: rect(px, py, px + fw, py + ph),
+                                radiusX: half,
+                                radiusY: half,
+                            },
+                            brush,
+                        );
+                    }
+                    DrawCmd::Line { x1, y1, x2, y2, width, color: c } => {
+                        brush.SetColor(&argb_color(*c));
+                        surface.target.DrawLine(
+                            D2D_POINT_2F { x: x1 * scale, y: header_h + y1 * scale },
+                            D2D_POINT_2F { x: x2 * scale, y: header_h + y2 * scale },
+                            brush,
+                            width * scale,
+                            None,
+                        );
+                    }
+                    DrawCmd::Circle { cx, cy, r, color: c } => {
+                        brush.SetColor(&argb_color(*c));
+                        let e = D2D1_ELLIPSE {
+                            point: D2D_POINT_2F { x: cx * scale, y: header_h + cy * scale },
+                            radiusX: r * scale,
+                            radiusY: r * scale,
+                        };
+                        surface.target.FillEllipse(&e, brush);
+                    }
+                    DrawCmd::CircleStroke { cx, cy, r, width, color: c } => {
+                        brush.SetColor(&argb_color(*c));
+                        let e = D2D1_ELLIPSE {
+                            point: D2D_POINT_2F { x: cx * scale, y: header_h + cy * scale },
+                            radiusX: r * scale,
+                            radiusY: r * scale,
+                        };
+                        surface.target.DrawEllipse(&e, brush, width * scale, None);
+                    }
+                    DrawCmd::RoundRect { x, y, w: cw, h: ch, radius: rr, color: c, border_width, border_color } => {
+                        let rr = D2D1_ROUNDED_RECT {
+                            rect: rect(x * scale, header_h + y * scale, (x + cw) * scale, header_h + (y + ch) * scale),
+                            radiusX: rr * scale,
+                            radiusY: rr * scale,
+                        };
+                        brush.SetColor(&argb_color(*c));
+                        surface.target.FillRoundedRectangle(&rr, brush);
+                        if *border_width > 0.0 {
+                            brush.SetColor(&argb_color(*border_color));
+                            surface.target.DrawRoundedRectangle(&rr, brush, border_width * scale, None);
+                        }
+                    }
+                    DrawCmd::TextCenter { x, y, text, size, color: c } => {
+                        Self::draw_widget_text(&surface.target, &surface.brush, &gfx.font_family, scale, text, *x, header_h / scale + *y, *size, *c, 1);
+                    }
+                    DrawCmd::TextRight { x, y, text, size, color: c } => {
+                        Self::draw_widget_text(&surface.target, &surface.brush, &gfx.font_family, scale, text, *x, header_h / scale + *y, *size, *c, 2);
+                    }
+                    DrawCmd::Image { url, x, y, w: cw, h: ch } => {
+                        let px = x * scale;
+                        let py = header_h + y * scale;
+                        let pw = cw * scale;
+                        let ph = ch * scale;
+                        if let Some(img) = crate::widgets::image_pixels(url) {
+                            if let Ok(bitmap) = surface.target.CreateBitmap(
+                                D2D_SIZE_U { width: img.width, height: img.height },
+                                Some(img.bgra.as_ptr() as *const c_void),
+                                img.width * 4,
+                                &D2D1_BITMAP_PROPERTIES {
+                                    pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                                    dpiX: 96.0,
+                                    dpiY: 96.0,
+                                },
+                            ) {
+                                let dest = D2D_RECT_F { left: px, top: py, right: px + pw, bottom: py + ph };
+                                surface.target.DrawBitmap(&bitmap, Some(&dest), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                            }
+                        } else {
+                            brush.SetColor(&with_alpha(theme.text, 0.06));
+                            surface.target.FillRectangle(&rect(px, py, px + pw, py + ph), brush);
+                        }
+                    }
+                }
+            }
+
+            surface.target.EndDraw(None, None)?;
+
+            let screen = GetDC(None);
+            let position = POINT { x: fence.layout.x, y: fence.layout.y };
+            let size = SIZE { cx: width, cy: visual_height };
+            let source = POINT { x: 0, y: 0 };
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let result = UpdateLayeredWindow(
+                fence.hwnd,
+                screen,
+                Some(&position as *const POINT),
+                Some(&size as *const SIZE),
+                surface.dc,
+                Some(&source as *const POINT),
+                COLORREF(0),
+                Some(&blend as *const BLENDFUNCTION),
+                ULW_ALPHA,
+            );
+            let _ = ReleaseDC(None, screen);
+            result?;
+        }
+        Ok(())
+    }
+
+    /// Re-renderiza las cajas widget (1 tick/segundo) para refrescar relojes
+    /// y widgets dependientes del tiempo.
+    fn widget_tick(&mut self) {
+        self.spotify_tick();
+        let indices: Vec<usize> = self
+            .fences
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.layout.widget.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        for i in indices {
+            let _ = self.render(i);
+        }
+    }
+
+    // -- widget Spotify (nativo) -------------------------------------------
+
+    fn spotify_present(&self) -> bool {
+        self.fences.iter().any(|f| f.layout.widget.as_deref() == Some("spotify"))
+    }
+
+    /// Poll de "now playing" con throttle (3s) mientras el widget este visible.
+    fn spotify_tick(&mut self) {
+        if !self.spotify_present() {
+            return;
+        }
+        if self.spotify.status() != spotify::Status::Ready {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if now.saturating_sub(self.spotify_last_poll) < 3000 {
+            return;
+        }
+        self.spotify_last_poll = now;
+        poll_spotify_now(self.spotify.clone(), self.controller.0 as isize);
+    }
+
+    /// Inicia el flujo OAuth: abre el navegador y escucha la redireccion local.
+    fn spotify_connect(&mut self) {
+        let Ok(url) = self.spotify.authorize_url() else { return };
+        let wurl = wide(&url);
+        unsafe {
+            let _ = ShellExecuteW(None, w!("open"), PCWSTR(wurl.as_ptr()), None, None, SW_SHOWNORMAL);
+        }
+        start_spotify_redirect(self.controller.0 as isize);
+    }
+
+    /// Alterna entre la vista "now playing" y la cola de reproduccion.
+    fn spotify_toggle_queue(&mut self) {
+        if self.spotify_show_queue {
+            self.spotify_show_queue = false;
+        } else {
+            self.spotify_show_queue = true;
+            self.spotify_queue_scroll = 0;
+            self.spotify_queue.clear();
+            self.spotify_context_uri.clear();
+            fetch_spotify_queue(self.spotify.clone(), self.controller.0 as isize);
+        }
+        self.render_all();
+    }
+
+    /// Copia la cola del hilo de trabajo a la app y repinta.
+    fn spotify_apply_queue(&mut self) {
+        if let Some((ctx, next)) = SPOTIFY_QUEUE.lock().unwrap().take() {
+            self.spotify_context_uri = ctx;
+            self.spotify_queue = next;
+        }
+        self.render_all();
+    }
+
+    /// Salta a una pista de la cola y vuelve a la vista "now playing".
+    fn spotify_play_track(&mut self, uri: String) {
+        self.spotify_show_queue = false;
+        let sp = self.spotify.clone();
+        let ctx = self.spotify_context_uri.clone();
+        let controller = self.controller.0 as isize;
+        thread::spawn(move || {
+            let _ = sp.play_track(&ctx, &uri);
+            thread::sleep(Duration::from_millis(500));
+            fetch_spotify_and_post(sp, controller);
+        });
+        self.render_all();
+    }
+
+    /// Cierra la sesion de Spotify: olvida el token y limpia el estado del widget.
+    fn spotify_sign_out(&mut self) {
+        self.spotify.sign_out();
+        self.spotify_np = None;
+        self.spotify_cover = None;
+        self.spotify_queue.clear();
+        self.spotify_context_uri.clear();
+        self.spotify_show_queue = false;
+        *SPOTIFY_LAST_COVER.lock().unwrap() = None;
+        self.render_all();
+    }
+
+    /// Ajusta el volumen: actualiza el estado local al instante y envia el
+    /// cambio a Spotify en un hilo de trabajo.
+    fn spotify_set_volume(&mut self, percent: u8) {
+        if let Some(np) = self.spotify_np.as_mut() {
+            np.volume_percent = percent;
+        }
+        let sp = self.spotify.clone();
+        thread::spawn(move || {
+            let _ = sp.set_volume(percent);
+        });
+    }
+
+    /// Control de reproduccion (0=anterior, 1=play/pausa, 2=siguiente) en un
+    /// hilo de trabajo; refresca el estado al terminar.
+    fn spotify_control(&self, action: u8) {
+        let sp = self.spotify.clone();
+        let playing = self.spotify_np.as_ref().map(|n| n.is_playing).unwrap_or(false);
+        let controller = self.controller.0 as isize;
+        thread::spawn(move || {
+            let _ = match action {
+                0 => sp.previous(),
+                1 => sp.set_playing(!playing),
+                2 => sp.next(),
+                _ => Ok(()),
+            };
+            // Pequena espera para que Spotify aplique el cambio.
+            thread::sleep(Duration::from_millis(400));
+            fetch_spotify_and_post(sp, controller);
+        });
+    }
+
+    /// Copia la instantanea del poller a la app y repinta.
+    fn spotify_apply_snapshot(&mut self) {
+        if let Some(snap) = SPOTIFY_SNAPSHOT.lock().unwrap().take() {
+            self.spotify_np = Some(snap.np);
+            // La portada solo llega cuando cambia (None = conservar la actual).
+            if let Some(c) = snap.cover {
+                self.spotify_cover = Some(c);
+            }
+        }
+        self.render_all();
+    }
+
+    /// Renderiza la caja widget de Spotify: marco + cabecera + escena nativa
+    /// (portada, metadatos, progreso y controles).
+    fn render_spotify_fence(&mut self, index: usize) -> WinResult<()> {
+        let theme_ptr: *const Theme = &self.theme;
+        let gfx_ptr: *const Graphics = &self.gfx;
+        let theme = unsafe { &*theme_ptr };
+        let gfx = unsafe { &*gfx_ptr };
+
+        let status = self.spotify.status();
+        let np = self.spotify_np.clone();
+        let cover = self
+            .spotify_cover
+            .as_ref()
+            .map(|c| (c.width, c.height, c.bgra.clone()));
+        let show_queue = self.spotify_show_queue;
+        let queue = self.spotify_queue.clone();
+        let queue_scroll = self.spotify_queue_scroll;
+
+        let (w_dip, h_dip, header_dip) = {
+            let f = &self.fences[index];
+            let s = f.scale;
+            let width = f.layout.width.max(80);
+            let visual = f.visible_height(theme).max(28);
+            (width as f32 / s, visual as f32 / s, f.header_h(theme))
+        };
+        let lay = spotify_layout(w_dip, (h_dip - header_dip).max(40.0));
+
+        let fence = &mut self.fences[index];
+        let width = fence.layout.width.max(80);
+        let visual_height = fence.visible_height(theme).max(28);
+        let scale = fence.scale;
+
+        unsafe {
+            let recreate = match &fence.surface {
+                Some(s) => s.width != width || s.height != visual_height,
+                None => true,
+            };
+            if recreate {
+                fence.surface = Some(Surface::new(gfx, width, visual_height)?);
+            }
+            let surface = match fence.surface.as_ref() {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+            let bounds = RECT { left: 0, top: 0, right: width, bottom: visual_height };
+            surface.target.BindDC(surface.dc, &bounds)?;
+            surface.target.BeginDraw();
+            surface.target.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+
+            let w = width as f32 / scale;
+            let h = visual_height as f32 / scale;
+            let radius = theme.radius;
+            let brush = &surface.brush;
+
+            // Sombra, fondo y borde.
+            brush.SetColor(&theme.shadow);
+            surface.target.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT { rect: rect(1.5 * scale, 2.5 * scale, (w - 1.5) * scale, (h - 0.5) * scale), radiusX: radius * scale, radiusY: radius * scale },
+                brush,
+            );
+            brush.SetColor(&theme.background);
+            let body = D2D1_ROUNDED_RECT { rect: rect(0.0, 0.0, (w - 1.0) * scale, (h - 1.5) * scale), radiusX: radius * scale, radiusY: radius * scale };
+            surface.target.FillRoundedRectangle(&body, brush);
+            brush.SetColor(&theme.border);
+            surface.target.DrawRoundedRectangle(&body, brush, theme.border_width * scale, None);
+
+            // Cabecera.
+            let header_h = header_dip * scale;
+            let base_h = theme.header * scale;
+            brush.SetColor(&with_alpha(theme.text, 0.035));
+            surface.target.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT { rect: rect(0.0, 0.0, w * scale, header_h), radiusX: radius * scale, radiusY: radius * scale },
+                brush,
+            );
+            let pad = theme.padding * scale;
+            brush.SetColor(&with_alpha(theme.border, 0.30));
+            surface.target.DrawLine(
+                D2D_POINT_2F { x: pad * 0.5, y: header_h },
+                D2D_POINT_2F { x: (w - theme.padding * 0.5) * scale, y: header_h },
+                brush,
+                1.0 * scale,
+                None,
+            );
+            let title = wide_str("Spotify");
+            brush.SetColor(&theme.title);
+            surface.target.DrawText(
+                &title,
+                &gfx.title_format,
+                &rect(pad + 10.0 * scale, 0.0, (w - pad) * scale, base_h),
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+
+            // Boton de cola (☰) y cerrar sesion (⏻) en la cabecera, si hay sesion.
+            if status == spotify::Status::Ready {
+                let qr = spotify_queue_btn_rect(w, header_dip);
+                brush.SetColor(&with_alpha(theme.text, if show_queue { 1.0 } else { 0.6 }));
+                surface.target.DrawText(
+                    &wide_str("☰"),
+                    &gfx.center_meta_format,
+                    &rect(qr.left * scale, qr.top * scale, qr.right * scale, qr.bottom * scale),
+                    brush,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+                let lr = spotify_logout_rect(w, header_dip);
+                brush.SetColor(&with_alpha(theme.text, 0.6));
+                surface.target.DrawText(
+                    &wide_str("⏻"),
+                    &gfx.center_meta_format,
+                    &rect(lr.left * scale, lr.top * scale, lr.right * scale, lr.bottom * scale),
+                    brush,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
+
+            // Escena.
+            match status {
+                spotify::Status::Unconfigured => {
+                    brush.SetColor(&theme.text);
+                    let msg = wide_str("Configura el Client ID de Spotify en Ajustes → Widgets");
+                    surface.target.DrawText(
+                        &msg,
+                        &gfx.center_meta_format,
+                        &rect(12.0 * scale, header_h + 12.0 * scale, (w - 12.0) * scale, header_h + 44.0 * scale),
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                }
+                spotify::Status::LoggedOut => {
+                    let cx = lay.connect.left * scale;
+                    let cy = header_h + lay.connect.top * scale;
+                    let cw = (lay.connect.right - lay.connect.left) * scale;
+                    let ch = (lay.connect.bottom - lay.connect.top) * scale;
+                    brush.SetColor(&argb_color(0xFF1DB954));
+                    surface.target.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(cx, cy, cx + cw, cy + ch), radiusX: 8.0 * scale, radiusY: 8.0 * scale }, brush);
+                    brush.SetColor(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 });
+                    let msg = wide_str("Conectar con Spotify");
+                    surface.target.DrawText(
+                        &msg,
+                        &gfx.center_meta_format,
+                        &rect(cx, cy, cx + cw, cy + ch),
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                }
+                spotify::Status::Ready => {
+                    if show_queue {
+                        // Vista de cola: lista de las proximas pistas (con scroll).
+                        let content_h = h - header_dip;
+                        brush.SetColor(&with_alpha(theme.text, 0.55));
+                        surface.target.DrawText(
+                            &wide_str("Próximas"),
+                            &gfx.meta_format,
+                            &rect(12.0 * scale, header_h + 2.0 * scale, (w - 12.0) * scale, header_h + 20.0 * scale),
+                            brush,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                        if queue.is_empty() {
+                            brush.SetColor(&with_alpha(theme.text, 0.6));
+                            surface.target.DrawText(
+                                &wide_str("Cola vacía"),
+                                &gfx.center_meta_format,
+                                &rect(12.0 * scale, header_h + 34.0 * scale, (w - 12.0) * scale, header_h + 64.0 * scale),
+                                brush,
+                                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                                DWRITE_MEASURING_MODE_NATURAL,
+                            );
+                        } else {
+                            for (i, item) in queue.iter().enumerate() {
+                                let Some(r) = spotify_queue_row_rect(i, queue_scroll, w, content_h) else { continue };
+                                if i % 2 == 0 {
+                                    brush.SetColor(&with_alpha(theme.text, 0.03));
+                                    surface.target.FillRoundedRectangle(
+                                        &D2D1_ROUNDED_RECT { rect: rect(r.left * scale, header_h + r.top * scale, r.right * scale, header_h + r.bottom * scale), radiusX: 6.0 * scale, radiusY: 6.0 * scale },
+                                        brush,
+                                    );
+                                }
+                                let num = wide_str(&(i + 1).to_string());
+                                brush.SetColor(&with_alpha(theme.text, 0.45));
+                                surface.target.DrawText(
+                                    &num,
+                                    &gfx.meta_format,
+                                    &rect(r.left * scale + 4.0 * scale, header_h + r.top * scale, r.left * scale + 24.0 * scale, header_h + r.bottom * scale),
+                                    brush,
+                                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                                    DWRITE_MEASURING_MODE_NATURAL,
+                                );
+                                let tx = (r.left + 26.0) * scale;
+                                let tw = (r.right - r.left - 26.0) * scale;
+                                brush.SetColor(&theme.text);
+                                surface.target.DrawText(
+                                    &wide_str(&item.title),
+                                    &gfx.text_format,
+                                    &rect(tx, header_h + r.top * scale + 2.0 * scale, tx + tw, header_h + r.top * scale + 20.0 * scale),
+                                    brush,
+                                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                                    DWRITE_MEASURING_MODE_NATURAL,
+                                );
+                                brush.SetColor(&with_alpha(theme.text, 0.5));
+                                surface.target.DrawText(
+                                    &wide_str(&item.artist),
+                                    &gfx.meta_format,
+                                    &rect(tx, header_h + r.top * scale + 20.0 * scale, tx + tw, header_h + r.bottom * scale),
+                                    brush,
+                                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                                    DWRITE_MEASURING_MODE_NATURAL,
+                                );
+                            }
+                        }
+                    } else {
+                    let np = np.unwrap_or_default();
+                    // Portada (o placeholder).
+                    let (cxp, cyp, csp) = (lay.cover.left * scale, header_h + lay.cover.top * scale, (lay.cover.right - lay.cover.left) * scale);
+                    if let Some((cw, ch, ref bgra)) = cover {
+                        if let Ok(bitmap) = surface.target.CreateBitmap(
+                            D2D_SIZE_U { width: cw, height: ch },
+                            Some(bgra.as_ptr() as *const c_void),
+                            cw * 4,
+                            &D2D1_BITMAP_PROPERTIES {
+                                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_IGNORE },
+                                dpiX: 96.0,
+                                dpiY: 96.0,
+                            },
+                        ) {
+                            let dest = D2D_RECT_F { left: cxp, top: cyp, right: cxp + csp, bottom: cyp + csp };
+                            surface.target.DrawBitmap(&bitmap, Some(&dest), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                        }
+                    } else {
+                        brush.SetColor(&with_alpha(theme.text, 0.06));
+                        surface.target.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(cxp, cyp, cxp + csp, cyp + csp), radiusX: 8.0 * scale, radiusY: 8.0 * scale }, brush);
+                    }
+
+                    // Titulo / artista / album.
+                    let tx = lay.text_x * scale;
+                    let tw = (lay.text_w * scale).max(20.0);
+                    brush.SetColor(&theme.title);
+                    surface.target.DrawText(&wide_str(&np.title), &gfx.title_format, &rect(tx, header_h + lay.cover.top * scale, tx + tw, header_h + lay.cover.top * scale + 22.0 * scale), brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+                    brush.SetColor(&theme.text);
+                    surface.target.DrawText(&wide_str(&np.artist), &gfx.text_format, &rect(tx, header_h + (lay.cover.top + 24.0) * scale, tx + tw, header_h + (lay.cover.top + 44.0) * scale), brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+                    brush.SetColor(&with_alpha(theme.text, 0.6));
+                    surface.target.DrawText(&wide_str(&np.album), &gfx.meta_format, &rect(tx, header_h + (lay.cover.top + 46.0) * scale, tx + tw, header_h + (lay.cover.top + 64.0) * scale), brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+                    // Dispositivo de reproduccion (solo si hay hueco para no pisar la barra).
+                    if !np.device_name.is_empty() && lay.cover.top + 80.0 < lay.progress.top {
+                        brush.SetColor(&with_alpha(theme.text, 0.4));
+                        surface.target.DrawText(&wide_str(&np.device_name), &gfx.text_format, &rect(tx, header_h + (lay.cover.top + 66.0) * scale, tx + tw, header_h + (lay.cover.top + 82.0) * scale), brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+                    }
+
+                    // Tiempos (mm:ss) flanqueando la barra de progreso.
+                    let ty = header_h + (lay.progress.top - 9.0) * scale;
+                    let tyb = header_h + (lay.progress.bottom + 9.0) * scale;
+                    brush.SetColor(&with_alpha(theme.text, 0.55));
+                    surface.target.DrawText(&wide_str(&format_time(np.progress_ms)), &gfx.meta_format, &rect(4.0 * scale, ty, lay.progress.left * scale - 2.0 * scale, tyb), brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+                    surface.target.DrawText(&wide_str(&format_time(np.duration_ms)), &gfx.text_format, &rect(lay.progress.right * scale + 2.0 * scale, ty, (w - 4.0) * scale, tyb), brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+
+                    // Barra de progreso.
+                    let (px, py, pw, ph) = (lay.progress.left * scale, header_h + lay.progress.top * scale, (lay.progress.right - lay.progress.left) * scale, (lay.progress.bottom - lay.progress.top) * scale);
+                    let half = ph * 0.5;
+                    brush.SetColor(&with_alpha(theme.text, 0.12));
+                    surface.target.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(px, py, px + pw, py + ph), radiusX: half, radiusY: half }, brush);
+                    let ratio = if np.duration_ms > 0 { np.progress_ms as f32 / np.duration_ms as f32 } else { 0.0 };
+                    brush.SetColor(&argb_color(0xFF1DB954));
+                    let fw = (pw * ratio.clamp(0.0, 1.0)).max(ph);
+                    surface.target.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(px, py, px + fw, py + ph), radiusX: half, radiusY: half }, brush);
+
+                    // Volumen (icono + slider).
+                    let (vx, vy, vw, vh) = (lay.volume.left * scale, header_h + lay.volume.top * scale, (lay.volume.right - lay.volume.left) * scale, (lay.volume.bottom - lay.volume.top) * scale);
+                    let icon_rect = D2D_RECT_F { left: 8.0 * scale, top: header_h + (lay.volume.top - 4.0) * scale, right: (8.0 + 20.0) * scale, bottom: header_h + (lay.volume.bottom + 4.0) * scale };
+                    brush.SetColor(&with_alpha(theme.text, 0.7));
+                    surface.target.DrawText(&wide_str("♪"), &gfx.center_meta_format, &icon_rect, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+                    let vhalf = vh * 0.5;
+                    brush.SetColor(&with_alpha(theme.text, 0.12));
+                    surface.target.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(vx, vy, vx + vw, vy + vh), radiusX: vhalf, radiusY: vhalf }, brush);
+                    let vratio = np.volume_percent as f32 / 100.0;
+                    brush.SetColor(&argb_color(0xFF1DB954));
+                    let vf = (vw * vratio.clamp(0.0, 1.0)).max(vh);
+                    surface.target.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(vx, vy, vx + vf, vy + vh), radiusX: vhalf, radiusY: vhalf }, brush);
+                    let kx = vx + vw * vratio.clamp(0.0, 1.0);
+                    brush.SetColor(&theme.text);
+                    surface.target.FillEllipse(&D2D1_ELLIPSE { point: D2D_POINT_2F { x: kx, y: vy + vh * 0.5 }, radiusX: vh * 0.7, radiusY: vh * 0.7 }, brush);
+
+                    // Controles.
+                    let glyph = |state: bool| if state { "⏸" } else { "▶" };
+                    let controls: [(&str, D2D_RECT_F); 3] = [
+                        ("⏮", lay.prev),
+                        (glyph(np.is_playing), lay.play),
+                        ("⏭", lay.next),
+                    ];
+                    brush.SetColor(&theme.text);
+                    for (g, r) in controls {
+                        surface.target.DrawText(
+                            &wide_str(g),
+                            &gfx.center_meta_format,
+                            &rect(r.left * scale, header_h + r.top * scale, r.right * scale, header_h + r.bottom * scale),
+                            brush,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                    }
+                    }
+                }
+            }
+
+            surface.target.EndDraw(None, None)?;
+
+            let screen = GetDC(None);
+            let position = POINT { x: fence.layout.x, y: fence.layout.y };
+            let size = SIZE { cx: width, cy: visual_height };
+            let source = POINT { x: 0, y: 0 };
+            let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+            let result = UpdateLayeredWindow(
+                fence.hwnd,
+                screen,
+                Some(&position as *const POINT),
+                Some(&size as *const SIZE),
+                surface.dc,
+                Some(&source as *const POINT),
+                COLORREF(0),
+                Some(&blend as *const BLENDFUNCTION),
+                ULW_ALPHA,
+            );
+            let _ = ReleaseDC(None, screen);
+            result?;
+        }
+        Ok(())
+    }
+
     // -- acciones -----------------------------------------------------------
 
     /// Muestra u oculta la miniatura emergente junto al cursor.
@@ -3651,6 +4904,9 @@ impl App {
         let report = rules::organize(&self.cfg, &self.desktop);
         let sweep = rules::sweep_ephemeral(&self.cfg, &self.desktop);
         let total = report.organized + sweep.archived;
+        for (from, to) in report.moves.iter().cloned().chain(sweep.moves.iter().cloned()) {
+            self.undo_stack.push(UndoOp { from, to });
+        }
         if total > 0 {
             let msg = format!("{} {}", total, self.tr.toast_organized);
             unsafe { self.show_toast(&msg, TOAST_ORGANIZE); }
@@ -3662,11 +4918,37 @@ impl App {
         // No barrer mientras el drag OLE conserva activas las ventanas.
         if self.dragging { return; }
         let report = rules::sweep_ephemeral(&self.cfg, &self.desktop);
+        for (from, to) in report.moves.iter().cloned() {
+            self.undo_stack.push(UndoOp { from, to });
+        }
         if report.archived > 0 {
             let msg = format!("{} {}", report.archived, self.tr.toast_archived);
             unsafe { self.show_toast(&msg, TOAST_ORGANIZE); }
         }
         self.refresh_contents();
+    }
+
+    /// Deshace la ultima operacion de archivo (Ctrl+Z): devuelve el fichero a
+    /// su ruta original.
+    fn undo_last(&mut self) {
+        if self.dragging { return; }
+        let Some(op) = self.undo_stack.pop() else {
+            unsafe { self.show_toast(self.tr.toast_nothing_to_undo, TOAST_DROP); }
+            return;
+        };
+        if rules::undo_move(&op.from, &op.to) {
+            // Evitar que el organizador automatico devuelva el fichero a su caja.
+            self.skip_next_organize = true;
+            unsafe { self.show_toast(self.tr.toast_undone, TOAST_DROP); }
+            self.refresh_contents();
+            unsafe {
+                let _ = SetTimer(self.controller, TIMER_PERSIST, 800, None);
+            }
+        } else {
+            // Fichero bloqueado: re-apilar para poder reintentar despues.
+            self.undo_stack.push(op);
+            unsafe { self.show_toast(self.tr.toast_undo_failed, TOAST_ERROR); }
+        }
     }
 
     /// Muestra las cajas tras el retraso de inicio configurable.
@@ -3825,6 +5107,7 @@ impl App {
         }
         match std::fs::rename(&path, &new_path) {
             Ok(()) => {
+                self.undo_stack.push(UndoOp { from: path, to: new_path });
                 // Los indices de seleccion quedan obsoletos tras re-ordenar.
                 self.fences[fence_idx].tab_mut().selected.clear();
                 self.fences[fence_idx].tab_mut().rename_text.clear();
@@ -3873,6 +5156,7 @@ impl App {
         self.cfg = cfg;
         self.theme = Theme::from_config(&self.cfg);
         self.tr = Tr::get(self.cfg.lang());
+        self.spotify.set_client_id(self.cfg.spotify.client_id.clone());
         if let Ok(gfx) = Graphics::new(&self.cfg) {
             self.gfx = gfx;
         }
@@ -3922,7 +5206,10 @@ impl App {
             return;
         }
         let Some(mut cfg) = chosen else {
-            return; // cancelado
+            // Cancelado: aun asi recarga los scripts por si el usuario edito
+            // y guardo codigo desde la pestana Widgets.
+            self.reload_widgets();
+            return;
         };
         // Fusiona las preferencias de orden del dialogo con la geometria actual.
         for df in &cfg.fences {
@@ -3947,6 +5234,9 @@ impl App {
         if cfg.general.start_with_windows != self.cfg.general.start_with_windows {
             let _ = crate::config::apply_autostart(cfg.general.start_with_windows);
         }
+        // Los scripts Lua pueden haberse editado desde la pestana Widgets:
+        // recargar antes de reconstruir las cajas para usar el codigo nuevo.
+        self.reload_widgets();
         self.apply_config(cfg);
         let _ = self.cfg.save(&self.cfg_path);
         if organize {
@@ -4666,6 +5956,48 @@ extern "system" fn controller_proc(
                 }
                 LRESULT(0)
             }
+            WM_ZEN_SPOTIFY_AUTH => {
+                // El navegador devolvio el codigo: canjearlo por tokens.
+                if let Some(app) = app_from(hwnd) {
+                    if let Some(code) = SPOTIFY_AUTH_CODE.lock().unwrap().take() {
+                        if app.spotify.complete_auth(&code).is_ok() {
+                            poll_spotify_now(app.spotify.clone(), app.controller.0 as isize);
+                        }
+                    }
+                    app.render_all();
+                }
+                LRESULT(0)
+            }
+            WM_ZEN_SPOTIFY_NP => {
+                if let Some(app) = app_from(hwnd) {
+                    app.spotify_apply_snapshot();
+                }
+                LRESULT(0)
+            }
+            WM_ZEN_SPOTIFY_QUEUE => {
+                // La cola llego del hilo de trabajo: copiarla a la app y repintar.
+                if let Some(app) = app_from(hwnd) {
+                    app.spotify_apply_queue();
+                }
+                LRESULT(0)
+            }
+            widgets::WM_ZEN_WIDGET_HTTP => {
+                // Una descarga HTTP de un widget Lua termino: repintar para que
+                // el script lea los datos cacheados y dibuje la escena real.
+                if let Some(app) = app_from(hwnd) {
+                    app.render_all();
+                }
+                LRESULT(0)
+            }
+            widgets::WM_ZEN_WIDGET_TOAST => {
+                // Un widget pidio `app:notify(...)`: mostrarlo como toast.
+                if let Some(app) = app_from(hwnd) {
+                    if let Some(msg) = widgets::take_widget_toast() {
+                        app.show_toast(&msg, TOAST_DROP);
+                    }
+                }
+                LRESULT(0)
+            }
             WM_ZEN_TOAST_CLICK => {
                 // Cualquier clic en un toast lo descarta y muestra el siguiente.
                 if let Some(app) = app_from(hwnd) {
@@ -4739,6 +6071,9 @@ extern "system" fn controller_proc(
                         }
                         TIMER_SCROLL => {
                             app.scroll_tick();
+                        }
+                        TIMER_WIDGET => {
+                            app.widget_tick();
                         }
                         _ => {}
                     }
@@ -5156,6 +6491,110 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                     app.commit_rename(index);
                 }
                 let (x, y) = point_of(lparam);
+
+                // Widget de Spotify: clic en Conectar, controles o volumen.
+                if app.fences[index].layout.widget.as_deref() == Some("spotify") {
+                    let status = app.spotify.status();
+                    let (w_dip, h_dip, header, s) = {
+                        let f = &app.fences[index];
+                        (
+                            f.layout.width as f32 / f.scale,
+                            f.visible_height(&app.theme) as f32 / f.scale,
+                            f.header_h(&app.theme),
+                            f.scale,
+                        )
+                    };
+                    // Boton de cola (☰) y de cerrar sesion (⏻) en la cabecera.
+                    if status == spotify::Status::Ready {
+                        let (cx, cy) = (x as f32 / s, y as f32 / s);
+                        let qr = spotify_queue_btn_rect(w_dip, header);
+                        if cx >= qr.left && cx <= qr.right && cy >= qr.top && cy <= qr.bottom {
+                            app.spotify_toggle_queue();
+                            return LRESULT(0);
+                        }
+                        let lr = spotify_logout_rect(w_dip, header);
+                        if cx >= lr.left && cx <= lr.right && cy >= lr.top && cy <= lr.bottom {
+                            app.spotify_sign_out();
+                            return LRESULT(0);
+                        }
+                    }
+                    let lay = spotify_layout(w_dip, (h_dip - header).max(40.0));
+                    let (dx, dy) = (x as f32 / s, y as f32 / s - header);
+                    // En vista de cola: clic en una pista la reproduce.
+                    if status == spotify::Status::Ready && app.spotify_show_queue {
+                        let content_h = h_dip - header;
+                        let queue = app.spotify_queue.clone();
+                        let scroll = app.spotify_queue_scroll;
+                        for (i, item) in queue.iter().enumerate() {
+                            if let Some(r) = spotify_queue_row_rect(i, scroll, w_dip, content_h) {
+                                if dx >= r.left && dx <= r.right && dy >= r.top && dy <= r.bottom {
+                                    let uri = item.uri.clone();
+                                    app.spotify_play_track(uri);
+                                    return LRESULT(0);
+                                }
+                            }
+                        }
+                        return LRESULT(0);
+                    }
+                    // Slider de volumen: ajusta y entra en modo arrastre.
+                    if status == spotify::Status::Ready && point_in(&lay.volume, dx, dy) {
+                        let percent = volume_from_x(&lay, dx);
+                        app.spotify_set_volume(percent);
+                        app.spotify_volume_drag = true;
+                        let _ = SetCapture(hwnd);
+                        let _ = app.render(index);
+                        return LRESULT(0);
+                    }
+                    let action = match status {
+                        spotify::Status::Ready => {
+                            if point_in(&lay.prev, dx, dy) {
+                                Some(0u8)
+                            } else if point_in(&lay.play, dx, dy) {
+                                Some(1)
+                            } else if point_in(&lay.next, dx, dy) {
+                                Some(2)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => {
+                            if point_in(&lay.connect, dx, dy) { Some(3) } else { None }
+                        }
+                    };
+                    match action {
+                        Some(3) => app.spotify_connect(),
+                        Some(a) => app.spotify_control(a),
+                        None => {}
+                    }
+                    return LRESULT(0);
+                }
+
+                // Widget Lua generico (no Spotify): clic en el CUERPO -> la
+                // funcion `click(x, y, w, h)` del script (coordenadas DIP
+                // relativas al cuerpo, bajo la cabecera). Los clics en la
+                // cabecera y en el grip de redimension caen al flujo normal
+                // (mover / redimensionar la caja como cualquier otra).
+                if app.fences[index].layout.widget.is_some() {
+                    let f = &app.fences[index];
+                    let header_px = (f.header_h(&app.theme) * f.scale) as i32;
+                    let in_grip = x > f.layout.width - GRIP
+                        && y > f.visible_height(&app.theme) - GRIP
+                        && !f.layout.collapsed;
+                    if y > header_px && !in_grip {
+                        let s = f.scale;
+                        let header_dip = f.header_h(&app.theme);
+                        let (dx, dy) = (x as f32 / s, y as f32 / s);
+                        let body_w = f.layout.width as f32 / s;
+                        let body_h = f.visible_height(&app.theme) as f32 / s - header_dip;
+                        let name = f.layout.widget.clone().unwrap_or_default();
+                        if let Some(w) = app.widget_host.get_mut(&name) {
+                            w.handle_click(dx, dy - header_dip, body_w, body_h);
+                        }
+                        let _ = app.render(index);
+                        return LRESULT(0);
+                    }
+                }
+
                 let theme_header = (app.theme.header * app.fences[index].scale) as i32;
 
                 // Clic en pestanas
@@ -5232,7 +6671,10 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
 
                     let in_lock = y <= theme_header
                         && x >= (lr.left * fence.scale) as i32
-                        && x <= (lr.right * fence.scale) as i32;
+                        && x <= (lr.right * fence.scale) as i32
+                        // Las cajas widget no pintan candado/chincheta en la
+                        // cabecera: no deben anclarse con un clic invisible.
+                        && fence.layout.widget.is_none();
                     if in_lock {
                         fence.layout.locked = !fence.layout.locked;
                         fence.drag = DragMode::None;
@@ -5245,7 +6687,8 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                     let pr = pin_rect(w_dip, &app.theme, app.theme.show_counter, item_cnt);
                     let in_pin = y <= theme_header
                         && x >= (pr.left * fence.scale) as i32
-                        && x <= (pr.right * fence.scale) as i32;
+                        && x <= (pr.right * fence.scale) as i32
+                        && fence.layout.widget.is_none();
                     if in_pin {
                         fence.layout.pinned = !fence.layout.pinned;
                         fence.drag = DragMode::None;
@@ -5416,6 +6859,22 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                     let _ = TrackMouseEvent(&mut track);
                 }
                 let (x, y) = point_of(lparam);
+
+                // Arrastre del slider de volumen del widget Spotify.
+                if app.spotify_volume_drag {
+                    let percent = {
+                        let f = &app.fences[index];
+                        let header = f.header_h(&app.theme);
+                        let w_dip = f.layout.width as f32 / f.scale;
+                        let h_dip = f.visible_height(&app.theme) as f32 / f.scale;
+                        let lay = spotify_layout(w_dip, (h_dip - header).max(40.0));
+                        volume_from_x(&lay, x as f32 / f.scale)
+                    };
+                    app.spotify_set_volume(percent);
+                    let _ = app.render(index);
+                    return LRESULT(0);
+                }
+
                 let mode = app.fences[index].drag.clone();
 
                 if let DragMode::ItemDrag { item_idx: _, start_x, start_y } = mode {
@@ -5635,6 +7094,12 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 if app.dragging {
                     return LRESULT(0);
                 }
+                // Fin del arrastre del slider de volumen del widget Spotify.
+                if app.spotify_volume_drag {
+                    app.spotify_volume_drag = false;
+                    let _ = ReleaseCapture();
+                    return LRESULT(0);
+                }
                 let drag_state = app.fences[index].drag.clone();
                 if let DragMode::ItemDrag { .. } = drag_state {
                     let _ = ReleaseCapture();
@@ -5704,6 +7169,19 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
             }
             WM_MOUSEWHEEL => {
                 let delta = ((wparam.0 >> 16) as i16) as i32 / WHEEL_DELTA as i32;
+                // Widget Spotify en vista de cola: la rueda desplaza la lista.
+                if app.fences[index].layout.widget.as_deref() == Some("spotify") && app.spotify_show_queue {
+                    let f = &app.fences[index];
+                    let content_h = f.visible_height(&app.theme) as f32 / f.scale - f.header_h(&app.theme);
+                    let visible = ((content_h - 10.0) / SPOTIFY_QUEUE_ROW_H).floor().max(1.0) as i32;
+                    let max = (app.spotify_queue.len() as i32 - visible).max(0);
+                    let next = (app.spotify_queue_scroll - delta * 3).clamp(0, max);
+                    if next != app.spotify_queue_scroll {
+                        app.spotify_queue_scroll = next;
+                        let _ = app.render(index);
+                    }
+                    return LRESULT(0);
+                }
                 let max = if app.fences[index].grid_mode(&app.theme) {
                     let cell = (app.cfg.appearance.grid_item_size * app.fences[index].scale).max(48.0);
                     let w_dip = app.fences[index].layout.width as f32 / app.fences[index].scale;
@@ -5776,6 +7254,9 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                         let fence = &mut app.fences[index];
                         fence.tabs[fence.active_tab].selected = (0..fence.tabs[fence.active_tab].content.items.len()).collect();
                         let _ = app.render(index);
+                    }
+                    0x5A if ctrl => { // Ctrl + Z (Deshacer)
+                        app.undo_last();
                     }
                     0x46 if ctrl => { // Ctrl + F (Foco en el buscador)
                         let fence = &mut app.fences[index];

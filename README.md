@@ -43,35 +43,39 @@
 - **🌍 Multi-language** — English, Spanish, German, French, Portuguese, Italian (dedicated Language tab)
 - **🪶 Ultralight** — ~3 MB binary, ~4 MB RAM idle, 0% CPU (fully event-driven, no polling)
 - **🔔 Toast notifications** — Visual feedback with a queue (🟢 drops, 🔵 organization) so they never overwrite each other
-- **🤖 Local AI (Ollama)** — Semantic classification and automatic fence creation via local LLM
+- **🤖 Local AI (Ollama)** — Semantic classification, automatic fence creation, and rule generation from a text description via local LLM
+- **🧩 Lua widgets** — Programmable boxes that run user scripts (clocks, weather, launchers…) with a sandboxed API: drawing primitives, images, HTTP, interactivity and persistent state
+- **🎧 Spotify widget** — OAuth PKCE now-playing widget with cover art, progress + times, volume slider, playback controls, device name and queue (jump to any track)
+- **↩️ Undo moves** — Moving files into fences is undoable (Ctrl+Z or the toast action)
+- **📐 Per-fence list/grid view** — Each rule picks its own view mode (auto/list/grid) from Settings → Rules
 
 ## 📥 Download
 
 | Format | File | Best for |
 |---|---|---|
-| 🖥️ **Installer (EXE)** | `ZenDesktop-1.0.16-setup.exe` | Most users — wizard installer with Start Menu shortcut |
-| 📦 **Installer (MSI)** | `ZenDesktop-v1.0.16-x64.msi` | Enterprises / system-wide installs with clean uninstall |
-| 💾 **Portable** | `ZenDesktop-v1.0.16-portable.zip` | USB drives, custom paths, no installation |
+| 🖥️ **Installer (EXE)** | `ZenDesktop-1.0.17-setup.exe` | Most users — wizard installer with Start Menu shortcut |
+| 📦 **Installer (MSI)** | `ZenDesktop-v1.0.17-x64.msi` | Enterprises / system-wide installs with clean uninstall |
+| 💾 **Portable** | `ZenDesktop-v1.0.17-portable.zip` | USB drives, custom paths, no installation |
 
 All downloads are available at **[Releases](https://github.com/jaimitus/ZenDesktop/releases)**.
 
 ### 🖥️ EXE Installer (recommended)
 
-1. Download `ZenDesktop-1.0.16-setup.exe` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+1. Download `ZenDesktop-1.0.17-setup.exe` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Run the installer — accepts the license, installs to `Program Files\ZenDesktop`
 3. Start Menu shortcut is created automatically
 4. Uninstall via Windows Settings → Apps, or re-run the installer
 
 ### 📦 MSI Installer
 
-1. Download `ZenDesktop-v1.0.16-x64.msi` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+1. Download `ZenDesktop-v1.0.17-x64.msi` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Run the installer — it installs to `Program Files\ZenDesktop` for all users
 3. Start Menu shortcut is created automatically
 4. Uninstall via Windows Settings → Apps, or re-run the MSI
 
 ### 💾 Portable (for USB drives / custom paths)
 
-1. Download `ZenDesktop-v1.0.16-portable.zip` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+1. Download `ZenDesktop-v1.0.17-portable.zip` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Extract to any folder (e.g. `%APPDATA%\ZenDesktop\`)
 3. Run `ZenDesktop.exe` — it minimizes to the system tray
 4. **Optional**: Add a shortcut to `shell:startup` for auto-start with Windows
@@ -134,6 +138,108 @@ color = "#4CCD3C"
 enabled = true
 ```
 
+## 🧩 Widgets (Lua)
+
+Widgets are **programmable boxes**: each one runs a Lua script that draws its
+own content on the desktop — a clock, the weather, a notes panel, a launcher,
+or anything else you can draw.
+
+### Quick start
+
+1. Open **Settings → 🧩 Widgets**. The bundled examples (`Reloj`, `Notas`,
+   `Clima`, `Contador`) are installed automatically on first run.
+2. Select one and press **"Añadir como caja"** — the box appears on the
+   desktop instantly. Drag it by its header, resize from the corner.
+3. **Edit the code** inline in the same tab (press *Guardar* to reload) or
+   edit the `.lua` files directly in the widgets folder:
+   - portable mode: `widgets/` next to `zendesktop.exe`;
+   - installed mode: `%APPDATA%\ZenDesktop\widgets\`.
+
+Every widget is a plain `.lua` file in that folder; you can add your own
+anytime (they show up in the Widgets tab automatically). Disable a widget with
+its checkbox, or remove its box with **"Quitar caja"** — the script is kept.
+
+### The script
+
+```lua
+WIDTH  = 240   -- optional suggested box width
+HEIGHT = 150   -- optional suggested box height
+TITLE  = "My widget"
+
+function render(ctx)
+    local w = ctx:width()   -- real box width in DIP
+    local h = ctx:height()
+    ctx:fill_rect(0, 0, w, h, 0x0AFFFFFF)
+    ctx:text_center(w / 2, 20, "Hello", 24, 0xFFFFFFFF)
+end
+```
+
+`render(ctx)` runs at least once per second (and on resize / config change).
+All coordinates are in DIPs, relative to the widget body (0,0 = top-left just
+below the header).
+
+### Drawing API (`ctx`)
+
+| Method | Description |
+|---|---|
+| `ctx:width()` / `ctx:height()` | Body size in DIP (0,0 = below the header) |
+| `ctx:now_ms()` | Milliseconds since the Unix epoch (animations) |
+| `ctx:fill_rect(x, y, w, h, color)` | Filled rectangle |
+| `ctx:text(x, y, text, size, color)` | Left-aligned text |
+| `ctx:text_center(x, y, text, size, color)` | Text centered on `x` (real measured size) |
+| `ctx:text_right(x, y, text, size, color)` | Text right-aligned at `x` |
+| `ctx:progress(x, y, w, h, value, color)` | Progress bar (`value` 0..1) |
+| `ctx:line(x1, y1, x2, y2, width, color)` | Segment with thickness |
+| `ctx:circle(cx, cy, r, color)` | Filled circle/ellipse |
+| `ctx:circle_stroke(cx, cy, r, width, color)` | Circle outline |
+| `ctx:round_rect(x, y, w, h, radius, color, border_width, border_color)` | Rounded rectangle (border optional, width 0 = none) |
+| `ctx:image(url, x, y, w, h)` | Image downloaded from a URL (async, cached 5 min) |
+
+Colors are packed ARGB integers: `0xAARRGGBB` (e.g. `0xFF4FC3F7`,
+`0x22FFFFFF`). Lua's standard libraries (`math`, `string`, `table`, `os.date`…)
+are all available.
+
+### Data APIs
+
+| Global | Method | Description |
+|---|---|---|
+| `http` | `http:get(url)` | Raw response body, or `nil` while downloading |
+| `http` | `http:get_json(url)` | JSON → Lua table, or `nil` while downloading |
+| `app` | `app:open(path)` | Opens a file/program with its default app (launcher widgets) |
+| `app` | `app:notify(message)` | Shows a ZenDesktop toast |
+| `app` | `app:version()` | Current app version string |
+
+HTTP downloads never block the UI: the first call with a cold cache returns
+`nil` and the widget repaints itself when the data arrives (draw a
+"Loading…" state while `nil`).
+
+### Interactivity & state
+
+- **`state`** — a global table that **persists across renders and clicks**
+  (counters, selected tab, cached computations). It is reset only when the
+  widget is reloaded.
+- **`function click(x, y, w, h)`** — called when you press inside the body;
+  `x, y` are the press position and `w, h` the body size, so buttons always
+  hit-test correctly even after resizing:
+
+```lua
+function click(x, y, w, h)
+    if x >= 10 and x <= 110 and y >= 10 and y <= 40 then
+        state.count = (state.count or 0) + 1
+    end
+end
+```
+
+The `Contador` example is a full working template of an interactive widget
+(buttons, persistent state, toast on milestones).
+
+### Security
+
+Scripts run in a sandboxed Lua VM with **no filesystem access and no process
+execution**: the only side effects are drawing, HTTP GETs (cached, bounded),
+`app:open` (launches the default app) and `app:notify`. Image and HTTP caches
+are size-bounded and expire after 5 minutes.
+
 ## 🏗️ Architecture
 
 - **Rendering**: Direct2D + DirectWrite on *layered* windows (per-pixel alpha, 0% VRAM reserved)
@@ -159,7 +265,10 @@ enabled = true
 │   ├── watcher.rs         # File system watcher
 │   ├── ai.rs              # HTTP client for Ollama
 │   ├── updater.rs         # Auto-update via GitHub Releases
+│   ├── spotify.rs         # Spotify OAuth PKCE + Web API client
+│   ├── widgets/mod.rs     # Lua widget sandbox (drawing, http, images, state)
 │   └── i18n.rs            # Translations (6 languages)
+├── widgets/               # Bundled example widget scripts (clock, notas, clima, contador)
 ├── scripts/
 │   └── build-release.ps1  # Local release builder
 ├── installer/

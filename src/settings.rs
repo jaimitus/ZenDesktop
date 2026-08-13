@@ -111,6 +111,10 @@ const ID_EDIT_R_MAX_SIZE: u16 = 30;
 const ID_EDIT_R_NEWER: u16 = 31;
 const ID_EDIT_R_OLDER: u16 = 32;
 const ID_EDIT_R_REGEX: u16 = 33;
+const ID_EDIT_AI_EMBED_MODEL: u16 = 35;
+const ID_EDIT_R_AI_DESC: u16 = 36;
+const ID_EDIT_WIDGET_NAME: u16 = 37;
+const ID_EDIT_WIDGET_CODE: u16 = 38;
 
 const ID_CHECK_ORGANIZE_FOLDERS: u16 = 101;
 const ID_CHECK_ORGANIZE_START: u16 = 102;
@@ -131,6 +135,7 @@ const ID_CHECK_A_SEARCH: u16 = 153;
 const ID_CHECK_A_GRID: u16 = 154;
 const ID_CHECK_AI_ENABLE: u16 = 160;
 const ID_CHECK_AUTO_UPDATE: u16 = 161;
+const ID_CHECK_WIDGET_ENABLED: u16 = 170;
 
 const ID_BTN_NEW: u16 = 201;
 const ID_BTN_DEL: u16 = 202;
@@ -151,6 +156,13 @@ const ID_BTN_TEMPLATE_SAVE: u16 = 217;
 const ID_BTN_TEMPLATE_APPLY: u16 = 218;
 const ID_BTN_TEMPLATE_DEL: u16 = 219;
 const ID_BTN_TEMPLATE_DEFAULT: u16 = 220;
+const ID_BTN_R_AI_GEN: u16 = 221;
+const ID_BTN_WIDGET_NEW: u16 = 222;
+const ID_BTN_WIDGET_DEL: u16 = 223;
+const ID_BTN_WIDGET_SAVE: u16 = 224;
+const ID_BTN_WIDGET_RELOAD: u16 = 225;
+const ID_BTN_WIDGET_ADD: u16 = 226;
+const ID_BTN_WIDGET_REMOVE: u16 = 227;
 
 // ---------------------------------------------------------------------------
 // Resultados asíncronos (hilo de trabajo -> hilo de UI del diálogo).
@@ -162,10 +174,12 @@ const WM_AI_PING_DONE: u32 = WM_APP + 0x41;
 const WM_AI_MODELS_DONE: u32 = WM_APP + 0x42;
 const WM_AI_CLUSTER_DONE: u32 = WM_APP + 0x43;
 const WM_UPDATE_DONE: u32 = WM_APP + 0x44;
+const WM_AI_RULE_DONE: u32 = WM_APP + 0x45;
 
 static AI_PING_RESULT: Mutex<Option<bool>> = Mutex::new(None);
 static AI_MODELS_RESULT: Mutex<Option<Vec<String>>> = Mutex::new(None);
 static AI_CLUSTER_RESULT: Mutex<Option<Vec<crate::ai::AiSuggestedRule>>> = Mutex::new(None);
+static AI_RULE_RESULT: Mutex<Option<crate::ai::AiRuleDraft>> = Mutex::new(None);
 static UPDATE_RESULT: Mutex<Option<crate::updater::UpdateStatus>> = Mutex::new(None);
 
 /// Guarda anti doble-clic: evita lanzar dos hilos de red a la vez por accion.
@@ -179,7 +193,7 @@ const BUSY_TIMER_ID: usize = 0x4E5;
 const PREVIEW_TIMER_ID: usize = 0x4E6;
 const PREVIEW_DEBOUNCE_MS: u32 = 200;
 
-const ALL_EDITS: [u16; 33] = [
+const ALL_EDITS: [u16; 36] = [
     ID_EDIT_MAX_AGE, ID_EDIT_MIN_AGE, ID_EDIT_PURGE, ID_EDIT_R_TITLE, ID_EDIT_R_FOLDER,
     ID_EDIT_R_COLOR, ID_EDIT_R_EXTS, ID_EDIT_R_PATTERNS, ID_EDIT_R_GROUP_TITLE, ID_EDIT_A_BG, ID_EDIT_A_HOVER,
     ID_EDIT_A_BORDER, ID_EDIT_A_TITLE, ID_EDIT_A_TEXT, ID_EDIT_A_MUTED, ID_EDIT_A_SHADOW,
@@ -189,6 +203,7 @@ const ALL_EDITS: [u16; 33] = [
     ID_EDIT_STARTUP_DELAY,
     ID_EDIT_TEMPLATE_NAME,
     ID_EDIT_R_MIN_SIZE, ID_EDIT_R_MAX_SIZE, ID_EDIT_R_NEWER, ID_EDIT_R_OLDER, ID_EDIT_R_REGEX,
+    ID_EDIT_AI_EMBED_MODEL, ID_EDIT_R_AI_DESC, ID_EDIT_WIDGET_NAME,
 ];
 
 // Valores de teclas para patrones de match (las constantes VK_* no son
@@ -252,6 +267,7 @@ enum Panel {
     Language,
     Ai,
     Updates,
+    Widgets,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -273,6 +289,7 @@ enum Ctrl {
     Lang(Lang),
     Template(usize),
     Theme(&'static str),
+    WidgetRow(usize),
     None,
 }
 
@@ -359,6 +376,12 @@ struct Settings {
     rules_scroll: usize,
     /// Orden por regla (indice en cfg.rules -> sort_mode).
     rules_sort: std::collections::HashMap<usize, Option<String>>,
+
+    // Widgets (Lua)
+    widgets_dir: PathBuf,
+    widgets_list: Vec<String>,
+    widgets_selected: Option<usize>,
+    widgets_scroll: usize,
 
     // Desplazamiento vertical del contenido (ventana redimensionable).
     scroll: f32,
@@ -682,9 +705,9 @@ impl Settings {
             1.0,
         );
         if self.picker.is_some() {
-            // Con el selector de color abierto los EDITs se ocultan (el panel
-            // los cubriria) y el valor se dibuja en D2D, siempre al dia con
-            // los cambios del selector.
+            // Con el selector de color (o el formulario de caja) abierto los
+            // EDITs del panel se ocultan (los cubriria) y el valor se dibuja
+            // en D2D, siempre al dia con los cambios del selector.
             let shown = self.edit_text(id).unwrap_or_else(|| value.to_string());
             self.text(
                 &shown,
@@ -1431,6 +1454,18 @@ impl Settings {
         self.icon_size_chip(Rect { x: vx, y, w: vw, h: 26.0 }, idx);
         y += 32.0;
         y = self.field_row(y, (cx, cw), ID_EDIT_R_TITLE, self.tr.fld_title, &rule.title, false);
+        // Generacion de regla con IA desde lenguaje natural (texto transitorio).
+        y = self.field_row(y, (cx, cw), ID_EDIT_R_AI_DESC, self.tr.fld_ai_rule_desc, "", false);
+        self.icon_button(
+            Rect { x: cx + 16.0, y, w: 200.0, h: 28.0 },
+            self.tr.btn_ai_gen_rule,
+            ID_BTN_R_AI_GEN,
+            self.rules_selected.is_some(),
+        );
+        if AI_BUSY.load(Ordering::SeqCst) {
+            self.spinner(cx + 226.0, y + 14.0, 8.0, self.spinner_phase);
+        }
+        y += 38.0;
         // Titulo del grupo: solo se muestra si la regla seleccionada esta
         // agrupada (el campo nativo se oculta/limpieza solo al no renderizarse).
         let group_title = self
@@ -1608,6 +1643,9 @@ impl Settings {
         let model = self.cfg.ai.model.clone();
         y = self.field_row(y, (cx, cw), ID_EDIT_AI_MODEL, tr.fld_ai_model, &model, false);
 
+        let embed = self.cfg.ai.embed_model.clone();
+        y = self.field_row(y, (cx, cw), ID_EDIT_AI_EMBED_MODEL, tr.fld_ai_embed_model, &embed, false);
+
         y += 8.0;
         let bx0 = cx + 16.0;
         self.icon_button(Rect { x: bx0, y, w: 200.0, h: 30.0 }, tr.btn_ai_ping, ID_BTN_AI_PING, true);
@@ -1649,6 +1687,399 @@ impl Settings {
         self.icon_button(Rect { x: bx0 + 230.0, y, w: 220.0, h: 32.0 }, self.tr.btn_download_update, ID_BTN_DOWNLOAD_UPDATE, true);
         if UPDATE_BUSY.load(Ordering::SeqCst) {
             self.spinner(bx0 + 236.0, y + 16.0, 8.0, self.spinner_phase);
+        }
+    }
+
+    fn panel_widgets(&mut self, cy: f32) {
+        let (cx, _, cw, ch) = self.content_area();
+        let mut y = cy + 10.0;
+        y = self.section(y, cx, cw, self.tr.sec_widgets);
+
+        // Botones de gestion del widget.
+        let bx = cx + 16.0;
+        self.icon_button(Rect { x: bx, y, w: 100.0, h: 28.0 }, self.tr.btn_new, ID_BTN_WIDGET_NEW, true);
+        self.icon_button(Rect { x: bx + 108.0, y, w: 100.0, h: 28.0 }, self.tr.btn_delete, ID_BTN_WIDGET_DEL, self.widgets_selected.is_some());
+        self.icon_button(Rect { x: bx + 216.0, y, w: 100.0, h: 28.0 }, self.tr.btn_widget_reload, ID_BTN_WIDGET_RELOAD, true);
+        self.icon_button(Rect { x: bx + 324.0, y, w: 150.0, h: 28.0 }, self.tr.btn_widget_add, ID_BTN_WIDGET_ADD, self.widget_can_add());
+        self.icon_button(Rect { x: bx + 482.0, y, w: 135.0, h: 28.0 }, self.tr.btn_widget_remove, ID_BTN_WIDGET_REMOVE, self.widget_can_remove());
+        y += 38.0;
+
+        // Lista de scripts instalados (nombres .lua).
+        let list_h = 118.0;
+        let list = D2D_RECT_F {
+            left: cx + 16.0,
+            top: y,
+            right: cx + cw - 16.0,
+            bottom: y + list_h,
+        };
+        self.fill_rr(list.left, list.top, list.right - list.left, list.bottom - list.top, 10.0, col("#10162A"));
+        self.draw_rr(Rect { x: list.left, y: list.top, w: list.right - list.left, h: list.bottom - list.top }, 10.0, rgba(C_FIELD_BORDER, 0.6), 1.0);
+        self.list_rect = Some(list);
+
+        let row_h = 28.0;
+        let rows = D2D_RECT_F {
+            left: list.left + 8.0,
+            top: list.top + 6.0,
+            right: list.right - 8.0,
+            bottom: list.bottom - 6.0,
+        };
+        let visible = ((rows.bottom - rows.top) / row_h).floor().max(0.0) as usize;
+        let total = self.widgets_list.len();
+        let max_scroll = total.saturating_sub(visible);
+        self.widgets_scroll = self.widgets_scroll.min(max_scroll);
+        unsafe {
+            self.target().PushAxisAlignedClip(
+                &D2D_RECT_F {
+                    left: rows.left.floor(),
+                    top: rows.top.floor(),
+                    right: rows.right.ceil(),
+                    bottom: rows.bottom.ceil(),
+                },
+                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            );
+        }
+        for offset in 0..visible.min(total.saturating_sub(self.widgets_scroll)) {
+            let idx = self.widgets_scroll + offset;
+            let r = D2D_RECT_F {
+                left: rows.left,
+                top: rows.top + offset as f32 * row_h,
+                right: rows.right,
+                bottom: rows.top + (offset as f32 + 1.0) * row_h,
+            };
+            self.widget_row(&r, idx);
+        }
+        unsafe {
+            self.target().PopAxisAlignedClip();
+        }
+        if total == 0 {
+            self.text(
+                self.tr.msg_widget_empty,
+                Fmt::Small,
+                D2D_RECT_F {
+                    left: rows.left + 6.0,
+                    top: rows.top + 10.0,
+                    right: rows.right,
+                    bottom: rows.top + 30.0,
+                },
+                col(C_DIM),
+            );
+        }
+        y += list_h + 12.0;
+
+        // Nombre y estado del widget seleccionado.
+        let name = self
+            .widgets_selected
+            .and_then(|i| self.widgets_list.get(i).cloned())
+            .unwrap_or_default();
+        y = self.field_row(y, (cx, cw), ID_EDIT_WIDGET_NAME, self.tr.fld_widget_name, &name, false);
+        y = self.check(y, cx, cw, ID_CHECK_WIDGET_ENABLED, self.tr.chk_widget_enabled);
+        y += 4.0;
+
+        // Editor de codigo Lua (multilinea nativo).
+        self.text(
+            self.tr.lbl_widget_code,
+            Fmt::Small,
+            D2D_RECT_F {
+                left: cx + 26.0,
+                top: y,
+                right: cx + cw - 16.0,
+                bottom: y + 18.0,
+            },
+            col(C_DIM),
+        );
+        y += 20.0;
+        let code_h = (ch - (y - cy) - 44.0).max(60.0);
+        self.widget_code_edit(cx + 16.0, y, cw - 32.0, code_h);
+        y += code_h + 10.0;
+        self.icon_button(Rect { x: cx + 16.0, y, w: 140.0, h: 28.0 }, self.tr.btn_widget_save, ID_BTN_WIDGET_SAVE, self.widgets_selected.is_some());
+    }
+
+    fn widget_row(&mut self, r: &D2D_RECT_F, idx: usize) {
+        let name = self.widgets_list[idx].clone();
+        let selected = self.widgets_selected == Some(idx);
+        let over = self.hover == Some(Ctrl::WidgetRow(idx));
+        let enabled = !self.cfg.widgets_disabled.iter().any(|d| d == &name);
+        let bg = if selected { col(C_ACTIVE) } else if over { col(C_HOVER) } else { col("#131B2E") };
+        self.fill_rr(r.left, r.top, r.right - r.left, r.bottom - r.top, 8.0, bg);
+        if selected {
+            self.draw_rr(Rect { x: r.left, y: r.top, w: r.right - r.left, h: r.bottom - r.top }, 8.0, rgba(C_ACCENT, 0.5), 1.0);
+        }
+        self.text(
+            &name,
+            Fmt::Body,
+            D2D_RECT_F {
+                left: r.left + 12.0,
+                top: r.top + 4.0,
+                right: r.right - 40.0,
+                bottom: r.top + 22.0,
+            },
+            if enabled { col(C_TEXT) } else { col(C_DIM) },
+        );
+        if !enabled {
+            self.text(
+                "✕",
+                Fmt::Small,
+                D2D_RECT_F {
+                    left: r.right - 26.0,
+                    top: r.top + 4.0,
+                    right: r.right - 8.0,
+                    bottom: r.top + 22.0,
+                },
+                col(C_DIM),
+            );
+        }
+        self.add_region(Ctrl::WidgetRow(idx), *r);
+    }
+
+    /// Fondo del editor de codigo y registro de la posicion del EDIT multilinea
+    /// (misma estrategia que `field_at`: se aplica tras el present D2D).
+    fn widget_code_edit(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        let focused = self.edits_focused(ID_EDIT_WIDGET_CODE);
+        self.fill_rr(x, y, w, h, 10.0, col(C_FIELD));
+        self.draw_rr(Rect { x, y, w, h }, 10.0, if focused { col(C_FIELD_FOCUS) } else { col(C_FIELD_BORDER) }, 1.0);
+        if self.edits.contains_key(&ID_EDIT_WIDGET_CODE) {
+            let (_, cyt, _, chb) = self.content_rect;
+            if y >= cyt && y + h <= chb {
+                let s = self.scale;
+                let rect = (
+                    ((x + 6.0) * s) as i32,
+                    ((y + 6.0) * s) as i32,
+                    ((w - 12.0) * s).max(40.0) as i32,
+                    ((h - 12.0) * s).max(20.0) as i32,
+                );
+                self.edit_next_rects.insert(ID_EDIT_WIDGET_CODE, rect);
+                self.edits_shown.push(ID_EDIT_WIDGET_CODE);
+            }
+        }
+        self.add_region(
+            Ctrl::Field(ID_EDIT_WIDGET_CODE),
+            D2D_RECT_F {
+                left: x,
+                top: y,
+                right: x + w,
+                bottom: y + h,
+            },
+        );
+    }
+
+    fn widget_select(&mut self, idx: usize) {
+        self.widgets_selected = Some(idx);
+        self.refresh_widget_fields();
+        self.invalidate();
+    }
+
+    fn widget_code(&self, name: &str) -> Option<String> {
+        std::fs::read_to_string(self.widgets_dir.join(format!("{name}.lua"))).ok()
+    }
+
+    fn refresh_widget_fields(&mut self) {
+        let name = self
+            .widgets_selected
+            .and_then(|i| self.widgets_list.get(i).cloned());
+        match name {
+            Some(name) => {
+                if let Some(&hwnd) = self.edits.get(&ID_EDIT_WIDGET_NAME) {
+                    set_text(hwnd, &name);
+                }
+                let code = self.widget_code(&name).unwrap_or_default();
+                if let Some(&hwnd) = self.edits.get(&ID_EDIT_WIDGET_CODE) {
+                    set_text(hwnd, &code);
+                }
+                let enabled = !self.cfg.widgets_disabled.iter().any(|d| d == &name);
+                self.checks.insert(ID_CHECK_WIDGET_ENABLED, enabled);
+            }
+            None => {
+                if let Some(&hwnd) = self.edits.get(&ID_EDIT_WIDGET_NAME) {
+                    set_text(hwnd, "");
+                }
+                if let Some(&hwnd) = self.edits.get(&ID_EDIT_WIDGET_CODE) {
+                    set_text(hwnd, "");
+                }
+                self.checks.insert(ID_CHECK_WIDGET_ENABLED, false);
+            }
+        }
+    }
+
+    fn widget_new(&mut self) {
+        if std::fs::create_dir_all(&self.widgets_dir).is_err() {
+            return;
+        }
+        let mut n = 1;
+        let name = loop {
+            let candidate = format!("widget_{n}");
+            if !self.widgets_list.iter().any(|w| w == &candidate) {
+                break candidate;
+            }
+            n += 1;
+        };
+        let template = r#"TITLE = "Mi widget"
+
+function render(ctx)
+    local w = ctx:width()
+    local h = ctx:height()
+    ctx:fill_rect(0, 0, w, h, 0x00000000)
+    ctx:text(24, h * 0.4, "Hola", 20, 0xFFFFFFFF)
+end
+"#;
+        let _ = std::fs::write(self.widgets_dir.join(format!("{name}.lua")), template);
+        self.widget_reload();
+        if let Some(idx) = self.widgets_list.iter().position(|w| w == &name) {
+            self.widget_select(idx);
+        }
+    }
+
+    fn widget_delete(&mut self) {
+        let Some(idx) = self.widgets_selected else { return };
+        let name = self.widgets_list[idx].clone();
+        let _ = std::fs::remove_file(self.widgets_dir.join(format!("{name}.lua")));
+        self.cfg.widgets_disabled.retain(|d| d != &name);
+        self.widget_reload();
+        self.preview_apply();
+    }
+
+    fn widget_save(&mut self) {
+        let Some(idx) = self.widgets_selected else { return };
+        let old_name = self.widgets_list[idx].clone();
+        let new_name = self.edit_text(ID_EDIT_WIDGET_NAME).unwrap_or_default().trim().to_string();
+        if new_name.is_empty() || new_name.chars().any(|c| "\\/:*?\"<>|".contains(c)) {
+            return;
+        }
+        let code = self.edit_text(ID_EDIT_WIDGET_CODE).unwrap_or_default();
+        if std::fs::write(self.widgets_dir.join(format!("{new_name}.lua")), &code).is_err() {
+            return;
+        }
+        if new_name != old_name {
+            let _ = std::fs::remove_file(self.widgets_dir.join(format!("{old_name}.lua")));
+            if let Some(pos) = self.cfg.widgets_disabled.iter().position(|d| d == &old_name) {
+                self.cfg.widgets_disabled[pos] = new_name.clone();
+            }
+        }
+        if !self.app.is_null() {
+            unsafe { (*self.app).reload_widgets(); }
+        }
+        self.widget_reload();
+        self.preview_apply();
+    }
+
+    /// Abre el formulario de posicion/tamano para el widget seleccionado:
+    /// guarda el script, y si la caja ya existe precarga su geometria actual
+    /// para editarla; si no, propone una por defecto en cascada.
+    /// Crea la caja del widget seleccionado al instante (sin formulario):
+    /// habilita el widget, añade la entrada `[[fences]] widget = ...` en una
+    /// posicion en cascada y aplica directo a la app. Para recolocar o
+    /// redimensionar se arrastra la caja en el escritorio como cualquier otra.
+    fn widget_add_as_box(&mut self) {
+        self.widget_save();
+        let Some(name) = self
+            .widgets_selected
+            .and_then(|i| self.widgets_list.get(i).cloned())
+        else {
+            return;
+        };
+        if self.widget_has_box(&name) {
+            return;
+        }
+        // Habilita el widget: lo saca de la lista de desactivados.
+        self.cfg.widgets_disabled.retain(|d| d != &name);
+        self.checks.insert(ID_CHECK_WIDGET_ENABLED, true);
+        let n = self.cfg.fences.iter().filter(|f| f.widget.is_some()).count() as i32;
+        let layout = crate::config::FenceLayout {
+            id: crate::config::String32::new(&format!("widget:{name}")),
+            x: 120 + n * 32,
+            y: 120 + n * 32,
+            width: 320,
+            height: 240,
+            widget: Some(name.clone()),
+            ..Default::default()
+        };
+        self.cfg.fences.push(layout);
+        if !self.app.is_null() {
+            unsafe {
+                (*self.app).reload_widgets();
+                // Aplica directo (sin esperar a la vista previa): la caja
+                // aparece ya, aunque otro campo de config este a medio editar.
+                (*self.app).apply_config(self.cfg.clone());
+            }
+        }
+        self.preview_apply();
+    }
+
+    /// Quita la caja instanciada para el widget seleccionado: elimina la
+    /// entrada `[[fences]] widget = ...` (el script .lua se conserva intacto).
+    fn widget_remove_box(&mut self) {
+        let Some(name) = self
+            .widgets_selected
+            .and_then(|i| self.widgets_list.get(i).cloned())
+        else {
+            return;
+        };
+        let before = self.cfg.fences.len();
+        self.cfg.fences.retain(|f| f.widget.as_deref() != Some(name.as_str()));
+        if self.cfg.fences.len() != before {
+            if !self.app.is_null() {
+                unsafe { (*self.app).apply_config(self.cfg.clone()); }
+            }
+            self.preview_apply();
+        }
+    }
+
+    fn widget_reload(&mut self) {
+        let keep = self
+            .widgets_selected
+            .and_then(|i| self.widgets_list.get(i).cloned());
+        self.widgets_list.clear();
+        if let Ok(entries) = std::fs::read_dir(&self.widgets_dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("lua") {
+                    if let Some(name) = p.file_stem().and_then(|s| s.to_str()) {
+                        self.widgets_list.push(name.to_string());
+                    }
+                }
+            }
+        }
+        self.widgets_list.sort();
+        self.widgets_list.dedup();
+        self.widgets_scroll = 0;
+        self.widgets_selected = keep
+            .as_ref()
+            .and_then(|k| self.widgets_list.iter().position(|w| w == k));
+        self.refresh_widget_fields();
+        self.invalidate();
+    }
+
+    /// ¿Ya existe una caja (`[[fences]] widget = ...`) para este script?
+    fn widget_has_box(&self, name: &str) -> bool {
+        self.cfg.fences.iter().any(|f| f.widget.as_deref() == Some(name))
+    }
+
+    /// El boton "Añadir como caja" esta activo con un script seleccionado que
+    /// aun no tiene caja.
+    fn widget_can_add(&self) -> bool {
+        self.widgets_selected
+            .and_then(|i| self.widgets_list.get(i))
+            .is_some_and(|name| !self.widget_has_box(name))
+    }
+
+    /// El boton "Quitar caja" esta activo con un script seleccionado que ya
+    /// tiene una caja instanciada.
+    fn widget_can_remove(&self) -> bool {
+        self.widgets_selected
+            .and_then(|i| self.widgets_list.get(i))
+            .is_some_and(|name| self.widget_has_box(name))
+    }
+
+    /// Refleja el estado del checkbox del widget seleccionado en
+    /// `cfg.widgets_disabled` (idempotente: se recomputa en cada recogida).
+    fn sync_widgets_disabled(&mut self) {
+        let Some(idx) = self.widgets_selected else { return };
+        let Some(name) = self.widgets_list.get(idx).cloned() else { return };
+        let enabled = self.checked(ID_CHECK_WIDGET_ENABLED);
+        let contains = self.cfg.widgets_disabled.iter().any(|d| d == &name);
+        if enabled && contains {
+            self.cfg.widgets_disabled.retain(|d| d != &name);
+        } else if !enabled && !contains {
+            self.cfg.widgets_disabled.push(name);
         }
     }
 }
@@ -1713,13 +2144,14 @@ impl Settings {
         let h = self.size.1 - HEADER_H - BAR_H;
         self.fill_rr(0.0, y0, SIDEBAR_W, h, 0.0, col(C_SIDEBAR));
         self.draw_rr(Rect { x: SIDEBAR_W - 1.0, y: y0, w: 1.0, h }, 0.0, rgba(C_CARD_BORDER, 0.6), 1.0);
-        let items: [(Panel, &'static str); 6] = [
+        let items: [(Panel, &'static str); 7] = [
             (Panel::General, self.tr.nav_general),
             (Panel::Rules, self.tr.nav_rules),
             (Panel::Appearance, self.tr.nav_appearance),
             (Panel::Language, "🌐 Idioma"),
             (Panel::Ai, "🤖 IA (Ollama)"),
             (Panel::Updates, "🔄 Updates"),
+            (Panel::Widgets, "🧩 Widgets"),
         ];
         let mut y = y0 + 16.0;
         for (panel, label) in items {
@@ -2052,6 +2484,7 @@ impl Settings {
             Panel::Language => self.panel_language(scy),
             Panel::Ai => self.panel_ai(scy),
             Panel::Updates => self.panel_updates(scy),
+            Panel::Widgets => self.panel_widgets(scy),
         }
         // Limite de desplazamiento = el punto mas bajo del contenido dibujado.
         let max_bottom = self.regions[panel_start..]
@@ -2086,6 +2519,7 @@ impl Settings {
         if self.picker.is_some() {
             self.draw_picker();
         }
+        // El formulario "Añadir como caja" flota por encima de todo.
 
         // Sincroniza los EDIT nativos FUERA del ciclo de dibujado D2D: primero
         // se ocultan los que van a moverse o desaparecer (con WS_CLIPCHILDREN,
@@ -2156,6 +2590,10 @@ impl Settings {
         self.focus.map(|i| self.focus_order.get(i) == Some(&c)).unwrap_or(false)
     }
 
+    /// Con el formulario "Añadir como caja" abierto, los EDITs del panel
+    /// subyacente se ocultan para que no asomen por encima del modal (los
+    /// hijos nativos se pintan sobre el D2D). Los campos del propio formulario
+    /// (X/Y/Ancho/Alto) siguen siendo EDITs editables.
     fn edits_focused(&self, id: u16) -> bool {
         let focus = unsafe { GetFocus() };
         self.edits.get(&id).map(|e| *e == focus).unwrap_or(false)
@@ -2245,6 +2683,8 @@ impl Settings {
                     Ctrl::Check(ID_CHECK_R_ENABLED),
                     Ctrl::Check(ID_CHECK_R_MOVE),
                     Ctrl::Check(ID_CHECK_R_FOLDERS),
+                    Ctrl::Field(ID_EDIT_R_AI_DESC),
+                    Ctrl::Btn(ID_BTN_R_AI_GEN),
                     Ctrl::Field(ID_EDIT_R_TITLE),
                     Ctrl::Field(ID_EDIT_R_GROUP_TITLE),
                     Ctrl::Field(ID_EDIT_R_FOLDER),
@@ -2283,6 +2723,7 @@ impl Settings {
                     Ctrl::Check(ID_CHECK_AI_ENABLE),
                     Ctrl::Field(ID_EDIT_AI_URL),
                     Ctrl::Field(ID_EDIT_AI_MODEL),
+                    Ctrl::Field(ID_EDIT_AI_EMBED_MODEL),
                     Ctrl::Btn(ID_BTN_AI_PING),
                 ]);
             }
@@ -2291,6 +2732,20 @@ impl Settings {
                     Ctrl::Check(ID_CHECK_AUTO_UPDATE),
                     Ctrl::Btn(ID_BTN_CHECK_UPDATES),
                     Ctrl::Btn(ID_BTN_DOWNLOAD_UPDATE),
+                ]);
+            }
+            Panel::Widgets => {
+                order.extend([
+                    Ctrl::Btn(ID_BTN_WIDGET_NEW),
+                    Ctrl::Btn(ID_BTN_WIDGET_DEL),
+                    Ctrl::Btn(ID_BTN_WIDGET_RELOAD),
+                    Ctrl::Btn(ID_BTN_WIDGET_ADD),
+                    Ctrl::Btn(ID_BTN_WIDGET_REMOVE),
+                    Ctrl::WidgetRow(0),
+                    Ctrl::Field(ID_EDIT_WIDGET_NAME),
+                    Ctrl::Check(ID_CHECK_WIDGET_ENABLED),
+                    Ctrl::Field(ID_EDIT_WIDGET_CODE),
+                    Ctrl::Btn(ID_BTN_WIDGET_SAVE),
                 ]);
             }
         }
@@ -2336,7 +2791,11 @@ impl Settings {
         match c {
             Ctrl::RuleRow(0) => !self.cfg.rules.is_empty(),
             Ctrl::RuleSort(0) => !self.cfg.rules.is_empty(),
+            Ctrl::WidgetRow(0) => !self.widgets_list.is_empty(),
             Ctrl::Btn(ID_BTN_DEL) => self.rules_selected.is_some(),
+            Ctrl::Btn(ID_BTN_WIDGET_DEL) | Ctrl::Btn(ID_BTN_WIDGET_SAVE) => self.widgets_selected.is_some(),
+            Ctrl::Btn(ID_BTN_WIDGET_ADD) => self.widget_can_add(),
+            Ctrl::Btn(ID_BTN_WIDGET_REMOVE) => self.widget_can_remove(),
             Ctrl::Btn(ID_BTN_GROUP) => self.rule_can_group(),
             Ctrl::Btn(ID_BTN_UNGROUP) => self.selected_is_grouped(),
             Ctrl::Btn(ID_BTN_UP) | Ctrl::Btn(ID_BTN_DOWN) => self.rule_can_move(if c == Ctrl::Btn(ID_BTN_UP) { -1 } else { 1 }),
@@ -2368,6 +2827,7 @@ impl Settings {
             Ctrl::Btn(ID_BTN_AI_PING) => self.test_ollama_connection(),
             Ctrl::Btn(ID_BTN_AI_DETECT_MODELS) => self.detect_models(),
             Ctrl::Btn(ID_BTN_AI_REORGANIZE) => self.reorganize_with_ai(),
+            Ctrl::Btn(ID_BTN_R_AI_GEN) => self.generate_rule_with_ai(),
             Ctrl::Btn(ID_BTN_CHECK_UPDATES) => self.check_for_updates(),
             Ctrl::Btn(ID_BTN_DOWNLOAD_UPDATE) => self.download_update(),
             Ctrl::Btn(ID_BTN_EXPORT_CFG) => self.export_config(),
@@ -2377,6 +2837,13 @@ impl Settings {
             Ctrl::Btn(ID_BTN_TEMPLATE_DEL) => self.template_delete(),
             Ctrl::Btn(ID_BTN_TEMPLATE_DEFAULT) => self.template_set_default(),
             Ctrl::Template(i) => self.template_apply_index(i),
+            Ctrl::WidgetRow(idx) => self.widget_select(idx),
+            Ctrl::Btn(ID_BTN_WIDGET_NEW) => self.widget_new(),
+            Ctrl::Btn(ID_BTN_WIDGET_DEL) => self.widget_delete(),
+            Ctrl::Btn(ID_BTN_WIDGET_SAVE) => self.widget_save(),
+            Ctrl::Btn(ID_BTN_WIDGET_RELOAD) => self.widget_reload(),
+            Ctrl::Btn(ID_BTN_WIDGET_ADD) => self.widget_add_as_box(),
+            Ctrl::Btn(ID_BTN_WIDGET_REMOVE) => self.widget_remove_box(),
             Ctrl::Folder(id) => {
                 self.pick_folder(id);
                 self.preview_apply();
@@ -2607,6 +3074,8 @@ impl Settings {
         let client_host = host.to_string();
         let client_port = port;
         let client_model = self.edit_text(ID_EDIT_AI_MODEL).unwrap_or_else(|| self.cfg.ai.model.clone());
+        let embed_model = self.edit_text(ID_EDIT_AI_EMBED_MODEL).unwrap_or_else(|| self.cfg.ai.embed_model.clone());
+        let language = self.cfg.language.clone();
         let hwnd = self.hwnd.0 as usize;
 
         // Recopilar nombres de archivos del escritorio
@@ -2640,7 +3109,7 @@ impl Settings {
                 port: client_port,
                 model: client_model,
             };
-            let suggestions = client.auto_cluster_desktop(&filenames);
+            let suggestions = client.auto_cluster_desktop(&filenames, &embed_model, &language);
             if let Ok(mut slot) = AI_CLUSTER_RESULT.lock() {
                 *slot = Some(suggestions);
             }
@@ -2670,7 +3139,7 @@ impl Settings {
                 title: sug.title.clone(),
                 enabled: true,
                 extensions: sug.extensions.clone(),
-                name_patterns: Vec::new(),
+                name_patterns: sug.name_patterns.clone(),
                 folder: sug.folder.clone(),
                 move_files: true,
                 include_folders: true,
@@ -2705,6 +3174,70 @@ impl Settings {
             let title = crate::config::wide("ZenDesktop :: Reorganización IA Completada");
             MessageBoxW(self.hwnd, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
         }
+    }
+
+    /// Genera una regla a partir de la descripcion en lenguaje natural escrita
+    /// en el panel Reglas (modelo local, fuera del hilo de UI).
+    fn generate_rule_with_ai(&mut self) {
+        if self.rules_selected.is_none() { return; }
+        if AI_BUSY.swap(true, Ordering::SeqCst) {
+            return; // Ya hay una operacion de IA en curso.
+        }
+        let desc = self.edit_text(ID_EDIT_R_AI_DESC).unwrap_or_default();
+        if desc.trim().is_empty() {
+            AI_BUSY.store(false, Ordering::SeqCst);
+            unsafe {
+                let body = crate::config::wide("ℹ️ Escribe primero una descripción de la regla (ej. 'los archivos que parezcan facturas van a Facturas').");
+                let title = crate::config::wide("ZenDesktop :: IA");
+                MessageBoxW(self.hwnd, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
+            }
+            return;
+        }
+
+        let host_url = self.edit_text(ID_EDIT_AI_URL).unwrap_or_else(|| self.cfg.ai.ollama_url.clone());
+        let host_clean = host_url.replace("http://", "").replace("https://", "");
+        let parts: Vec<&str> = host_clean.split(':').collect();
+        let host = parts.first().copied().unwrap_or("127.0.0.1").trim().to_string();
+        let port = parts.get(1).and_then(|p| p.parse::<u16>().ok()).unwrap_or(11434);
+        let client_model = self.edit_text(ID_EDIT_AI_MODEL).unwrap_or_else(|| self.cfg.ai.model.clone());
+        let language = self.cfg.language.clone();
+        let hwnd = self.hwnd.0 as usize;
+
+        let _ = std::thread::spawn(move || {
+            let hwnd = HWND(hwnd as *mut c_void);
+            let client = crate::ai::AiClient {
+                host,
+                port,
+                model: client_model,
+            };
+            let draft = client.generate_rule_from_text(&desc, &language);
+            if let Ok(mut slot) = AI_RULE_RESULT.lock() {
+                *slot = draft;
+            }
+            let _ = unsafe { PostMessageW(hwnd, WM_AI_RULE_DONE, WPARAM(0), LPARAM(0)) };
+        });
+    }
+
+    fn on_ai_rule_done(&mut self) {
+        AI_BUSY.store(false, Ordering::SeqCst);
+        let Some(draft) = AI_RULE_RESULT.lock().ok().and_then(|mut s| s.take()) else { return };
+        let Some(index) = self.rules_selected else {
+            unsafe {
+                let body = crate::config::wide("🔴 No hay ninguna regla seleccionada para aplicar la propuesta.");
+                let title = crate::config::wide("ZenDesktop :: Error IA");
+                MessageBoxW(self.hwnd, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONWARNING);
+            }
+            return;
+        };
+        // Aplicar el borrador a la regla seleccionada y refrescar los campos.
+        let rule = &mut self.cfg.rules[index];
+        rule.title = draft.title;
+        rule.folder = draft.folder;
+        rule.extensions = draft.extensions;
+        rule.name_patterns = draft.name_patterns;
+        rule.regex = draft.regex;
+        self.refresh_rule_fields();
+        self.invalidate();
     }
 
     fn check_for_updates(&self) {
@@ -3260,6 +3793,7 @@ impl Settings {
     /// (muestra el aviso correspondiente). Compartido por Guardar y Aplicar.
     fn collect_cfg(&mut self) -> Option<Config> {
         self.sync_rule_fields();
+        self.sync_widgets_disabled();
         let mut cfg = self.cfg.clone();
         let text = |id: u16| self.edit_text(id).unwrap_or_default();
         let bad_number = |name: &'static str| self.tr.warn_not_number.replace("{name}", name);
@@ -3290,6 +3824,10 @@ impl Settings {
         let ai_model = text(ID_EDIT_AI_MODEL);
         if !ai_model.trim().is_empty() {
             cfg.ai.model = ai_model.trim().to_string();
+        }
+        let ai_embed_model = text(ID_EDIT_AI_EMBED_MODEL);
+        if !ai_embed_model.trim().is_empty() {
+            cfg.ai.embed_model = ai_embed_model.trim().to_string();
         }
 
         // Carpetas donde se guardan los elementos organizados.
@@ -3783,12 +4321,21 @@ extern "system" fn dlg_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                 let (dx, dy) = (pt.x as f32 / state.scale, pt.y as f32 / state.scale);
                 // Sobre la lista de reglas, la rueda desplaza la lista
                 // interna; sobre el resto del contenido, desplaza el panel.
-                let over_list = state.panel == Panel::Rules
+                let over_list = (state.panel == Panel::Rules || state.panel == Panel::Widgets)
                     && state
                         .list_rect
                         .map(|r| dx >= r.left && dx <= r.right && dy >= r.top && dy <= r.bottom)
                         .unwrap_or(false);
-                if over_list {
+                if over_list && state.panel == Panel::Widgets {
+                    let total = state.widgets_list.len();
+                    let max_scroll = total.saturating_sub(4);
+                    let next = (state.widgets_scroll as isize + steps as isize)
+                        .clamp(0, max_scroll as isize) as usize;
+                    if next != state.widgets_scroll {
+                        state.widgets_scroll = next;
+                        state.invalidate();
+                    }
+                } else if over_list {
                     let total = state.cfg.rules.len();
                     let max_scroll = total.saturating_sub(5);
                     let next = (state.rules_scroll as isize + steps as isize)
@@ -3809,14 +4356,15 @@ extern "system" fn dlg_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
             WM_KEYDOWN => {
                 let state = &mut *state_from(hwnd);
                 let vk = wparam.0 as u32;
-                // Con el selector de color abierto solo ESC tiene efecto
-                // (cierra el selector); el teclado no maneja el dialogo.
+                // Con el selector de color abierto solo ESC tiene efecto (lo
+                // cierra); el teclado no maneja el dialogo mientras el foco
+                // vive en los EDITs del modal.
                 if state.picker.is_some() && vk != KEY_ESC {
                     return LRESULT(0);
                 }
                 match vk {
                     KEY_ESC => {
-                        // ESC primero cierra el selector de color si esta abierto.
+                        // ESC cierra primero el selector de color si esta abierto.
                         if state.picker.is_some() {
                             state.close_picker();
                         } else {
@@ -3868,6 +4416,11 @@ extern "system" fn dlg_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
             WM_AI_CLUSTER_DONE => {
                 let state = &mut *state_from(hwnd);
                 state.on_ai_cluster_done();
+                LRESULT(0)
+            }
+            WM_AI_RULE_DONE => {
+                let state = &mut *state_from(hwnd);
+                state.on_ai_rule_done();
                 LRESULT(0)
             }
             WM_UPDATE_DONE => {
@@ -4271,6 +4824,22 @@ pub fn open_dialog(current: &Config, app: *mut App) -> Option<Config> {
         let x = wa.left + ((work_w - win_w as f32) / 2.0) as i32;
         let y = wa.top + ((work_h - win_h as f32) / 2.0) as i32;
 
+        // Lista de widgets instalados (nombres de los scripts .lua).
+        let widgets_dir = (*app).widgets_dir();
+        let mut widgets_list: Vec<String> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&widgets_dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("lua") {
+                    if let Some(name) = p.file_stem().and_then(|s| s.to_str()) {
+                        widgets_list.push(name.to_string());
+                    }
+                }
+            }
+        }
+        widgets_list.sort();
+        let widgets_selected = if widgets_list.is_empty() { None } else { Some(0) };
+
         let mut settings = Settings {
             cfg: current.clone(),
             original_cfg: current.clone(),
@@ -4304,6 +4873,10 @@ pub fn open_dialog(current: &Config, app: *mut App) -> Option<Config> {
             rules_selected: if current.rules.is_empty() { None } else { Some(0) },
             rules_scroll: 0,
             rules_sort: std::collections::HashMap::new(),
+            widgets_dir,
+            widgets_list,
+            widgets_selected,
+            widgets_scroll: 0,
             scroll: 0.0,
             scroll_max: 0.0,
             content_rect: (0.0, 0.0, 0.0, 0.0),
@@ -4483,8 +5056,30 @@ pub fn open_dialog(current: &Config, app: *mut App) -> Option<Config> {
             }
         }
 
+        // Editor de codigo Lua (multilinea, con scroll vertical).
+        let code_edit = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("EDIT"),
+            w!(""),
+            WS_CHILD | WS_VSCROLL | WINDOW_STYLE((ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | ES_LEFT) as u32),
+            0,
+            0,
+            10,
+            10,
+            hwnd,
+            HMENU(ID_EDIT_WIDGET_CODE as usize as *mut c_void),
+            instance,
+            None,
+        );
+        if let Ok(code_edit) = code_edit {
+            let _ = SendMessageW(code_edit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+            let _ = ShowWindow(code_edit, SW_HIDE);
+            settings.edits.insert(ID_EDIT_WIDGET_CODE, code_edit);
+        }
+
         // Valores iniciales.
         settings.refresh_rule_fields();
+        settings.refresh_widget_fields();
         seed_edits(&settings);
 
         let _ = ShowWindow(hwnd, SW_SHOW);
@@ -4506,6 +5101,13 @@ pub fn open_dialog(current: &Config, app: *mut App) -> Option<Config> {
                 let vk = msg.wParam.0 as u32;
                 if vk == VK_TAB.0 as u32 {
                     let state = &mut *state_from(hwnd);
+                    // En el editor de codigo Lua, Tab inserta una tabulacion
+                    // en vez de mover el foco entre controles.
+                    if state.edits.get(&ID_EDIT_WIDGET_CODE).copied() == Some(msg.hwnd) {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                        continue;
+                    }
                     let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
                     state.advance_focus(if shift { -1 } else { 1 });
                     continue;
@@ -4518,9 +5120,16 @@ pub fn open_dialog(current: &Config, app: *mut App) -> Option<Config> {
                     continue;
                 }
                 if vk == VK_RETURN.0 as u32 && msg.hwnd != hwnd {
+                    let state = &mut *state_from(hwnd);
+                    // En el editor de codigo Lua, Enter inserta una linea nueva
+                    // en vez de aplicar el campo y devolver el foco.
+                    if state.edits.get(&ID_EDIT_WIDGET_CODE).copied() == Some(msg.hwnd) {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                        continue;
+                    }
                     // Enter dentro de un campo de texto: aplica en vivo y
                     // devuelve el foco al dialogo (sin cerrar).
-                    let state = &mut *state_from(hwnd);
                     state.preview_apply();
                     let _ = SetFocus(hwnd);
                     continue;
@@ -4567,6 +5176,7 @@ fn seed_edits(s: &Settings) {
         (ID_EDIT_A_GRID_ICON, format!("{}", s.cfg.appearance.grid_icon_size as u32)),
         (ID_EDIT_AI_URL, s.cfg.ai.ollama_url.clone()),
         (ID_EDIT_AI_MODEL, s.cfg.ai.model.clone()),
+        (ID_EDIT_AI_EMBED_MODEL, s.cfg.ai.embed_model.clone()),
     ];
     for (id, value) in rows {
         if let Some(edit) = s.edits.get(&id).copied() {

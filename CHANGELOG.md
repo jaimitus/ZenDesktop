@@ -7,6 +7,59 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.17] - 2026-08-13
+
+### Added
+- **Lua widget framework**: boxes that run user scripts from the widgets
+  folder (`widgets/` next to the exe, or `%APPDATA%\ZenDesktop\widgets\`).
+  Manage them in Settings → 🧩 Widgets: create, edit the code inline, rename,
+  delete, disable, or instantiate a box with "Añadir como caja" (no form — it
+  appears on the desktop immediately and is dragged/resized like any fence).
+- **Bundled example widgets** auto-installed on first run: `Reloj` (clock),
+  `Notas` (todo list), `Clima` (Open-Meteo, no API key) and `Contador`
+  (interactive counter demo). They install only when the widgets folder is
+  empty or contains only bundled examples, so user scripts are never touched.
+- **Expanded sandbox API** so widgets can be truly complex:
+  - Drawing: `line`, `circle`, `circle_stroke`, `round_rect` (with border),
+    `text_center` / `text_right` (real measured sizes via DirectWrite);
+  - Images: `ctx:image(url, x, y, w, h)` — async download + bounded cache
+    (32 entries, 1024 px max, 5 min TTL), JPEG/PNG/GIF/BMP;
+  - Interactivity: `function click(x, y, w, h)` is called on body presses
+    (header drags and the resize grip still work normally);
+  - Persistent state: the global `state` table survives across renders and
+    clicks;
+  - System API: `app:open(path)` (launch with default app), `app:notify(msg)`
+    (toast), `app:version()`;
+  - HTTP API: `http:get` / `http:get_json` (async, cached, never blocks UI).
+- **Spotify widget**: an OAuth PKCE now-playing box with cover art, progress
+  bar with elapsed/total times, volume slider (drag to adjust), previous /
+  play-pause / next controls, playback device name, disconnect button, and a
+  queue view (☰) where clicking any track jumps to it (with mouse-wheel
+  scroll). The Spotify Client ID lives in the code (`SPOTIFY_CLIENT_ID`),
+  no configuration needed.
+- **AI rule generation**: describe a rule in plain text and Ollama creates it
+  (title, folder, extensions, name patterns, regex); the AI can also
+  auto-cluster the desktop into suggested rules using embeddings.
+- **Undo moves**: files moved into fences can be undone (undo stack with
+  retry when the destination is locked).
+- **Per-fence list/grid view**: each rule picks its own view mode
+  (Auto/List/Grid) from Settings → Rules, overriding the global appearance.
+
+### Fixed
+- **"Añadir como caja" worked but the box vanished instantly**: the live
+  settings preview calls `normalize()`, which pruned every fence whose id was
+  not a rule — widget boxes (`widget:clima`) were deleted a split second
+  after being created. `normalize()` now keeps widget fences.
+- **Widget boxes could not be moved/resized**: body-click interception was
+  swallowing header and resize-grip presses too. Only body clicks are
+  intercepted now; header drags move the box and the corner grip resizes it
+  like any other fence. Invisible lock/pin hit-tests are disabled on widget
+  boxes.
+- **Contador Reset button**: `click` now receives the real body size
+  (`x, y, w, h`), so hit-testing stays correct when the box is resized.
+- **Spotify Client ID field** removed from the Settings UI — the ID is
+  compiled in; configs that already have one keep it.
+
 ## [1.0.16] - 2026-08-13
 
 ### Added
