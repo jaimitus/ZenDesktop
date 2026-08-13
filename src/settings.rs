@@ -132,7 +132,6 @@ const ID_BTN_UP: u16 = 203;
 const ID_BTN_DOWN: u16 = 204;
 const ID_BTN_OK: u16 = 205;
 const ID_BTN_CANCEL: u16 = 206;
-const ID_BTN_APPLY: u16 = 207;
 const ID_BTN_GROUP: u16 = 208;
 const ID_BTN_UNGROUP: u16 = 209;
 const ID_BTN_AI_PING: u16 = 210;
@@ -169,6 +168,10 @@ static UPDATE_BUSY: AtomicBool = AtomicBool::new(false);
 
 /// Timer de animacion del spinner mientras hay una operacion de red en curso.
 const BUSY_TIMER_ID: usize = 0x4E5;
+/// Timer que aplaza la reconstruccion de la vista previa para coalescer
+/// rafagas de cambios (tecleo + blur, doble clic, toggles rapidos).
+const PREVIEW_TIMER_ID: usize = 0x4E6;
+const PREVIEW_DEBOUNCE_MS: u32 = 200;
 
 const ALL_EDITS: [u16; 28] = [
     ID_EDIT_MAX_AGE, ID_EDIT_MIN_AGE, ID_EDIT_PURGE, ID_EDIT_R_TITLE, ID_EDIT_R_FOLDER,
@@ -216,8 +219,6 @@ const C_DANGER: &str = "#F472B6";
 enum BtnKind {
     /// Secundario silencioso: fondo transparente y borde tenue (Cancelar).
     Ghost,
-    /// Accion alternativa: contorno y texto de acento (Aplicar).
-    Outline,
     /// Accion principal: relleno de acento solido con sombra (Guardar).
     Primary,
 }
@@ -296,6 +297,9 @@ struct Rect {
 
 struct Settings {
     cfg: Config,
+    /// Configuracion tal y como estaba al abrir el dialogo: permite revertir
+    /// la vista previa en vivo al cancelar o cerrar sin guardar.
+    original_cfg: Config,
     hwnd: HWND,
     scale: f32,
     // Tamaño del lienzo en DIPs (independiente del DPI). Los metodos de
@@ -356,6 +360,11 @@ struct Settings {
 
     finished: bool,
     result: bool,
+    /// Suprime los MessageBoxW de aviso durante la recogida silenciosa (vista
+    /// previa en vivo): un campo a medio editar no debe interrumpir al usuario.
+    suppress_warnings: bool,
+    /// true si hay cambios en la vista previa aun no persistidos con Guardar.
+    dirty: bool,
     target_px_size: (u32, u32),
     // Fase de animacion del spinner (0..1) y si el timer de repintado esta vivo.
     spinner_phase: f32,
@@ -967,17 +976,6 @@ impl Settings {
                 },
                 if over { rgba(C_ACCENT, 0.5) } else { rgba(C_FIELD_BORDER, 0.9) },
                 if over { col(C_TEXT) } else { col(C_MUTED) },
-            ),
-            BtnKind::Outline => (
-                if pressed {
-                    rgba(C_ACCENT, 0.3)
-                } else if over {
-                    rgba(C_ACCENT, 0.16)
-                } else {
-                    rgba(C_ACCENT, 0.07)
-                },
-                rgba(C_ACCENT, if over { 0.95 } else { 0.55 }),
-                col(C_ACCENT),
             ),
             BtnKind::Primary => (
                 if pressed {
@@ -1619,7 +1617,7 @@ impl Settings {
         }
         // Pie de la barra lateral: version.
         self.text(
-            "v1.0.11",
+            concat!("v", env!("CARGO_PKG_VERSION")),
             Fmt::Small,
             D2D_RECT_F {
                 left: 12.0,
@@ -1639,9 +1637,25 @@ impl Settings {
         let (bw, bh) = (112.0, 36.0);
         let bx = w - 24.0 - bw;
         let by = y0 + (BAR_H - bh) / 2.0;
-        // Aplicar guarda y aplica en caliente sin cerrar el dialogo.
-        self.push_button(Rect { x: bx - 16.0 - bw - 16.0 - bw, y: by, w: bw, h: bh }, self.tr.btn_cancel, ID_BTN_CANCEL, BtnKind::Ghost);
-        self.push_button(Rect { x: bx - 16.0 - bw, y: by, w: bw, h: bh }, self.tr.btn_apply, ID_BTN_APPLY, BtnKind::Outline);
+        // Indicador de cambios sin guardar (vista previa aun no persistida).
+        if self.dirty {
+            let dot = 6.0;
+            let dot_y = y0 + (BAR_H - dot) / 2.0;
+            self.fill_rr(24.0, dot_y, dot, dot, dot / 2.0, col(C_ACCENT));
+            self.text(
+                self.tr.unsaved_changes,
+                Fmt::Small,
+                D2D_RECT_F {
+                    left: 24.0 + dot + 8.0,
+                    top: y0,
+                    right: bx - 16.0 - bw - 12.0,
+                    bottom: y0 + BAR_H,
+                },
+                col(C_MUTED),
+            );
+        }
+        // Los cambios se aplican en vivo; Cancelar revierte y Guardar persiste.
+        self.push_button(Rect { x: bx - 16.0 - bw, y: by, w: bw, h: bh }, self.tr.btn_cancel, ID_BTN_CANCEL, BtnKind::Ghost);
         self.push_button(Rect { x: bx, y: by, w: bw, h: bh }, self.tr.btn_save, ID_BTN_OK, BtnKind::Primary);
     }
 
@@ -1813,7 +1827,8 @@ impl Settings {
     fn close_picker(&mut self) {
         if self.picker.is_some() {
             self.picker = None;
-            self.invalidate();
+            // El color elegido ya se escribio en el EDIT: aplicarlo en vivo.
+            self.preview_apply();
         }
     }
 
@@ -2171,6 +2186,7 @@ impl Settings {
         match ctrl {
             Ctrl::Close | Ctrl::Btn(ID_BTN_CANCEL) => {
                 self.result = false;
+                self.revert_preview();
                 self.finish();
             }
             Ctrl::Minimize => {
@@ -2184,10 +2200,9 @@ impl Settings {
             Ctrl::Check(id) => {
                 let v = self.checked(id);
                 self.checks.insert(id, !v);
-                self.invalidate();
+                self.preview_apply();
             }
             Ctrl::Btn(ID_BTN_OK) => self.save_and_close(),
-            Ctrl::Btn(ID_BTN_APPLY) => self.apply_and_keep(),
             Ctrl::Btn(ID_BTN_AI_PING) => self.test_ollama_connection(),
             Ctrl::Btn(ID_BTN_AI_DETECT_MODELS) => self.detect_models(),
             Ctrl::Btn(ID_BTN_AI_REORGANIZE) => self.reorganize_with_ai(),
@@ -2200,13 +2215,34 @@ impl Settings {
             Ctrl::Btn(ID_BTN_TEMPLATE_DEL) => self.template_delete(),
             Ctrl::Btn(ID_BTN_TEMPLATE_DEFAULT) => self.template_set_default(),
             Ctrl::Template(i) => self.template_apply_index(i),
-            Ctrl::Folder(id) => self.pick_folder(id),
-            Ctrl::Btn(ID_BTN_NEW) => self.new_rule(),
-            Ctrl::Btn(ID_BTN_DEL) => self.delete_rule(),
-            Ctrl::Btn(ID_BTN_GROUP) => self.group_rule(),
-            Ctrl::Btn(ID_BTN_UNGROUP) => self.ungroup_rule(),
-            Ctrl::Btn(ID_BTN_UP) => self.move_rule(-1),
-            Ctrl::Btn(ID_BTN_DOWN) => self.move_rule(1),
+            Ctrl::Folder(id) => {
+                self.pick_folder(id);
+                self.preview_apply();
+            }
+            Ctrl::Btn(ID_BTN_NEW) => {
+                self.new_rule();
+                self.preview_apply();
+            }
+            Ctrl::Btn(ID_BTN_DEL) => {
+                self.delete_rule();
+                self.preview_apply();
+            }
+            Ctrl::Btn(ID_BTN_GROUP) => {
+                self.group_rule();
+                self.preview_apply();
+            }
+            Ctrl::Btn(ID_BTN_UNGROUP) => {
+                self.ungroup_rule();
+                self.preview_apply();
+            }
+            Ctrl::Btn(ID_BTN_UP) => {
+                self.move_rule(-1);
+                self.preview_apply();
+            }
+            Ctrl::Btn(ID_BTN_DOWN) => {
+                self.move_rule(1);
+                self.preview_apply();
+            }
             Ctrl::RuleSort(idx) => {
                     let current = self.rules_sort.get(&idx).and_then(|m| m.as_deref()).unwrap_or(&self.cfg.appearance.sort_by);
                     let next = crate::rules::next_sort_mode(current);
@@ -2216,13 +2252,13 @@ impl Settings {
                     } else {
                         self.rules_sort.insert(idx, Some(next.to_string()));
                     }
-                    self.invalidate();
+                    self.preview_apply();
                 }
             Ctrl::RuleView(idx, value) => {
                 if let Some(rule) = self.cfg.rules.get_mut(idx) {
                     rule.view_mode = value.to_string();
                 }
-                self.invalidate();
+                self.preview_apply();
             }
             Ctrl::RuleRow(idx) => {
                 self.sync_rule_fields();
@@ -2235,17 +2271,15 @@ impl Settings {
                     unsafe { let _ = SetFocus(edit); }
                 }
             }
-            Ctrl::Lang(lang) => self.set_lang(lang),
+            Ctrl::Lang(lang) => {
+                self.set_lang(lang);
+                self.preview_apply();
+            }
             Ctrl::Theme(key) => {
                 self.cfg.appearance.apply_preset(key);
                 self.refresh_appearance_fields();
-                if !self.app.is_null() {
-                    unsafe {
-                        (*self.app).apply_config(self.cfg.clone());
-                    }
-                }
                 self.hover = None;
-                self.invalidate();
+                self.preview_apply();
             }
             _ => {}
         }
@@ -2486,7 +2520,7 @@ impl Settings {
 
         // Aplicar la nueva configuración inmediatamente a la app y organizar en vivo
         let cfg_to_apply = self.cfg.clone();
-        app.apply_dialog_cfg(cfg_to_apply);
+        app.apply_dialog_cfg(cfg_to_apply, true);
 
         self.invalidate();
 
@@ -2694,7 +2728,7 @@ impl Settings {
                 self.build_focus_order();
                 if !self.app.is_null() {
                     // Guarda en disco, aplica en caliente y organiza.
-                    unsafe { (*self.app).apply_dialog_cfg(self.cfg.clone()); }
+                    unsafe { (*self.app).apply_dialog_cfg(self.cfg.clone(), true); }
                 }
                 self.invalidate();
                 unsafe {
@@ -3175,16 +3209,63 @@ impl Settings {
         }
     }
 
-    /// Guarda y aplica los cambios en caliente sin cerrar el dialogo.
-    fn apply_and_keep(&mut self) {
-        if let Some(cfg) = self.collect_cfg() {
-            self.cfg = cfg;
-            if !self.app.is_null() {
-                unsafe {
-                    (*self.app).apply_dialog_cfg(self.cfg.clone());
+    /// Recoge la configuracion sin mostrar avisos: un campo a medio editar
+    /// devuelve `None` en silencio para no interrumpir la vista previa.
+    fn collect_cfg_quiet(&mut self) -> Option<Config> {
+        self.suppress_warnings = true;
+        let r = self.collect_cfg();
+        self.suppress_warnings = false;
+        r
+    }
+
+    /// Vuelca las preferencias de orden por regla (rules_sort) sobre
+    /// `cfg.fences`, creando el FenceLayout si la regla aun no tiene entrada.
+    fn sync_rules_sort_into(&self, cfg: &mut Config) {
+        for (rule_idx, sort_opt) in self.rules_sort.iter() {
+            if let Some(rule) = cfg.rules.get(*rule_idx) {
+                match cfg.fences.iter_mut().find(|f| f.id.as_str() == rule.id || f.tabs.iter().any(|t| t == &rule.id)) {
+                    Some(slot) => slot.sort_by = sort_opt.clone(),
+                    None => {
+                        let fl = crate::config::FenceLayout {
+                            id: crate::config::String32::new(&rule.id),
+                            sort_by: sort_opt.clone(),
+                            ..Default::default()
+                        };
+                        cfg.fences.push(fl);
+                    }
                 }
             }
-            self.invalidate();
+        }
+    }
+
+    /// Marca la vista previa como sucia y programa la reconstruccion real con
+    /// un debounce corto: las rafagas (tecleo + blur, doble clic, toggles
+    /// rapidos) coalescen en una sola pasada en vez de reconstruir a cada evento.
+    fn preview_apply(&mut self) {
+        self.dirty = true;
+        self.invalidate();
+        unsafe {
+            let _ = KillTimer(self.hwnd, PREVIEW_TIMER_ID);
+            let _ = SetTimer(self.hwnd, PREVIEW_TIMER_ID, PREVIEW_DEBOUNCE_MS, None);
+        }
+    }
+
+    /// Aplica de verdad la configuracion editada (sin guardar en disco ni
+    /// organizar), al expirar el debounce de la vista previa.
+    fn flush_preview(&mut self) {
+        let Some(mut cfg) = self.collect_cfg_quiet() else { return };
+        self.sync_rules_sort_into(&mut cfg);
+        self.cfg = cfg;
+        if !self.app.is_null() {
+            unsafe { (*self.app).apply_config(self.cfg.clone()); }
+        }
+    }
+
+    /// Revierte la vista previa devolviendo la app a la configuracion original
+    /// (al cancelar o cerrar sin guardar).
+    fn revert_preview(&mut self) {
+        if !self.app.is_null() {
+            unsafe { (*self.app).apply_config(self.original_cfg.clone()); }
         }
     }
 
@@ -3220,6 +3301,9 @@ impl Settings {
     }
 
     fn warn(&mut self, message: &str) {
+        if self.suppress_warnings {
+            return;
+        }
         let text = wide(&format!("{message}\n\n{}", self.tr.warn_not_saved));
         unsafe {
             MessageBoxW(None, PCWSTR(text.as_ptr()), w!("ZenDesktop"), MB_OK | MB_ICONWARNING);
@@ -3566,6 +3650,10 @@ extern "system" fn dlg_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                     let state = &mut *state_from(hwnd);
                     state.spinner_phase = (state.spinner_phase + 0.125).fract();
                     state.invalidate();
+                } else if wparam.0 == PREVIEW_TIMER_ID {
+                    let state = &mut *state_from(hwnd);
+                    let _ = KillTimer(hwnd, PREVIEW_TIMER_ID);
+                    state.flush_preview();
                 }
                 LRESULT(0)
             }
@@ -3589,6 +3677,18 @@ extern "system" fn dlg_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                 state.on_update_done();
                 LRESULT(0)
             }
+            WM_COMMAND => {
+                // Los EDIT nativos notifican al dialogo por WM_COMMAND. Al
+                // perder el foco un campo de texto (EN_KILLFOCUS) se aplica su
+                // valor en vivo; mientras se teclea no se toca nada para no
+                // reconstruir las cajas a cada pulsacion.
+                let code = ((wparam.0 as u32) >> 16) & 0xFFFF;
+                if code == EN_KILLFOCUS {
+                    let state = &mut *state_from(hwnd);
+                    state.preview_apply();
+                }
+                LRESULT(0)
+            }
             WM_CLOSE => {
                 let state = &mut *state_from(hwnd);
                 if state.busy_timer {
@@ -3597,12 +3697,17 @@ extern "system" fn dlg_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                 }
                 AI_BUSY.store(false, Ordering::SeqCst);
                 UPDATE_BUSY.store(false, Ordering::SeqCst);
+                // Cierre sin guardar (Alt+F4 o el flujo de actualizacion):
+                // deshacer la vista previa como en Cancelar.
+                state.result = false;
+                state.revert_preview();
                 state.finished = true;
                 LRESULT(0)
             }
             WM_DESTROY => {
                 // Red de seguridad: si la ventana se destruye por otra via.
                 let _ = KillTimer(hwnd, BUSY_TIMER_ID);
+                let _ = KillTimer(hwnd, PREVIEW_TIMER_ID);
                 // Sin PostQuitMessage: el bucle principal de la app decide.
                 LRESULT(0)
             }
@@ -3899,6 +4004,7 @@ pub fn open_dialog(current: &Config, app: *mut App) -> Option<Config> {
 
         let mut settings = Settings {
             cfg: current.clone(),
+            original_cfg: current.clone(),
             hwnd: HWND::default(),
             scale,
             // Tamaño en DIPs (el lienzo D2D escala solo).
@@ -3935,6 +4041,8 @@ pub fn open_dialog(current: &Config, app: *mut App) -> Option<Config> {
             app,
             finished: false,
             result: false,
+            suppress_warnings: false,
+            dirty: false,
             target_px_size: (0, 0),
             spinner_phase: 0.0,
             busy_timer: false,
@@ -4135,13 +4243,16 @@ pub fn open_dialog(current: &Config, app: *mut App) -> Option<Config> {
                 if vk == KEY_ESC {
                     let state = &mut *state_from(hwnd);
                     state.result = false;
+                    state.revert_preview();
                     state.finish();
                     continue;
                 }
                 if vk == VK_RETURN.0 as u32 && msg.hwnd != hwnd {
-                    // Enter dentro de un campo de texto: guardar.
+                    // Enter dentro de un campo de texto: aplica en vivo y
+                    // devuelve el foco al dialogo (sin cerrar).
                     let state = &mut *state_from(hwnd);
-                    state.save_and_close();
+                    state.preview_apply();
+                    let _ = SetFocus(hwnd);
                     continue;
                 }
             }
@@ -4151,21 +4262,9 @@ pub fn open_dialog(current: &Config, app: *mut App) -> Option<Config> {
 
         // Sincronizar ordenes por regla -> cfg.fences antes de devolver.
         if settings.result {
-            for (rule_idx, sort_opt) in settings.rules_sort.iter() {
-                if let Some(rule) = settings.cfg.rules.get(*rule_idx) {
-                    match settings.cfg.fences.iter_mut().find(|f| f.id.as_str() == rule.id || f.tabs.iter().any(|t| t == &rule.id)) {
-                        Some(slot) => slot.sort_by = sort_opt.clone(),
-                        None => {
-                            let fl = crate::config::FenceLayout {
-                                id: crate::config::String32::new(&rule.id),
-                                sort_by: sort_opt.clone(),
-                                ..Default::default()
-                            };
-                            settings.cfg.fences.push(fl);
-                        }
-                    }
-                }
-            }
+            let mut cfg = settings.cfg.clone();
+            settings.sync_rules_sort_into(&mut cfg);
+            settings.cfg = cfg;
         }
         let result = if settings.result { Some(settings.cfg.clone()) } else { None };
         let _ = DestroyWindow(hwnd);

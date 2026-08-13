@@ -227,7 +227,7 @@ pub struct Appearance {
     pub grid_icon_size: f32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Ephemeral {
     pub enabled: bool,
@@ -245,7 +245,7 @@ pub struct Ephemeral {
     pub purge_archive_after_days: u32,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Rule {
     /// Identificador estable, usado para casar la geometria de la caja.
@@ -809,6 +809,19 @@ impl Config {
     pub fn archive_dir(&self) -> PathBuf {
         resolve_folder(&self.general.archive_folder)
     }
+
+    /// true si cambio algo que afecta a la organizacion (reglas, carpetas de
+    /// destino/archivo, protecciones o caducidad). Permite saltarse pasadas de
+    /// organizacion innecesarias al guardar cambios puramente visuales.
+    pub fn organize_relevant_changed(&self, other: &Config) -> bool {
+        self.general.root_folder != other.general.root_folder
+            || self.general.archive_folder != other.general.archive_folder
+            || self.general.organize_folders != other.general.organize_folders
+            || self.general.protected != other.general.protected
+            || self.general.keep_shortcuts != other.general.keep_shortcuts
+            || self.rules != other.rules
+            || self.ephemeral != other.ephemeral
+    }
 }
 
 fn dir_is_writable(dir: &Path) -> bool {
@@ -1212,5 +1225,37 @@ mod tests {
             .map(|t| t.name.as_str())
             .collect();
         assert_eq!(defaults, vec!["a"]);
+    }
+
+    #[test]
+    fn organize_relevant_changed_detects_rule_and_folder_edits_only() {
+        let base = Config::default();
+
+        // Sin cambios -> false.
+        assert!(!base.organize_relevant_changed(&base.clone()));
+
+        // Cambio puramente visual (color) -> false.
+        let mut visual = Config::default();
+        visual.appearance.background = "#112233".into();
+        assert!(!visual.organize_relevant_changed(&base));
+
+        // Cambio en una regla -> true.
+        let mut with_rule = Config::default();
+        with_rule.rules.push(Rule {
+            id: "r".into(),
+            folder: "docs".into(),
+            ..Default::default()
+        });
+        assert!(with_rule.organize_relevant_changed(&base));
+
+        // Cambio en la carpeta raiz -> true.
+        let mut root = Config::default();
+        root.general.root_folder = "otra".into();
+        assert!(root.organize_relevant_changed(&base));
+
+        // Cambio en caducidad (ephemeral) -> true.
+        let mut ephemeral = Config::default();
+        ephemeral.ephemeral.max_age_days = 7.0;
+        assert!(ephemeral.organize_relevant_changed(&base));
     }
 }

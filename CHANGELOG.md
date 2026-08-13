@@ -7,6 +7,31 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.13] - 2026-08-13
+
+### Changed
+- **Live settings preview**: options now apply instantly as you change them
+  (theme, colors, sizes, rules, language, folders…), so you see the result
+  immediately without an Apply button.
+- Removed the **Apply** button: **Save** persists the changes and closes,
+  **Cancel** reverts the live preview back to the state before opening
+  Settings. Text fields commit when they lose focus or on Enter.
+- An **unsaved changes** indicator (accent dot + label) appears in the
+  Settings bar while the preview differs from the saved state.
+- **Debounced preview**: rapid changes (typing + blur, fast toggles) coalesce
+  into a single fence rebuild ~200 ms after the last change, so the desktop
+  doesn't flicker while editing.
+- **State preserved on rebuild**: fences keep their scroll position, selection,
+  search text and active tab across live-preview rebuilds, so changing a
+  color no longer resets what you were looking at.
+- **Selective organize**: saving now only runs an organization pass when the
+  rules or folders actually changed, so a purely visual tweak no longer
+  sweeps the desktop.
+
+### Fixed
+- Settings sidebar now shows the real build version instead of a hardcoded
+  `v1.0.11`.
+
 ## [1.0.12] - 2026-08-13
 
 ### Added

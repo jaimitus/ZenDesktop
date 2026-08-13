@@ -1331,6 +1331,29 @@ impl App {
 
     /// Crea una ventana por regla activa y calcula la geometria inicial.
     unsafe fn build_fences(&mut self) -> WinResult<()> {
+        // Snapshot del estado editable (scroll, busqueda, seleccion, pestana
+        // activa) por regla, para restaurarlo tras reconstruir las cajas: asi
+        // un cambio visual en la vista previa no resetea la posicion ni la
+        // seleccion del usuario.
+        let mut tab_snap: HashMap<String, (i32, f32, bool, String, HashSet<PathBuf>)> = HashMap::new();
+        let mut active_snap: HashMap<String, String> = HashMap::new();
+        for fence in &self.fences {
+            if let Some(first) = fence.tabs.first() {
+                active_snap.insert(first.content.id.clone(), fence.tabs[fence.active_tab].content.id.clone());
+            }
+            for tab in &fence.tabs {
+                let selected_paths: HashSet<PathBuf> = tab
+                    .selected
+                    .iter()
+                    .filter_map(|&i| tab.content.items.get(i).map(|it| it.path.clone()))
+                    .collect();
+                tab_snap.insert(
+                    tab.content.id.clone(),
+                    (tab.scroll, tab.smooth_scroll, tab.search_focused, tab.search_text.clone(), selected_paths),
+                );
+            }
+        }
+
         for fence in self.fences.drain(..) {
             let _ = RevokeDragDrop(fence.hwnd);
             let _ = DestroyWindow(fence.hwnd);
@@ -1340,23 +1363,38 @@ impl App {
         let mut unassigned: Vec<Option<rules::FenceContent>> = contents.into_iter().map(Some).collect();
         let mut grouped_fences: Vec<(FenceLayout, Vec<FenceTab>)> = Vec::new();
 
+        // Construye una pestana restaurando el estado previo de la misma regla.
+        let mut make_tab = |content: rules::FenceContent| -> FenceTab {
+            let id = content.id.clone();
+            let (scroll, smooth_scroll, search_focused, search_text, selected_paths) = match tab_snap.remove(&id) {
+                Some(v) => v,
+                None => (0, 0.0, false, String::new(), HashSet::new()),
+            };
+            let selected: HashSet<usize> = selected_paths
+                .iter()
+                .filter_map(|p| content.items.iter().position(|it| &it.path == p))
+                .collect();
+            let max_scroll = content.items.len().saturating_sub(1) as i32;
+            FenceTab {
+                content,
+                selected,
+                scroll: scroll.clamp(0, max_scroll),
+                smooth_scroll: smooth_scroll.clamp(0.0, scroll as f32),
+                search_focused,
+                search_text,
+                rename_item: None,
+                rename_text: String::new(),
+                rename_path: None,
+            }
+        };
+
         for layout in &self.cfg.fences {
             let mut tabs = Vec::new();
             if !layout.tabs.is_empty() {
                 for tab_id in &layout.tabs {
                     if let Some(idx) = unassigned.iter().position(|c| c.as_ref().is_some_and(|content| &content.id == tab_id)) {
                         if let Some(content) = unassigned[idx].take() {
-                            tabs.push(FenceTab {
-                                content,
-                                selected: HashSet::new(),
-                                scroll: 0,
-                                smooth_scroll: 0.0,
-                                search_focused: false,
-                                search_text: String::new(),
-                                rename_item: None,
-                                rename_text: String::new(),
-                                rename_path: None,
-                            });
+                            tabs.push(make_tab(content));
                         }
                     }
                 }
@@ -1364,17 +1402,7 @@ impl App {
                 let target_id = layout.id.as_str();
                 if let Some(idx) = unassigned.iter().position(|c| c.as_ref().is_some_and(|content| content.id == target_id)) {
                     if let Some(content) = unassigned[idx].take() {
-                        tabs.push(FenceTab {
-                            content,
-                            selected: HashSet::new(),
-                            scroll: 0,
-                            smooth_scroll: 0.0,
-                            search_focused: false,
-                            search_text: String::new(),
-                            rename_item: None,
-                            rename_text: String::new(),
-                            rename_path: None,
-                        });
+                        tabs.push(make_tab(content));
                     }
                 }
             }
@@ -1409,17 +1437,7 @@ impl App {
                 group_title: None,
                 monitor: None,
             };
-            let tabs = vec![FenceTab {
-                content,
-                selected: HashSet::new(),
-                scroll: 0,
-                smooth_scroll: 0.0,
-                search_focused: false,
-                search_text: String::new(),
-                rename_item: None,
-                rename_text: String::new(),
-                rename_path: None,
-            }];
+            let tabs = vec![make_tab(content)];
             grouped_fences.push((layout, tabs));
         }
 
@@ -1443,11 +1461,18 @@ impl App {
 
             let dpi = GetDpiForWindow(hwnd) as f32;
             let accent = color(&tabs[0].content.color);
-            
+            // Restaura la pestana activa de la misma caja (mejor esfuerzo tras
+            // agrupar/desagrupar).
+            let group_key = tabs[0].content.id.clone();
+            let active_tab = active_snap
+                .remove(&group_key)
+                .and_then(|aid| tabs.iter().position(|t| t.content.id == aid))
+                .unwrap_or(0);
+
             let fence = Fence {
                 hwnd,
                 tabs,
-                active_tab: 0,
+                active_tab,
                 accent,
                 layout: layout.clone(),
                 surface: None,
@@ -3454,9 +3479,13 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
             return;
         }
         self.settings_open = true;
-        // El dialogo recibe el puntero a la app para que "Aplicar" guarde y
-        // aplique en caliente sin cerrar la ventana (mismo hilo, dialogo
-        // modal, asi que el puntero es seguro mientras dura la llamada).
+        // Snapshot anterior al dialogo: la vista previa en vivo ya ha ido
+        // aplicando cambios, asi que se compara contra esta copia para saber
+        // si las reglas/carpetas cambiaron y hay que organizar.
+        let original = self.cfg.clone();
+        // El dialogo recibe el puntero a la app para aplicar la vista previa
+        // en vivo (mismo hilo, dialogo modal, asi que el puntero es seguro
+        // mientras dura la llamada).
         let app_ptr = self as *mut App;
         let chosen = settings::open_dialog(&self.cfg, app_ptr);
         self.settings_open = false;
@@ -3478,19 +3507,26 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
         }
         // Conserva la geometria actual de las cajas, que el dialogo no toca.
         cfg.fences = self.cfg.fences.clone();
-        self.apply_dialog_cfg(cfg);
+        // Organizar solo si cambiaron las reglas o carpetas (no por un cambio
+        // visual); asi un ajuste de color no lanza una pasada sobre el escritorio.
+        let organize = cfg.organize_relevant_changed(&original);
+        self.apply_dialog_cfg(cfg, organize);
     }
 
-    /// Aplica una configuracion ya validada por el dialogo (autostart, tema,
-    /// cajas, vigilante, guardado en disco y una pasada de organizacion). La
-    /// usan tanto "Guardar" (cierra el dialogo) como "Aplicar" (sin cerrar).
-    pub(crate) fn apply_dialog_cfg(&mut self, cfg: Config) {
+    /// Aplica una configuracion ya validada por el dialogo: autostart, tema,
+    /// cajas, vigilante y guardado en disco. La pasada de organizacion solo se
+    /// ejecuta cuando `organize` es true (el llamador decide si las reglas o
+    /// carpetas cambiaron de verdad, para no mover ficheros por un cambio de
+    /// color o tema).
+    pub(crate) fn apply_dialog_cfg(&mut self, cfg: Config, organize: bool) {
         if cfg.general.start_with_windows != self.cfg.general.start_with_windows {
             let _ = crate::config::apply_autostart(cfg.general.start_with_windows);
         }
         self.apply_config(cfg);
         let _ = self.cfg.save(&self.cfg_path);
-        self.organize_now();
+        if organize {
+            self.organize_now();
+        }
     }
 
     fn persist_layout(&mut self) {
