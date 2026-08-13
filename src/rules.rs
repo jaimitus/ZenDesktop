@@ -142,7 +142,14 @@ pub fn ensure_layout(cfg: &Config) -> io::Result<Vec<PathBuf>> {
 
 /// Devuelve la primera regla que casa. El orden del array `rules` de
 /// config.toml es, por tanto, la prioridad: la regla comodin va la ultima.
-pub fn classify<'a>(cfg: &'a Config, name: &str, ext: &str, is_dir: bool) -> Option<&'a Rule> {
+pub fn classify<'a>(
+    cfg: &'a Config,
+    name: &str,
+    ext: &str,
+    is_dir: bool,
+    size: Option<u64>,
+    modified: Option<SystemTime>,
+) -> Option<&'a Rule> {
     let lower_name = name.to_ascii_lowercase();
     let lower_ext = ext.to_ascii_lowercase();
 
@@ -195,7 +202,7 @@ pub fn classify<'a>(cfg: &'a Config, name: &str, ext: &str, is_dir: bool) -> Opt
             .name_patterns
             .iter()
             .any(|pattern| wildcard_match(&pattern.to_ascii_lowercase(), &lower_name));
-        ext_hit || name_hit
+        (ext_hit || name_hit) && rule_extra_matches(rule, name, size, modified)
     });
 
     if let Some(rule) = hit {
@@ -211,7 +218,58 @@ pub fn classify<'a>(cfg: &'a Config, name: &str, ext: &str, is_dir: bool) -> Opt
             return false;
         }
         rule.extensions.iter().any(|candidate| candidate == "*")
+            && rule_extra_matches(rule, name, size, modified)
     })
+}
+
+/// Filtros avanzados (tamano / fecha / regex) de una regla. Devuelve `true`
+/// si el archivo cumple todos los criterios configurados (o si no hay ninguno).
+fn rule_extra_matches(
+    rule: &Rule,
+    name: &str,
+    size: Option<u64>,
+    modified: Option<SystemTime>,
+) -> bool {
+    if let Some(min) = rule.min_size_bytes {
+        match size {
+            Some(s) if s >= min => {}
+            _ => return false,
+        }
+    }
+    if let Some(max) = rule.max_size_bytes {
+        match size {
+            Some(s) if s <= max => {}
+            _ => return false,
+        }
+    }
+    if rule.newer_than_days.is_some() || rule.older_than_days.is_some() {
+        let Some(modified) = modified else { return false };
+        let age_days = SystemTime::now()
+            .duration_since(modified)
+            .map(|d| d.as_secs_f64() / 86400.0)
+            .unwrap_or(0.0);
+        if let Some(days) = rule.newer_than_days {
+            if age_days > days {
+                return false;
+            }
+        }
+        if let Some(days) = rule.older_than_days {
+            if age_days < days {
+                return false;
+            }
+        }
+    }
+    if let Some(pattern) = &rule.regex {
+        match regex::Regex::new(pattern) {
+            Ok(re) => {
+                if !re.is_match(name) {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 /// Archivos que ZenDesktop no debe tocar jamas.
@@ -284,7 +342,10 @@ pub fn organize(cfg: &Config, desktop: &Path) -> Report {
         }
 
         // Las carpetas solo casan si la regla permite mover archivos.
-        let rule = classify(cfg, &name, &ext, is_dir)
+        let meta = fs::metadata(&path).ok();
+        let size = meta.as_ref().map(|m| m.len());
+        let modified = meta.as_ref().and_then(|m| m.modified().ok());
+        let rule = classify(cfg, &name, &ext, is_dir, size, modified)
             .filter(|r| r.move_files);
         let rule = match rule {
             Some(r) => r,
@@ -595,7 +656,10 @@ fn read_items(
             .unwrap_or_default();
 
         if let Some(rule) = filter {
-            match classify(cfg, &name, &ext, is_dir) {
+            let meta = fs::metadata(&path).ok();
+            let size = meta.as_ref().map(|m| m.len());
+            let modified = meta.as_ref().and_then(|m| m.modified().ok());
+            match classify(cfg, &name, &ext, is_dir, size, modified) {
                 Some(hit) if hit.id == rule.id => {}
                 _ => continue,
             }
@@ -953,10 +1017,39 @@ mod tests {
     #[test]
     fn classification_priority() {
         let cfg = Config::default();
-        let media = classify(&cfg, "vacaciones.jpg", "jpg", false).unwrap();
+        let media = classify(&cfg, "vacaciones.jpg", "jpg", false, None, None).unwrap();
         assert_eq!(media.id, "media");
-        let misc = classify(&cfg, "raro.xyz", "xyz", false).unwrap();
+        let misc = classify(&cfg, "raro.xyz", "xyz", false, None, None).unwrap();
         assert_eq!(misc.id, "misc");
+    }
+
+    #[test]
+    fn advanced_rule_filters() {
+        let mut cfg = Config::default();
+        cfg.rules = vec![Rule {
+            id: "facturas".into(),
+            title: "Facturas".into(),
+            enabled: true,
+            extensions: vec!["pdf".into()],
+            name_patterns: Vec::new(),
+            move_files: true,
+            folder: "Facturas".into(),
+            color: "#fff".into(),
+            include_folders: false,
+            view_mode: "auto".into(),
+            icon_size: None,
+            min_size_bytes: Some(1024 * 1024),
+            max_size_bytes: None,
+            newer_than_days: None,
+            older_than_days: None,
+            regex: Some(r"^factura-.*\.pdf$".into()),
+        }];
+        // regex ok + tamano ok -> casa
+        assert!(classify(&cfg, "factura-2024.pdf", "pdf", false, Some(2 * 1024 * 1024), None).is_some());
+        // regex no casa
+        assert!(classify(&cfg, "nota.pdf", "pdf", false, Some(2 * 1024 * 1024), None).is_none());
+        // tamano por debajo del minimo
+        assert!(classify(&cfg, "factura-2024.pdf", "pdf", false, Some(10), None).is_none());
     }
 
     /// Crea un escritorio de prueba aislado en el directorio temporal.
@@ -997,6 +1090,11 @@ mod tests {
                 include_folders: true,
                 view_mode: "auto".into(),
                 icon_size: None,
+                min_size_bytes: None,
+                max_size_bytes: None,
+                newer_than_days: None,
+                older_than_days: None,
+                regex: None,
             },
             Rule {
                 id: "misc".into(),
@@ -1010,6 +1108,11 @@ mod tests {
                 include_folders: true,
                 view_mode: "auto".into(),
                 icon_size: None,
+                min_size_bytes: None,
+                max_size_bytes: None,
+                newer_than_days: None,
+                older_than_days: None,
+                regex: None,
             },
         ];
 
@@ -1051,6 +1154,11 @@ mod tests {
             include_folders: true,
             view_mode: "auto".into(),
             icon_size: None,
+                min_size_bytes: None,
+                max_size_bytes: None,
+                newer_than_days: None,
+                older_than_days: None,
+                regex: None,
         }];
         ensure_layout(&cfg).unwrap();
         let report = organize(&cfg, &desktop);
@@ -1083,6 +1191,11 @@ mod tests {
                 include_folders: false,
                 view_mode: "auto".into(),
                 icon_size: None,
+                min_size_bytes: None,
+                max_size_bytes: None,
+                newer_than_days: None,
+                older_than_days: None,
+                regex: None,
             },
             Rule {
                 id: "misc".into(),
@@ -1096,6 +1209,11 @@ mod tests {
                 include_folders: true,
                 view_mode: "auto".into(),
                 icon_size: None,
+                min_size_bytes: None,
+                max_size_bytes: None,
+                newer_than_days: None,
+                older_than_days: None,
+                regex: None,
             },
         ];
         ensure_layout(&cfg).unwrap();
@@ -1132,6 +1250,11 @@ mod tests {
             include_folders: true,
             view_mode: "auto".into(),
             icon_size: None,
+                min_size_bytes: None,
+                max_size_bytes: None,
+                newer_than_days: None,
+                older_than_days: None,
+                regex: None,
         }];
         ensure_layout(&cfg).unwrap();
         organize(&cfg, &desktop);
@@ -1169,6 +1292,11 @@ mod tests {
             include_folders: false,
             view_mode: "auto".into(),
             icon_size: None,
+                min_size_bytes: None,
+                max_size_bytes: None,
+                newer_than_days: None,
+                older_than_days: None,
+                regex: None,
         }];
         ensure_layout(&cfg).unwrap();
         organize(&cfg, &desktop);

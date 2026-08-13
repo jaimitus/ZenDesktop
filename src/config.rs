@@ -271,6 +271,22 @@ pub struct Rule {
     /// global de Apariencia. Se cicla con valores predefinidos (16..96).
     #[serde(default)]
     pub icon_size: Option<f32>,
+    // --- Filtros avanzados (ninguno = no filtra por ese criterio) ---
+    /// Tamano minimo en bytes (None = sin minimo).
+    #[serde(default)]
+    pub min_size_bytes: Option<u64>,
+    /// Tamano maximo en bytes (None = sin maximo).
+    #[serde(default)]
+    pub max_size_bytes: Option<u64>,
+    /// Solo archivos mas nuevos de N dias.
+    #[serde(default)]
+    pub newer_than_days: Option<f64>,
+    /// Solo archivos mas viejos de N dias.
+    #[serde(default)]
+    pub older_than_days: Option<f64>,
+    /// Patron regex sobre el nombre completo del archivo (sin ruta).
+    #[serde(default)]
+    pub regex: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -571,6 +587,11 @@ pub fn default_rules() -> Vec<Rule> {
             include_folders: false,
             view_mode: "auto".into(),
             icon_size: None,
+            min_size_bytes: None,
+            max_size_bytes: None,
+            newer_than_days: None,
+            older_than_days: None,
+            regex: None,
         },
         Rule {
             id: "docs".into(),
@@ -590,6 +611,11 @@ pub fn default_rules() -> Vec<Rule> {
             include_folders: false,
             view_mode: "auto".into(),
             icon_size: None,
+            min_size_bytes: None,
+            max_size_bytes: None,
+            newer_than_days: None,
+            older_than_days: None,
+            regex: None,
         },
         Rule {
             id: "setup".into(),
@@ -609,6 +635,11 @@ pub fn default_rules() -> Vec<Rule> {
             include_folders: false,
             view_mode: "auto".into(),
             icon_size: None,
+            min_size_bytes: None,
+            max_size_bytes: None,
+            newer_than_days: None,
+            older_than_days: None,
+            regex: None,
         },
         Rule {
             id: "misc".into(),
@@ -624,6 +655,11 @@ pub fn default_rules() -> Vec<Rule> {
             include_folders: true,
             view_mode: "auto".into(),
             icon_size: None,
+            min_size_bytes: None,
+            max_size_bytes: None,
+            newer_than_days: None,
+            older_than_days: None,
+            regex: None,
         },
     ]
 }
@@ -770,6 +806,28 @@ impl Config {
             if let Some(v) = r.icon_size {
                 if !(16.0..=96.0).contains(&v) {
                     r.icon_size = None;
+                }
+            }
+            // Filtros avanzados: descartar valores invalidos (regex que no
+            // compila, dias negativos, rango de tamano invertido).
+            if let Some(re) = &r.regex {
+                if re.trim().is_empty() || regex::Regex::new(re).is_err() {
+                    r.regex = None;
+                }
+            }
+            if let Some(v) = r.newer_than_days {
+                if !v.is_finite() || v <= 0.0 {
+                    r.newer_than_days = None;
+                }
+            }
+            if let Some(v) = r.older_than_days {
+                if !v.is_finite() || v <= 0.0 {
+                    r.older_than_days = None;
+                }
+            }
+            if let (Some(min), Some(max)) = (r.min_size_bytes, r.max_size_bytes) {
+                if min > max {
+                    r.max_size_bytes = None;
                 }
             }
         }

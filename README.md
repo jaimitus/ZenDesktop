@@ -22,7 +22,9 @@
 - **💡 Header tooltips** — Hover the lock or pin icon to see what each toggle does, translated in your language
 - **🎯 Smart Drag & Drop** — Drag files between fences, to subfolders, or to the desktop with visual feedback
 - **📝 F2 Rename** — Press F2 on any item to directly rename it in place
+- **⌨️ Keyboard navigation** — Arrow keys move the selection (Home/End to jump, Shift to extend); Enter opens, Delete trashes
 - **🤖 Auto-organization** — Rules by extension, name, pattern, or local AI (Ollama) for automatic file classification
+- **🔍 Advanced rules** — Filter rules by file size, age, or regex in addition to extension and name patterns
 - **📦 Explorer drop** — Drop files from any folder directly into fences (native OLE drag & drop)
 - **🔍 Integrated search** — Filter files within each fence in real time
 - **📐 Grid + List view** — Grid or list mode, sortable by name, size, type, or date (with smooth scrolling)
@@ -38,7 +40,7 @@
 - **⏱️ Startup delay** — Optional delay so fences appear after Windows finishes loading
 - **⚡ Live settings preview** — Every option applies instantly as you change it (no Apply button); Cancel reverts
 - **🌍 Multi-language** — English, Spanish, German, French, Portuguese, Italian
-- **🪶 Ultralight** — ~780 KB binary, ~4 MB RAM idle, 0% CPU (fully event-driven, no polling)
+- **🪶 Ultralight** — ~3 MB binary, ~4 MB RAM idle, 0% CPU (fully event-driven, no polling)
 - **🔔 Toast notifications** — Visual feedback with a queue (🟢 drops, 🔵 organization) so they never overwrite each other
 - **🤖 Local AI (Ollama)** — Semantic classification and automatic fence creation via local LLM
 
@@ -46,29 +48,29 @@
 
 | Format | File | Best for |
 |---|---|---|
-| 🖥️ **Installer (EXE)** | `ZenDesktop-1.0.14-setup.exe` | Most users — wizard installer with Start Menu shortcut |
-| 📦 **Installer (MSI)** | `ZenDesktop-v1.0.14-x64.msi` | Enterprises / system-wide installs with clean uninstall |
-| 💾 **Portable** | `ZenDesktop-v1.0.14-portable.zip` | USB drives, custom paths, no installation |
+| 🖥️ **Installer (EXE)** | `ZenDesktop-1.0.15-setup.exe` | Most users — wizard installer with Start Menu shortcut |
+| 📦 **Installer (MSI)** | `ZenDesktop-v1.0.15-x64.msi` | Enterprises / system-wide installs with clean uninstall |
+| 💾 **Portable** | `ZenDesktop-v1.0.15-portable.zip` | USB drives, custom paths, no installation |
 
 All downloads are available at **[Releases](https://github.com/jaimitus/ZenDesktop/releases)**.
 
 ### 🖥️ EXE Installer (recommended)
 
-1. Download `ZenDesktop-1.0.14-setup.exe` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+1. Download `ZenDesktop-1.0.15-setup.exe` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Run the installer — accepts the license, installs to `Program Files\ZenDesktop`
 3. Start Menu shortcut is created automatically
 4. Uninstall via Windows Settings → Apps, or re-run the installer
 
 ### 📦 MSI Installer
 
-1. Download `ZenDesktop-v1.0.14-x64.msi` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+1. Download `ZenDesktop-v1.0.15-x64.msi` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Run the installer — it installs to `Program Files\ZenDesktop` for all users
 3. Start Menu shortcut is created automatically
 4. Uninstall via Windows Settings → Apps, or re-run the MSI
 
 ### 💾 Portable (for USB drives / custom paths)
 
-1. Download `ZenDesktop-v1.0.14-portable.zip` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+1. Download `ZenDesktop-v1.0.15-portable.zip` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Extract to any folder (e.g. `%APPDATA%\ZenDesktop\`)
 3. Run `ZenDesktop.exe` — it minimizes to the system tray
 4. **Optional**: Add a shortcut to `shell:startup` for auto-start with Windows
@@ -102,6 +104,9 @@ cargo build --release
 | Lock fence position | Click the lock icon 🔒 |
 | Pin fence always on top | Click the pin icon 📌 |
 | Change icon size per fence | Settings → Rules → icon size chip |
+| Move selection with keyboard | Arrow keys (Shift extends, Home/End jump) |
+| Rename selected item | F2 → type → Enter |
+| Delete selected item | Delete |
 | Save layout template | Settings → General → Layout templates → Save layout |
 | Auto-restore layout | Mark a template as default (★) in Settings → General |
 
@@ -133,7 +138,7 @@ enabled = true
 - **File watching**: Native `ReadDirectoryChangesW` via `notify` — no polling, 0% CPU idle
 - **Drag & Drop**: Manual capture (`SetCapture`) + `WM_MOUSEMOVE` for inter-fence drag; OLE `IDropTarget` for Explorer drop
 - **I18n**: Static translation system with `Tr` struct — zero runtime allocations
-- **Binary**: ~780 KB uncompressed (~420 KB with UPX), no external runtime
+- **Binary**: ~3 MB uncompressed, no external runtime
 
 ## 📁 Project Structure
 

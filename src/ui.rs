@@ -894,6 +894,8 @@ enum DragMode {
 struct FenceTab {
     content: FenceContent,
     selected: HashSet<usize>,
+    /// Indice activo para la navegacion por teclado (flechas / shift).
+    cursor: Option<usize>,
     scroll: i32,
     smooth_scroll: f32,
     search_focused: bool,
@@ -1007,6 +1009,50 @@ impl Fence {
             } else {
                 None
             }
+        }
+    }
+
+    /// Numero de columnas del modo cuadricula (misma formula que `item_at`).
+    fn grid_cols(&self, theme: &Theme) -> usize {
+        let cell = theme.grid_item_size.max(48.0);
+        let pad = theme.padding;
+        let w_dip = self.layout.width as f32 / self.scale;
+        ((w_dip - pad) / cell).floor().max(1.0) as usize
+    }
+
+    /// Ajusta el scroll para que el item `index` quede visible (lista o grid).
+    fn scroll_to_item(&mut self, theme: &Theme, index: usize) {
+        let n = self.tabs[self.active_tab].content.items.len();
+        if n == 0 || index >= n {
+            return;
+        }
+        if self.grid_mode(theme) {
+            let cell = theme.grid_item_size.max(48.0);
+            let cols = self.grid_cols(theme).max(1);
+            let row = (index / cols) as i32;
+            let usable = self.layout.height as f32 / self.scale - self.header_h(theme) - theme.padding;
+            let visible_rows = (usable / cell).floor().max(1.0) as i32;
+            let scroll = self.tabs[self.active_tab].scroll;
+            let next = if row < scroll {
+                row
+            } else if row >= scroll + visible_rows {
+                row - visible_rows + 1
+            } else {
+                scroll
+            };
+            self.tabs[self.active_tab].scroll = next.max(0);
+        } else {
+            let visible = self.rows_visible(theme).max(0);
+            let scroll = self.tabs[self.active_tab].scroll;
+            let idx = index as i32;
+            let next = if idx < scroll {
+                idx
+            } else if idx >= scroll + visible {
+                idx - visible + 1
+            } else {
+                scroll
+            };
+            self.tabs[self.active_tab].scroll = next.max(0);
         }
     }
 }
@@ -1435,6 +1481,7 @@ impl App {
             FenceTab {
                 content,
                 selected,
+                cursor: None,
                 scroll: scroll.clamp(0, max_scroll),
                 smooth_scroll: smooth_scroll.clamp(0.0, scroll as f32),
                 search_focused,
@@ -3570,6 +3617,46 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
+    // Navegacion por teclado
+    // -----------------------------------------------------------------------
+
+    /// Mueve la seleccion con el teclado. `dx`/`dy` son el desplazamiento en
+    /// celdas (lista: dy=+-1; cuadricula: dx=+-1 columna, dy=+-1 fila). Con
+    /// `extend` (Shift) se amplia la seleccion desde el cursor anterior.
+    unsafe fn navigate(&mut self, index: usize, dx: i32, dy: i32, extend: bool, jump_home: bool, jump_end: bool) {
+        let fence = &mut self.fences[index];
+        let n = fence.tabs[fence.active_tab].content.items.len() as i32;
+        if n == 0 {
+            return;
+        }
+        let grid = fence.grid_mode(&self.theme);
+        let cols = if grid { fence.grid_cols(&self.theme).max(1) as i32 } else { 1 };
+        let tab = &mut fence.tabs[fence.active_tab];
+        let cursor = tab.cursor.unwrap_or(0).min((n - 1) as usize) as i32;
+        let next: i32 = if jump_home {
+            0
+        } else if jump_end {
+            n - 1
+        } else {
+            (cursor + dy * cols + dx).clamp(0, n - 1)
+        };
+        if extend {
+            let (a, b) = (cursor.min(next), cursor.max(next));
+            tab.selected = (a..=b).map(|i| i as usize).collect();
+        } else {
+            tab.selected.clear();
+            tab.selected.insert(next as usize);
+        }
+        tab.cursor = Some(next as usize);
+        // Hacer visible el item seleccionado.
+        let theme: &Theme = &self.theme;
+        fence.scroll_to_item(theme, next as usize);
+        let _ = self.render(index);
+        // Animar el scroll hacia el item (igual que la rueda del raton).
+        let _ = SetTimer(self.controller, TIMER_SCROLL, 16, None);
+    }
+
+    // -----------------------------------------------------------------------
     // Renombrar en sitio (F2)
     // -----------------------------------------------------------------------
 
@@ -4881,6 +4968,11 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                         }
                     }
                 }
+                // Clic sobre un item: activar la caja para que el teclado
+                // (F2 renombrar, Supr, Enter...) funcione tras seleccionar.
+                if pt.y > theme_header && fence.item_at(&app.theme, pt.x, pt.y).is_some() {
+                    return LRESULT(MA_ACTIVATE as isize);
+                }
                 LRESULT(MA_NOACTIVATE as isize)
             }
             WM_SETCURSOR => {
@@ -5088,8 +5180,12 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                             fence.tabs[fence.active_tab].selected.insert(idx);
                         }
                     }
+                    fence.tabs[fence.active_tab].cursor = Some(idx);
                     fence.drag = DragMode::ItemDrag { item_idx: idx, start_x: x, start_y: y };
                     let _ = SetCapture(hwnd);
+                    // Foco de teclado para la caja: F2 (renombrar), Supr, Enter...
+                    let _ = SetForegroundWindow(hwnd);
+                    let _ = SetFocus(hwnd);
                     let _ = app.render(index);
                 } else {
                     // Clic en zona vacia dentro del cuerpo: iniciar seleccion por caja (Rubberband).
@@ -5563,6 +5659,19 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                                 app.start_rename(index, item);
                             }
                         }
+                    }
+                    0x23..=0x28 => { // Flechas / Inicio / Fin
+                        let shift = (GetKeyState(VK_SHIFT.0 as i32) as u32) & 0x8000 != 0;
+                        let (dx, dy, home, end) = match vk {
+                            0x26 => (0, -1, false, false), // Arriba
+                            0x28 => (0, 1, false, false),  // Abajo
+                            0x25 => (-1, 0, false, false), // Izquierda
+                            0x27 => (1, 0, false, false),  // Derecha
+                            0x24 => (0, 0, true, false),   // Inicio
+                            0x23 => (0, 0, false, true),   // Fin
+                            _ => unreachable!(),
+                        };
+                        app.navigate(index, dx, dy, shift, home, end);
                     }
                     0x08 => { // VK_BACK
                         if !app.fences[index].tab_mut().search_text.is_empty() {

@@ -105,6 +105,11 @@ const ID_EDIT_AI_MODEL: u16 = 24;
 const ID_EDIT_A_GRID_ICON: u16 = 26;
 const ID_EDIT_STARTUP_DELAY: u16 = 27;
 const ID_EDIT_TEMPLATE_NAME: u16 = 28;
+const ID_EDIT_R_MIN_SIZE: u16 = 29;
+const ID_EDIT_R_MAX_SIZE: u16 = 30;
+const ID_EDIT_R_NEWER: u16 = 31;
+const ID_EDIT_R_OLDER: u16 = 32;
+const ID_EDIT_R_REGEX: u16 = 33;
 
 const ID_CHECK_ORGANIZE_FOLDERS: u16 = 101;
 const ID_CHECK_ORGANIZE_START: u16 = 102;
@@ -173,7 +178,7 @@ const BUSY_TIMER_ID: usize = 0x4E5;
 const PREVIEW_TIMER_ID: usize = 0x4E6;
 const PREVIEW_DEBOUNCE_MS: u32 = 200;
 
-const ALL_EDITS: [u16; 28] = [
+const ALL_EDITS: [u16; 33] = [
     ID_EDIT_MAX_AGE, ID_EDIT_MIN_AGE, ID_EDIT_PURGE, ID_EDIT_R_TITLE, ID_EDIT_R_FOLDER,
     ID_EDIT_R_COLOR, ID_EDIT_R_EXTS, ID_EDIT_R_PATTERNS, ID_EDIT_R_GROUP_TITLE, ID_EDIT_A_BG, ID_EDIT_A_HOVER,
     ID_EDIT_A_BORDER, ID_EDIT_A_TITLE, ID_EDIT_A_TEXT, ID_EDIT_A_MUTED, ID_EDIT_A_SHADOW,
@@ -182,6 +187,7 @@ const ALL_EDITS: [u16; 28] = [
     ID_EDIT_A_GRID_SIZE, ID_EDIT_AI_URL, ID_EDIT_AI_MODEL, ID_EDIT_A_GRID_ICON,
     ID_EDIT_STARTUP_DELAY,
     ID_EDIT_TEMPLATE_NAME,
+    ID_EDIT_R_MIN_SIZE, ID_EDIT_R_MAX_SIZE, ID_EDIT_R_NEWER, ID_EDIT_R_OLDER, ID_EDIT_R_REGEX,
 ];
 
 // Valores de teclas para patrones de match (las constantes VK_* no son
@@ -1364,7 +1370,18 @@ impl Settings {
         y = self.field_row(y, (cx, cw), ID_EDIT_R_FOLDER, self.tr.fld_folder, &rule.folder, false);
         y = self.field_row(y, (cx, cw), ID_EDIT_R_COLOR, self.tr.fld_color, &rule.color, true);
         y = self.field_row(y, (cx, cw), ID_EDIT_R_EXTS, self.tr.fld_exts, &rule.extensions.join(", "), false);
-        let _ = self.field_row(y, (cx, cw), ID_EDIT_R_PATTERNS, self.tr.fld_patterns, &rule.name_patterns.join(", "), false);
+        y = self.field_row(y, (cx, cw), ID_EDIT_R_PATTERNS, self.tr.fld_patterns, &rule.name_patterns.join(", "), false);
+        // Filtros avanzados: tamano, fecha y regex.
+        let min_size = rule.min_size_bytes.map(format_size).unwrap_or_default();
+        let max_size = rule.max_size_bytes.map(format_size).unwrap_or_default();
+        let newer = rule.newer_than_days.map(|d| d.to_string()).unwrap_or_default();
+        let older = rule.older_than_days.map(|d| d.to_string()).unwrap_or_default();
+        let regex_str = rule.regex.clone().unwrap_or_default();
+        y = self.field_row(y, (cx, cw), ID_EDIT_R_MIN_SIZE, self.tr.fld_min_size, &min_size, false);
+        y = self.field_row(y, (cx, cw), ID_EDIT_R_MAX_SIZE, self.tr.fld_max_size, &max_size, false);
+        y = self.field_row(y, (cx, cw), ID_EDIT_R_NEWER, self.tr.fld_newer_than, &newer, false);
+        y = self.field_row(y, (cx, cw), ID_EDIT_R_OLDER, self.tr.fld_older_than, &older, false);
+        let _ = self.field_row(y, (cx, cw), ID_EDIT_R_REGEX, self.tr.fld_regex, &regex_str, false);
     }
 
     fn panel_appearance(&mut self, cy: f32) {
@@ -2128,6 +2145,11 @@ impl Settings {
                     Ctrl::Field(ID_EDIT_R_COLOR),
                     Ctrl::Field(ID_EDIT_R_EXTS),
                     Ctrl::Field(ID_EDIT_R_PATTERNS),
+                    Ctrl::Field(ID_EDIT_R_MIN_SIZE),
+                    Ctrl::Field(ID_EDIT_R_MAX_SIZE),
+                    Ctrl::Field(ID_EDIT_R_NEWER),
+                    Ctrl::Field(ID_EDIT_R_OLDER),
+                    Ctrl::Field(ID_EDIT_R_REGEX),
                 ]);
             }
             Panel::Appearance => {
@@ -2548,6 +2570,11 @@ impl Settings {
                 color: if sug.color.starts_with('#') { sug.color.clone() } else { "#38BDF8".into() },
                 view_mode: "auto".into(),
                 icon_size: None,
+                min_size_bytes: None,
+                max_size_bytes: None,
+                newer_than_days: None,
+                older_than_days: None,
+                regex: None,
             });
         }
 
@@ -3061,6 +3088,19 @@ impl Settings {
         }
         rule.extensions = split_csv(&get_text(self.edits.get(&ID_EDIT_R_EXTS).copied().unwrap_or_default()));
         rule.name_patterns = split_csv(&get_text(self.edits.get(&ID_EDIT_R_PATTERNS).copied().unwrap_or_default()));
+        rule.min_size_bytes = parse_size(&get_text(self.edits.get(&ID_EDIT_R_MIN_SIZE).copied().unwrap_or_default()));
+        rule.max_size_bytes = parse_size(&get_text(self.edits.get(&ID_EDIT_R_MAX_SIZE).copied().unwrap_or_default()));
+        rule.newer_than_days = parse_days(&get_text(self.edits.get(&ID_EDIT_R_NEWER).copied().unwrap_or_default()));
+        rule.older_than_days = parse_days(&get_text(self.edits.get(&ID_EDIT_R_OLDER).copied().unwrap_or_default()));
+        let re = get_text(self.edits.get(&ID_EDIT_R_REGEX).copied().unwrap_or_default()).trim().to_string();
+        if !re.is_empty() {
+            // Regex invalido: conservar el anterior para no romper la regla.
+            if regex::Regex::new(&re).is_ok() {
+                rule.regex = Some(re);
+            }
+        } else {
+            rule.regex = None;
+        }
         self.cfg.rules[index] = rule;
         // Persiste el titulo del grupo (solo si la regla esta agrupada).
         let gt = get_text(self.edits.get(&ID_EDIT_R_GROUP_TITLE).copied().unwrap_or_default());
@@ -3076,12 +3116,22 @@ impl Settings {
         self.checks.insert(ID_CHECK_R_ENABLED, r.map(|x| x.enabled).unwrap_or(false));
         self.checks.insert(ID_CHECK_R_MOVE, r.map(|x| x.move_files).unwrap_or(false));
         self.checks.insert(ID_CHECK_R_FOLDERS, r.map(|x| x.include_folders).unwrap_or(false));
+        let min_size = r.and_then(|x| x.min_size_bytes).map(format_size).unwrap_or_default();
+        let max_size = r.and_then(|x| x.max_size_bytes).map(format_size).unwrap_or_default();
+        let newer = r.and_then(|x| x.newer_than_days).map(|d| d.to_string()).unwrap_or_default();
+        let older = r.and_then(|x| x.older_than_days).map(|d| d.to_string()).unwrap_or_default();
+        let regex_str = r.and_then(|x| x.regex.clone()).unwrap_or_default();
         for (id, value) in [
             (ID_EDIT_R_TITLE, r.map(|x| x.title.as_str()).unwrap_or("")),
             (ID_EDIT_R_FOLDER, r.map(|x| x.folder.as_str()).unwrap_or("")),
             (ID_EDIT_R_COLOR, r.map(|x| x.color.as_str()).unwrap_or("")),
             (ID_EDIT_R_EXTS, r.map(|x| x.extensions.join(", ")).unwrap_or_default().as_str()),
             (ID_EDIT_R_PATTERNS, r.map(|x| x.name_patterns.join(", ")).unwrap_or_default().as_str()),
+            (ID_EDIT_R_MIN_SIZE, min_size.as_str()),
+            (ID_EDIT_R_MAX_SIZE, max_size.as_str()),
+            (ID_EDIT_R_NEWER, newer.as_str()),
+            (ID_EDIT_R_OLDER, older.as_str()),
+            (ID_EDIT_R_REGEX, regex_str.as_str()),
         ] {
             if let Some(edit) = self.edits.get(&id).copied() {
                 set_text(edit, value);
@@ -3777,6 +3827,64 @@ fn next_icon_size(cur: Option<f32>) -> Option<f32> {
             Some(i) if i + 1 < SIZES.len() => Some(SIZES[i + 1]),
             _ => None,
         },
+    }
+}
+
+/// Formatea un tamano en bytes como "1.5 MB" / "300 KB" / "512 B".
+fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = bytes as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{bytes} B")
+    } else if v >= 10.0 {
+        format!("{v:.0} {}", UNITS[i])
+    } else {
+        format!("{v:.1} {}", UNITS[i])
+    }
+}
+
+/// Parsea un tamano legible ("5 MB", "1.5 GB", "1024", "300 KB") a bytes.
+fn parse_size(s: &str) -> Option<u64> {
+    let lower = s.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    let (num, mult) = if let Some(rest) = lower.strip_suffix("tb") {
+        (rest.trim(), 1024u64.pow(4))
+    } else if let Some(rest) = lower.strip_suffix("gb") {
+        (rest.trim(), 1024u64.pow(3))
+    } else if let Some(rest) = lower.strip_suffix("mb") {
+        (rest.trim(), 1024u64.pow(2))
+    } else if let Some(rest) = lower.strip_suffix("kb") {
+        (rest.trim(), 1024)
+    } else if let Some(rest) = lower.strip_suffix('b') {
+        (rest.trim(), 1)
+    } else {
+        (lower.trim(), 1)
+    };
+    let val: f64 = num.parse().ok()?;
+    if !val.is_finite() || val < 0.0 {
+        return None;
+    }
+    Some((val * mult as f64) as u64)
+}
+
+/// Parsea un numero de dias; vacio o no valido => None.
+fn parse_days(s: &str) -> Option<f64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let v: f64 = t.parse().ok()?;
+    if !v.is_finite() || v <= 0.0 {
+        None
+    } else {
+        Some(v)
     }
 }
 

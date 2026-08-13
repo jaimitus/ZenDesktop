@@ -7,6 +7,25 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.15] - 2026-08-13
+
+### Added
+- **Keyboard navigation**: arrow keys move the selection (Home/End jump to
+  first/last, Shift extends the selection). Works in both list and grid
+  view, auto-scrolls to keep the selected item visible, and pairs with
+  Enter (open) and Delete (trash).
+- **Advanced rules**: rules can now filter by file size (min/max, human
+  readable like `5 MB`), age (newer/older than N days), and a full regular
+  expression on the file name. Filters combine with the existing
+  extension/name patterns and apply to virtual fences and auto-organization.
+
+### Fixed
+- **F2 rename now works**: fences are non-activating windows, so clicking a
+  file never gave the fence keyboard focus and F2/Delete/Enter keystrokes
+  went to the previously focused app. Clicking an item now activates and
+  focuses the fence, so F2 rename, Delete, Enter, Ctrl+A and arrow keys all
+  work right after selecting a file.
+
 ## [1.0.14] - 2026-08-13
 
 ### Added

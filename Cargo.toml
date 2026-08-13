@@ -1,6 +1,6 @@
 [package]
 name          = "zendesktop"
-version       = "1.0.14"
+version       = "1.0.15"
 edition       = "2021"
 rust-version  = "1.75"
 authors       = ["ZenDesktop Core Team"]
@@ -32,6 +32,9 @@ ed25519-dalek = "2"
 
 # Key generation only (gen-keys binary, not needed for release builds).
 rand = "0.8"
+
+# Filtros avanzados por regex en las reglas (patrones sobre el nombre del archivo).
+regex = "1"
 
 # Bindings Win32 / Direct2D / DirectWrite generados a partir de metadatos oficiales.
 # Se fija la version exacta: la forma de los handles (HWND, HDC...) cambia entre releases.
