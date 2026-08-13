@@ -178,12 +178,14 @@ const CMD_SORT_SIZE: usize = 13;
 const CMD_SORT_TYPE: usize = 14;
 const CMD_SORT_MODIFIED: usize = 15;
 const CMD_SORT_CUSTOM: usize = 16;
+const CMD_PIN: usize = 17;
 
 const CLASS_CONTROLLER: PCWSTR = w!("ZenDesktop.Controller");
 const CLASS_FENCE: PCWSTR = w!("ZenDesktop.Fence");
 const CLASS_THUMB: PCWSTR = w!("ZenDesktop.Thumb");
 const CLASS_TOAST: PCWSTR = w!("ZenDesktop.Toast");
 const CLASS_GUIDES: PCWSTR = w!("ZenDesktop.Guides");
+const CLASS_TOOLTIP: PCWSTR = w!("ZenDesktop.Tooltip");
 
 const GRIP: i32 = 22; // zona inferior derecha para redimensionar
 const SCROLLBAR_W: f32 = 3.0;
@@ -222,11 +224,26 @@ fn lock_rect(w: f32, theme: &Theme, show_counter: bool, item_count: usize) -> D2
     }
 }
 
+/// Rectangulo de la chincheta "siempre visible" en la cabecera, a la izquierda
+/// del candado. Compartido por el render y el hit-testing del clic.
+fn pin_rect(w: f32, theme: &Theme, show_counter: bool, item_count: usize) -> D2D_RECT_F {
+    let lr = lock_rect(w, theme, show_counter, item_count);
+    let size = 11.0;
+    let left = (lr.left - size - 9.0).max(theme.padding);
+    let top = (theme.header * 0.5 - size / 2.0).max(2.0);
+    D2D_RECT_F {
+        left,
+        top,
+        right: left + size,
+        bottom: top + size,
+    }
+}
+
 /// Rectangulo de la barra de busqueda en la cabecera (coordenadas de la caja, sin escalar).
 /// Se posiciona a la izquierda del candado y contador, adaptando su tamano para no solaparse nunca.
 fn search_rect(w: f32, theme: &Theme, show_counter: bool, item_count: usize) -> Option<D2D_RECT_F> {
-    let lock_r = lock_rect(w, theme, show_counter, item_count);
-    let right = lock_r.left - 8.0;
+    let pin_r = pin_rect(w, theme, show_counter, item_count);
+    let right = pin_r.left - 8.0;
     let search_w = (w * 0.28).clamp(65.0, 135.0);
     let left = right - search_w;
     let min_left = theme.padding + 70.0;
@@ -289,6 +306,17 @@ fn with_alpha(c: D2D1_COLOR_F, a: f32) -> D2D1_COLOR_F {
         b: c.b,
         a,
     }
+}
+
+/// Convierte un color D2D (componentes 0..1) a un pixel ARGB premultiplicado
+/// para las DIB BGRA usadas por los overlays (toast, tooltip, miniatura).
+fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
+    let a = alpha_override.unwrap_or(c.a).clamp(0.0, 1.0);
+    let r = (c.r * a * 255.0).clamp(0.0, 255.0) as u32;
+    let g = (c.g * a * 255.0).clamp(0.0, 255.0) as u32;
+    let b = (c.b * a * 255.0).clamp(0.0, 255.0) as u32;
+    let a_byte = (a * 255.0).clamp(0.0, 255.0) as u32;
+    (a_byte << 24) | (r << 16) | (g << 8) | b
 }
 
 impl Theme {
@@ -884,6 +912,7 @@ struct Fence {
     surface: Option<Surface>,
     hover: i32,
     hover_lock: bool,
+    hover_pin: bool,
     pub is_mouse_over: bool,
     rubberband: Option<(f32, f32, f32, f32)>,
     drag: DragMode,
@@ -913,6 +942,12 @@ impl Fence {
         } else {
             theme.header
         }
+    }
+
+    /// HWND de orden Z para la caja: anclada al fondo (escritorio) salvo que
+    /// este "pinneada", en cuyo caso flota siempre por encima (HWND_TOPMOST).
+    fn z_order(&self) -> HWND {
+        if self.layout.pinned { HWND_TOPMOST } else { HWND_BOTTOM }
     }
 
     /// Vista efectiva de la caja: la regla puede forzar lista o cuadricula, o
@@ -1021,6 +1056,12 @@ pub struct App {
     thumb_pos: POINT,
     /// Tamano de la ventana de miniatura (para el UpdateLayeredWindow del fade).
     thumb_sz: SIZE,
+    /// Ventana emergente del tooltip de cabecera (candado / chincheta).
+    tooltip_hwnd: HWND,
+    /// Superficie del tooltip (se reusa mientras el texto no cambie).
+    tooltip_surface: Option<SurfaceDib>,
+    /// Texto que muestra ahora el tooltip (None = oculto).
+    tooltip_text: Option<String>,
     toast_hwnd: HWND,
     toast_surface: Option<SurfaceDib>,
     toast_alpha: u8,
@@ -1208,6 +1249,9 @@ impl App {
                 thumb_fading_out: false,
                 thumb_pos: POINT::default(),
                 thumb_sz: SIZE::default(),
+                tooltip_hwnd: HWND::default(),
+                tooltip_surface: None,
+                tooltip_text: None,
                 toast_hwnd: HWND::default(),
                 toast_surface: None,
                 toast_alpha: 255,
@@ -1306,6 +1350,17 @@ impl App {
                 instance,
                 None,
             )?;
+            // Tooltip de cabecera: como las guias, transparente a los clics.
+            (*ptr).tooltip_hwnd = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                CLASS_TOOLTIP,
+                w!(""),
+                WS_POPUP,
+                0, 0, 1, 1,
+                None, None,
+                instance,
+                None,
+            )?;
             (*ptr).install_tray();
             (*ptr).install_hooks();
 
@@ -1331,6 +1386,8 @@ impl App {
 
     /// Crea una ventana por regla activa y calcula la geometria inicial.
     unsafe fn build_fences(&mut self) -> WinResult<()> {
+        // Al reconstruir las cajas el tooltip de cabecera puede quedar huerfano.
+        self.hide_tooltip();
         // Snapshot del estado editable (scroll, busqueda, seleccion, pestana
         // activa) por regla, para restaurarlo tras reconstruir las cajas: asi
         // un cambio visual en la vista previa no resetea la posicion ni la
@@ -1432,6 +1489,7 @@ impl App {
                 collapsed: false,
                 hidden: false,
                 locked: false,
+                pinned: false,
                 sort_by: None,
                 tabs: Vec::new(),
                 group_title: None,
@@ -1478,6 +1536,7 @@ impl App {
                 surface: None,
                 hover: -1,
                 hover_lock: false,
+                hover_pin: false,
             is_mouse_over: false,
                 rubberband: None,
                 drag: DragMode::None,
@@ -1860,10 +1919,10 @@ impl App {
                 if let Some(sr) = search_rect(w, theme, theme.show_counter, item_cnt) {
                     sr.left - 8.0
                 } else {
-                    lock_rect(w, theme, theme.show_counter, item_cnt).left - 8.0
+                    pin_rect(w, theme, theme.show_counter, item_cnt).left - 8.0
                 }
             } else {
-                lock_rect(w, theme, theme.show_counter, item_cnt).left - 8.0
+                pin_rect(w, theme, theme.show_counter, item_cnt).left - 8.0
             };
 
             let title_str = if fence.tabs.len() > 1 {
@@ -2157,6 +2216,56 @@ impl App {
                 );
             }
 
+            // Chincheta "siempre visible": icono vectorial a la izquierda del
+            // candado (cabeza circular + eje con punta).
+            {
+                let pr = pin_rect(w, theme, theme.show_counter, item_cnt);
+                let (rx, ry) = (pr.left, pr.top);
+                let is_hovered = fence.hover_pin;
+                let c = if fence.layout.pinned {
+                    fence.accent
+                } else if is_hovered {
+                    with_alpha(theme.text, 0.9)
+                } else {
+                    with_alpha(theme.muted, 0.40)
+                };
+                let s = 11.0;
+                brush.SetColor(&c);
+                // Cabeza de la chincheta (circulo relleno).
+                let head = D2D_POINT_2F { x: (rx + s * 0.5) * scale, y: (ry + 2.4) * scale };
+                surface.target.FillEllipse(
+                    &D2D1_ELLIPSE {
+                        point: head,
+                        radiusX: 2.0 * scale,
+                        radiusY: 2.0 * scale,
+                    },
+                    brush,
+                );
+                // Eje vertical de la chincheta.
+                surface.target.DrawLine(
+                    D2D_POINT_2F { x: head.x, y: (ry + 4.0) * scale },
+                    D2D_POINT_2F { x: head.x, y: (ry + s) * scale },
+                    brush,
+                    1.4 * scale,
+                    None,
+                );
+                // Punta afilada (dos trazos divergentes).
+                surface.target.DrawLine(
+                    D2D_POINT_2F { x: head.x, y: (ry + s) * scale },
+                    D2D_POINT_2F { x: head.x + 1.3 * scale, y: (ry + s + 1.3) * scale },
+                    brush,
+                    1.4 * scale,
+                    None,
+                );
+                surface.target.DrawLine(
+                    D2D_POINT_2F { x: head.x, y: (ry + s) * scale },
+                    D2D_POINT_2F { x: head.x - 1.3 * scale, y: (ry + s + 1.3) * scale },
+                    brush,
+                    1.4 * scale,
+                    None,
+                );
+            }
+
             let mut icon_jobs: Vec<(i32, i32, i32, HICON)> = Vec::new();
 
             if !fence.layout.collapsed || fence.is_mouse_over {
@@ -2195,7 +2304,10 @@ impl App {
                     let first_row = fence.tabs[fence.active_tab].smooth_scroll.floor().max(0.0) as usize;
                     let last_row = (first_row + visible_rows + 1).min(grid_rows);
                     let cell_pad = 4.0 * scale;
-                    let icon_size = (self.cfg.appearance.grid_icon_size * scale)
+                    // Tamano de icono: la regla puede anular el global.
+                    let base_icon = fence.tabs[fence.active_tab].content.icon_size
+                        .unwrap_or(self.cfg.appearance.grid_icon_size);
+                    let icon_size = (base_icon * scale)
                         .min(cell * 0.70 - cell_pad)
                         .max(16.0 * scale);
                     for row in first_row..last_row {
@@ -2589,9 +2701,7 @@ impl App {
                         );
                     }
                 }
-            }
-
-            surface.target.EndDraw(None, None)?;
+            }            surface.target.EndDraw(None, None)?;
 
             // Los iconos del shell son HICON de GDI: se estampan sobre la misma
             // DIB despues de que Direct2D haya volcado su contenido.
@@ -2702,15 +2812,6 @@ impl App {
             Some(s) => s,
             None => return,
         };
-fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
-    let a = alpha_override.unwrap_or(c.a).clamp(0.0, 1.0);
-    let r = (c.r * a * 255.0).clamp(0.0, 255.0) as u32;
-    let g = (c.g * a * 255.0).clamp(0.0, 255.0) as u32;
-    let b = (c.b * a * 255.0).clamp(0.0, 255.0) as u32;
-    let a_byte = (a * 255.0).clamp(0.0, 255.0) as u32;
-    (a_byte << 24) | (r << 16) | (g << 8) | b
-}
-
         // Pintar la tarjeta de fondo (redondeada con el tema activo) y la miniatura encima.
         if !surface.bits.is_null() {
             let bits = unsafe { std::slice::from_raw_parts_mut(surface.bits, (w * h) as usize) };
@@ -3214,6 +3315,158 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
         }
     }
 
+    /// Muestra el tooltip de cabecera (candado / chincheta) justo encima de la
+    /// caja, alineado a la derecha con el icono correspondiente.
+    unsafe fn show_tooltip(&mut self, text: &str, anchor_right: i32, anchor_bottom: i32) {
+        if self.tooltip_hwnd.is_invalid() {
+            return;
+        }
+        // Evitar redibujar si ya mostramos este mismo texto.
+        if self.tooltip_text.as_deref() == Some(text) {
+            return;
+        }
+        self.tooltip_text = Some(text.to_string());
+
+        // Medir el texto con GDI para dimensionar la pildora.
+        let font_name: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
+        let font = CreateFontW(
+            13, 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0,
+            1, 0, 0, 4, 0,
+            PCWSTR(font_name.as_ptr()),
+        );
+        let measure_dc = CreateCompatibleDC(None);
+        let old_font_m = SelectObject(measure_dc, HGDIOBJ(font.0));
+        let wide_text: Vec<u16> = text.encode_utf16().collect();
+        let mut text_sz = SIZE::default();
+        let _ = GetTextExtentPoint32W(measure_dc, &wide_text, &mut text_sz);
+        SelectObject(measure_dc, old_font_m);
+        let _ = DeleteDC(measure_dc);
+        let _ = DeleteObject(HGDIOBJ(font.0));
+
+        let pad_x: i32 = 10;
+        let pad_y: i32 = 4;
+        let tw = (text_sz.cx + pad_x * 2).max(24);
+        let th = (text_sz.cy + pad_y * 2).max(22);
+
+        let need_new = match &self.tooltip_surface {
+            Some(s) => s.width != tw || s.height != th,
+            None => true,
+        };
+        if need_new {
+            self.tooltip_surface = SurfaceDib::new(tw, th);
+        }
+        let surface = match &self.tooltip_surface {
+            Some(s) => s,
+            None => return,
+        };
+
+        if !surface.bits.is_null() {
+            let bits = std::slice::from_raw_parts_mut(surface.bits, (tw * th) as usize);
+            bits.fill(0);
+            let bg = color_to_bgra_u32(self.theme.background, Some(0.97));
+            let border = color_to_bgra_u32(self.theme.border, Some(0.6));
+            let radius: i32 = 4;
+            // Predicado "dentro de rectangulo redondeado" para relleno + borde.
+            let inside = |row: i32, col: i32, r: i32| -> bool {
+                let mut ok = true;
+                if row < r && col < r {
+                    let dx = (r - col) as f32; let dy = (r - row) as f32;
+                    ok = dx * dx + dy * dy <= (r * r) as f32;
+                } else if row < r && col >= tw - r {
+                    let dx = (col - (tw - r)) as f32; let dy = (r - row) as f32;
+                    ok = dx * dx + dy * dy <= (r * r) as f32;
+                } else if row >= th - r && col < r {
+                    let dx = (r - col) as f32; let dy = (row - (th - r)) as f32;
+                    ok = dx * dx + dy * dy <= (r * r) as f32;
+                } else if row >= th - r && col >= tw - r {
+                    let dx = (col - (tw - r)) as f32; let dy = (row - (th - r)) as f32;
+                    ok = dx * dx + dy * dy <= (r * r) as f32;
+                }
+                ok
+            };
+            for row in 0..th {
+                for col in 0..tw {
+                    if inside(row, col, radius) {
+                        bits[(row * tw + col) as usize] = if inside(row, col, radius - 1) { bg } else { border };
+                    }
+                }
+            }
+            // Texto centrado.
+            let text_font = CreateFontW(
+                13, 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0,
+                1, 0, 0, 4, 0,
+                PCWSTR(font_name.as_ptr()),
+            );
+            if !text_font.is_invalid() {
+                let old_font = SelectObject(surface.dc, HGDIOBJ(text_font.0));
+                let _ = SetBkMode(surface.dc, TRANSPARENT);
+                let text_color = COLORREF(
+                    ((self.theme.text.r * 255.0) as u32)
+                        | (((self.theme.text.g * 255.0) as u32) << 8)
+                        | (((self.theme.text.b * 255.0) as u32) << 16),
+                );
+                let _ = SetTextColor(surface.dc, text_color);
+                let mut text_buf: Vec<u16> = text.encode_utf16().collect();
+                let mut rc = RECT { left: pad_x, top: 0, right: tw - pad_x, bottom: th };
+                let _ = DrawTextW(surface.dc, &mut text_buf, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(surface.dc, old_font);
+                let _ = DeleteObject(HGDIOBJ(text_font.0));
+            }
+        }
+
+        let x = anchor_right - tw;
+        let y = anchor_bottom - th - 4;
+        let screen = GetDC(None);
+        let position = POINT { x, y };
+        let size = SIZE { cx: tw, cy: th };
+        let source = POINT { x: 0, y: 0 };
+        let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+        let surface = self.tooltip_surface.as_ref().unwrap();
+        let _ = SetWindowPos(self.tooltip_hwnd, HWND_TOPMOST, x, y, tw, th, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        let _ = UpdateLayeredWindow(self.tooltip_hwnd, screen, Some(&position), Some(&size), surface.dc, Some(&source), COLORREF(0), Some(&blend), ULW_ALPHA);
+        let _ = ReleaseDC(None, screen);
+    }
+
+    /// Oculta el tooltip de cabecera si esta visible.
+    unsafe fn hide_tooltip(&mut self) {
+        if self.tooltip_text.is_none() {
+            return;
+        }
+        self.tooltip_text = None;
+        if !self.tooltip_hwnd.is_invalid() {
+            let _ = ShowWindow(self.tooltip_hwnd, SW_HIDE);
+        }
+    }
+
+    /// Sincroniza el tooltip con el estado hover actual de la caja `index`:
+    /// muestra la etiqueta del candado o de la chincheta, o lo oculta.
+    unsafe fn sync_tooltip(&mut self, index: usize) {
+        if index >= self.fences.len() {
+            return;
+        }
+        let (hover_lock, hover_pin) = (self.fences[index].hover_lock, self.fences[index].hover_pin);
+        if !hover_lock && !hover_pin {
+            self.hide_tooltip();
+            return;
+        }
+        let label = if hover_lock {
+            if self.fences[index].layout.locked { self.tr.menu_unlock } else { self.tr.menu_lock }
+        } else {
+            if self.fences[index].layout.pinned { self.tr.menu_unpin } else { self.tr.menu_pin }
+        };
+        let scale = self.fences[index].scale;
+        let w_dip = self.fences[index].layout.width as f32 / scale;
+        let item_cnt = self.fences[index].tab_mut().content.items.len();
+        let icon_rect = if hover_lock {
+            lock_rect(w_dip, &self.theme, self.theme.show_counter, item_cnt)
+        } else {
+            pin_rect(w_dip, &self.theme, self.theme.show_counter, item_cnt)
+        };
+        let anchor_right = self.fences[index].layout.x + (icon_rect.right * scale) as i32;
+        let anchor_bottom = self.fences[index].layout.y;
+        self.show_tooltip(label, anchor_right, anchor_bottom);
+    }
+
     /// Tick del fade: incrementa (fade-in) o decrementa (fade-out) el alfa
     /// y re-publica la ventana de miniatura con UpdateLayeredWindow.
     unsafe fn thumb_fade_tick(&mut self) {
@@ -3589,6 +3842,7 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
                 fence.layout.height = slot.height;
                 fence.layout.collapsed = slot.collapsed;
                 fence.layout.locked = slot.locked;
+                fence.layout.pinned = slot.pinned;
                 fence.origin = fence.layout.clone();
                 unsafe {
                     let _ = SetWindowPos(
@@ -3818,6 +4072,12 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
                 self.tr.menu_lock
             };
             append_menu(menu, CMD_LOCK, lock_label);
+            let pin_label = if self.fences[index].layout.pinned {
+                self.tr.menu_unpin
+            } else {
+                self.tr.menu_pin
+            };
+            append_menu(menu, CMD_PIN, pin_label);
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             let current_sort = self.fences[fence_index.unwrap()].sort_mode.as_deref().unwrap_or(&self.cfg.appearance.sort_by);
             append_menu(menu, CMD_SORT_NAME, &format!("    {}", if current_sort == "name" { "✓ A-Z" } else { "  A-Z" }));
@@ -3889,6 +4149,20 @@ fn color_to_bgra_u32(c: D2D1_COLOR_F, alpha_override: Option<f32>) -> u32 {
                     self.persist_layout();
                 }
             }
+            CMD_PIN => {
+                if let Some(index) = fence_index {
+                    self.fences[index].layout.pinned = !self.fences[index].layout.pinned;
+                    self.fences[index].drag = DragMode::None;
+                    let _ = ReleaseCapture();
+                    let fhwnd = self.fences[index].hwnd;
+                    let fw = self.fences[index].layout.width;
+                    let vh = self.fences[index].visible_height(&self.theme);
+                    let z = self.fences[index].z_order();
+                    let _ = self.render(index);
+                    let _ = SetWindowPos(fhwnd, z, 0, 0, fw, vh, SWP_NOMOVE | SWP_NOACTIVATE);
+                    self.persist_layout();
+                }
+            }
             CMD_SORT_NAME | CMD_SORT_SIZE | CMD_SORT_TYPE | CMD_SORT_MODIFIED | CMD_SORT_CUSTOM => {
                 if let Some(index) = fence_index {
                     let mode = match choice.0 as usize {
@@ -3954,6 +4228,9 @@ impl Drop for App {
             }
             if !self.thumb_hwnd.is_invalid() {
                 let _ = DestroyWindow(self.thumb_hwnd);
+            }
+            if !self.tooltip_hwnd.is_invalid() {
+                let _ = DestroyWindow(self.tooltip_hwnd);
             }
             if !self.guides_hwnd.is_invalid() {
                 let _ = DestroyWindow(self.guides_hwnd);
@@ -4025,6 +4302,17 @@ unsafe fn register_classes(instance: HINSTANCE) -> WinResult<()> {
         ..Default::default()
     };
     if RegisterClassExW(&guides) == 0 {
+        return Err(windows::core::Error::from_win32());
+    }
+
+    let tooltip = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(tooltip_proc),
+        hInstance: instance,
+        lpszClassName: CLASS_TOOLTIP,
+        ..Default::default()
+    };
+    if RegisterClassExW(&tooltip) == 0 {
         return Err(windows::core::Error::from_win32());
     }
 
@@ -4504,6 +4792,23 @@ unsafe extern "system" fn guides_proc(
     }
 }
 
+/// Tooltip de cabecera (candado / chincheta): ventana emergente transparente
+/// a los clics; el contenido se pinta por UpdateLayeredWindow.
+unsafe extern "system" fn tooltip_proc(
+    hwnd: HWND,
+    message: u32,
+    _wparam: WPARAM,
+    _lparam: LPARAM,
+) -> LRESULT {
+    match message {
+        WM_PAINT => {
+            let _ = ValidateRect(hwnd, None);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, message, _wparam, _lparam),
+    }
+}
+
 unsafe extern "system" fn toast_proc(
     hwnd: HWND,
     message: u32,
@@ -4546,12 +4851,13 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
         };
 
         match message {
-            // Las cajas viven siempre en el fondo del orden Z: forman parte del
-            // escritorio, nunca tapan a las ventanas del usuario.
+            // Las cajas viven en el fondo del orden Z (forman parte del
+            // escritorio), salvo las "pinneadas", que flotan por encima de
+            // cualquier app (HWND_TOPMOST).
             WM_WINDOWPOSCHANGING => {
                 let pos = lparam.0 as *mut WINDOWPOS;
                 if !pos.is_null() && ((*pos).flags.0 & SWP_NOZORDER.0) == 0 {
-                    (*pos).hwndInsertAfter = HWND_BOTTOM;
+                    (*pos).hwndInsertAfter = app.fences[index].z_order();
                 }
                 LRESULT(0)
             }
@@ -4692,6 +4998,25 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                         fence.layout.locked = !fence.layout.locked;
                         fence.drag = DragMode::None;
                         let _ = app.render(index);
+                        app.sync_tooltip(index);
+                        SetTimer(app.controller, TIMER_PERSIST, 800, None);
+                        return LRESULT(0);
+                    }
+
+                    let pr = pin_rect(w_dip, &app.theme, app.theme.show_counter, item_cnt);
+                    let in_pin = y <= theme_header
+                        && x >= (pr.left * fence.scale) as i32
+                        && x <= (pr.right * fence.scale) as i32;
+                    if in_pin {
+                        fence.layout.pinned = !fence.layout.pinned;
+                        fence.drag = DragMode::None;
+                        let fhwnd = fence.hwnd;
+                        let fw = fence.layout.width;
+                        let vh = fence.visible_height(&app.theme);
+                        let z = fence.z_order();
+                        let _ = app.render(index);
+                        let _ = SetWindowPos(fhwnd, z, 0, 0, fw, vh, SWP_NOMOVE | SWP_NOACTIVATE);
+                        app.sync_tooltip(index);
                         SetTimer(app.controller, TIMER_PERSIST, 800, None);
                         return LRESULT(0);
                     }
@@ -4794,6 +5119,14 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                     app.hide_thumb();
                     needs_update = true;
                 }
+                // Al salir de la caja, limpiamos el hover de candado/chincheta
+                // y ocultamos su tooltip.
+                if app.fences[index].hover_lock || app.fences[index].hover_pin {
+                    app.fences[index].hover_lock = false;
+                    app.fences[index].hover_pin = false;
+                    needs_update = true;
+                }
+                app.hide_tooltip();
                 // Si el menu contextual esta abierto, ignoramos el mouseleave para no plegar la caja.
                 if app.fences[index].is_mouse_over && app.shell_menu.is_none() {
                     app.fences[index].is_mouse_over = false;
@@ -4873,6 +5206,19 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                     app.fences[index].hover_lock = in_lock;
                     let _ = app.render(index);
                 }
+
+                // Comprobar hover sobre la chincheta "siempre visible".
+                let pr = pin_rect(w_dip, &app.theme, app.theme.show_counter, item_cnt);
+                let in_pin = y <= theme_header
+                    && x >= (pr.left * app.fences[index].scale) as i32
+                    && x <= (pr.right * app.fences[index].scale) as i32;
+                if in_pin != app.fences[index].hover_pin {
+                    app.fences[index].hover_pin = in_pin;
+                    let _ = app.render(index);
+                }
+
+                // Tooltip de cabecera: mostrarlo/ocultarlo segun el hover.
+                app.sync_tooltip(index);
 
                 if mode == DragMode::None {
                     let hover_idx = app.fences[index]
@@ -5080,10 +5426,13 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 let in_lock = y <= header
                     && x >= (lr.left * s) as i32
                     && x <= (lr.right * s) as i32;
+                let in_pin = y <= header
+                    && x >= (pin_rect(w_dip, &app.theme, app.theme.show_counter, item_cnt).left * s) as i32
+                    && x <= (pin_rect(w_dip, &app.theme, app.theme.show_counter, item_cnt).right * s) as i32;
                 let in_search = app.cfg.appearance.show_search && y <= header && search_rect(w_dip, &app.theme, app.theme.show_counter, item_cnt).is_some_and(|sr| {
                     x >= (sr.left * s) as i32 && x <= (sr.right * s) as i32
                 });
-                if in_lock || in_search {
+                if in_lock || in_pin || in_search {
                     return LRESULT(0);
                 }
                 let theme_header = (app.theme.header * s) as i32;

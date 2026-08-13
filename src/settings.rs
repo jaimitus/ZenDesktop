@@ -255,6 +255,7 @@ enum Ctrl {
     RuleRow(usize),
     RuleSort(usize),
     RuleView(usize, &'static str),
+    RuleIcon(usize),
     Btn(u16),
     Folder(u16),
     Close,
@@ -1340,6 +1341,15 @@ impl Settings {
         self.view_chip(Rect { x: vx + vw + vg, y, w: vw, h: 26.0 }, idx, "list", self.tr.view_list);
         self.view_chip(Rect { x: vx + 2.0 * (vw + vg), y, w: vw, h: 26.0 }, idx, "grid", self.tr.view_grid);
         y += 32.0;
+        // Tamano de icono por caja: un clic cicla Auto -> 16 -> ... -> 96.
+        self.text(
+            self.tr.fld_grid_icon,
+            Fmt::Small,
+            D2D_RECT_F { left: cx + 16.0, top: y + 6.0, right: cx + 144.0, bottom: y + 26.0 },
+            col(C_MUTED),
+        );
+        self.icon_size_chip(Rect { x: vx, y, w: vw, h: 26.0 }, idx);
+        y += 32.0;
         y = self.field_row(y, (cx, cw), ID_EDIT_R_TITLE, self.tr.fld_title, &rule.title, false);
         // Titulo del grupo: solo se muestra si la regla seleccionada esta
         // agrupada (el campo nativo se oculta/limpieza solo al no renderizarse).
@@ -1465,6 +1475,29 @@ impl Settings {
         );
         self.add_region(
             Ctrl::RuleView(idx, value),
+            D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h },
+        );
+    }
+
+    /// Chip del tamano de icono por caja: un clic cicla Auto -> 16 -> ... -> 96.
+    fn icon_size_chip(&mut self, rect: Rect, idx: usize) {
+        let Rect { x, y, w, h } = rect;
+        let over = self.hover == Some(Ctrl::RuleIcon(idx));
+        let label = match self.cfg.rules.get(idx).and_then(|r| r.icon_size) {
+            Some(v) => format!("{:.0} px", v),
+            None => self.tr.view_auto.to_string(),
+        };
+        let bg = if over { col(C_HOVER) } else { col("#00000000") };
+        self.fill_rr(x, y, w, h, 7.0, bg);
+        self.draw_rr(Rect { x, y, w, h }, 7.0, rgba(C_FIELD_BORDER, 0.6), 1.0);
+        self.text(
+            &label,
+            Fmt::Small,
+            D2D_RECT_F { left: x + 4.0, top: y + 4.0, right: x + w - 4.0, bottom: y + h - 2.0 },
+            col(C_TEXT),
+        );
+        self.add_region(
+            Ctrl::RuleIcon(idx),
             D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h },
         );
     }
@@ -2260,6 +2293,12 @@ impl Settings {
                 }
                 self.preview_apply();
             }
+            Ctrl::RuleIcon(idx) => {
+                if let Some(rule) = self.cfg.rules.get_mut(idx) {
+                    rule.icon_size = next_icon_size(rule.icon_size);
+                }
+                self.preview_apply();
+            }
             Ctrl::RuleRow(idx) => {
                 self.sync_rule_fields();
                 self.rules_selected = Some(idx);
@@ -2508,6 +2547,7 @@ impl Settings {
                 include_folders: true,
                 color: if sug.color.starts_with('#') { sug.color.clone() } else { "#38BDF8".into() },
                 view_mode: "auto".into(),
+                icon_size: None,
             });
         }
 
@@ -3725,6 +3765,19 @@ static EDIT_BRUSH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 fn edit_brush() -> HBRUSH {
     let raw = EDIT_BRUSH.get_or_init(|| unsafe { CreateSolidBrush(COLORREF(0x0036241B)).0 as usize });
     HBRUSH(*raw as *mut c_void)
+}
+
+/// Siguiente tamano de icono en el ciclo por caja: None (Auto) -> 16 -> 24
+/// -> 32 -> 48 -> 64 -> 96 -> None (Auto).
+fn next_icon_size(cur: Option<f32>) -> Option<f32> {
+    const SIZES: [f32; 6] = [16.0, 24.0, 32.0, 48.0, 64.0, 96.0];
+    match cur {
+        None => Some(SIZES[0]),
+        Some(v) => match SIZES.iter().position(|&s| (s - v).abs() < f32::EPSILON) {
+            Some(i) if i + 1 < SIZES.len() => Some(SIZES[i + 1]),
+            _ => None,
+        },
+    }
 }
 
 fn get_text(hwnd: HWND) -> String {

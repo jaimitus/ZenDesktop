@@ -72,6 +72,8 @@ pub struct FenceContent {
     pub color: String,
     /// Vista de la caja: "auto" | "list" | "grid".
     pub view_mode: String,
+    /// Tamano del icono en modo cuadricula (px). None = sigue el ajuste global.
+    pub icon_size: Option<f32>,
     /// Carpeta fisica respaldada por la caja (None en cajas virtuales).
     pub folder: Option<PathBuf>,
     pub items: Vec<FileItem>,
@@ -558,6 +560,7 @@ pub fn collect_fences(cfg: &Config, desktop: &Path, sort_overrides: &std::collec
             title: rule.title.clone(),
             color: rule.color.clone(),
             view_mode: rule.view_mode.clone(),
+            icon_size: rule.icon_size,
             folder,
             items,
         });
@@ -993,6 +996,7 @@ mod tests {
                 color: "#38BDF8".into(),
                 include_folders: true,
                 view_mode: "auto".into(),
+                icon_size: None,
             },
             Rule {
                 id: "misc".into(),
@@ -1005,6 +1009,7 @@ mod tests {
                 color: "#34D399".into(),
                 include_folders: true,
                 view_mode: "auto".into(),
+                icon_size: None,
             },
         ];
 
@@ -1045,6 +1050,7 @@ mod tests {
             color: "#38BDF8".into(),
             include_folders: true,
             view_mode: "auto".into(),
+            icon_size: None,
         }];
         ensure_layout(&cfg).unwrap();
         let report = organize(&cfg, &desktop);
@@ -1076,6 +1082,7 @@ mod tests {
                 color: "#38BDF8".into(),
                 include_folders: false,
                 view_mode: "auto".into(),
+                icon_size: None,
             },
             Rule {
                 id: "misc".into(),
@@ -1088,6 +1095,7 @@ mod tests {
                 color: "#34D399".into(),
                 include_folders: true,
                 view_mode: "auto".into(),
+                icon_size: None,
             },
         ];
         ensure_layout(&cfg).unwrap();
@@ -1123,6 +1131,7 @@ mod tests {
             color: "#34D399".into(),
             include_folders: true,
             view_mode: "auto".into(),
+            icon_size: None,
         }];
         ensure_layout(&cfg).unwrap();
         organize(&cfg, &desktop);
@@ -1159,6 +1168,7 @@ mod tests {
             color: "#38BDF8".into(),
             include_folders: false,
             view_mode: "auto".into(),
+            icon_size: None,
         }];
         ensure_layout(&cfg).unwrap();
         organize(&cfg, &desktop);

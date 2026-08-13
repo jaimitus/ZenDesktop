@@ -7,6 +7,20 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.14] - 2026-08-13
+
+### Added
+- **Pin to Top (always-on-top)**: a pin button next to the lock in each fence
+  header makes that fence float above any app (`HWND_TOPMOST`), ideal for an
+  Inbox or a notes box. The state persists with the layout, survives layout
+  templates, and can also be toggled from the right-click menu.
+- **Per-fence icon size**: each rule can override the global grid icon size
+  with a cycling chip in Settings → Rules (Auto → 16 → 24 → 32 → 48 → 64 →
+  96 px). `Auto` inherits the global Appearance setting.
+- **Header tooltips**: hovering the lock or pin icon now shows a floating
+  tooltip above the fence explaining the action, localized in all six
+  languages.
+
 ## [1.0.13] - 2026-08-13
 
 ### Changed

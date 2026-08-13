@@ -267,6 +267,10 @@ pub struct Rule {
     /// "list" (lista) o "grid" (cuadricula de iconos).
     #[serde(default = "default_view_mode")]
     pub view_mode: String,
+    /// Tamano del icono en modo cuadricula, en px. `None` = sigue el ajuste
+    /// global de Apariencia. Se cicla con valores predefinidos (16..96).
+    #[serde(default)]
+    pub icon_size: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -281,6 +285,9 @@ pub struct FenceLayout {
     pub hidden: bool,
     /// Caja anclada: ni se arrastra ni se redimensiona (candado en la cabecera).
     pub locked: bool,
+    /// Caja "siempre visible": flota por encima de cualquier app (chincheta en
+    /// la cabecera). Independiente del candado de anclaje.
+    pub pinned: bool,
     /// Orden de los items: "name" | "size" | "type" | "modified" | "custom"
     /// None => hereda el orden global de `appearance.sort_by`.
     pub sort_by: Option<String>,
@@ -423,6 +430,7 @@ impl Default for FenceLayout {
             collapsed: false,
             hidden: false,
             locked: false,
+            pinned: false,
             sort_by: None,
             tabs: Vec::new(),
             group_title: None,
@@ -562,6 +570,7 @@ pub fn default_rules() -> Vec<Rule> {
             color: "#38BDF8".into(),
             include_folders: false,
             view_mode: "auto".into(),
+            icon_size: None,
         },
         Rule {
             id: "docs".into(),
@@ -580,6 +589,7 @@ pub fn default_rules() -> Vec<Rule> {
             color: "#A78BFA".into(),
             include_folders: false,
             view_mode: "auto".into(),
+            icon_size: None,
         },
         Rule {
             id: "setup".into(),
@@ -598,6 +608,7 @@ pub fn default_rules() -> Vec<Rule> {
             color: "#F472B6".into(),
             include_folders: false,
             view_mode: "auto".into(),
+            icon_size: None,
         },
         Rule {
             id: "misc".into(),
@@ -612,6 +623,7 @@ pub fn default_rules() -> Vec<Rule> {
             color: "#34D399".into(),
             include_folders: true,
             view_mode: "auto".into(),
+            icon_size: None,
         },
     ]
 }
@@ -753,6 +765,12 @@ impl Config {
             }
             if !matches!(r.view_mode.as_str(), "auto" | "list" | "grid") {
                 r.view_mode = "auto".into();
+            }
+            // El tamano de icono por caja solo acepta valores razonables.
+            if let Some(v) = r.icon_size {
+                if !(16.0..=96.0).contains(&v) {
+                    r.icon_size = None;
+                }
             }
         }
         // Descarta geometrias huerfanas de reglas eliminadas.
