@@ -7,6 +7,36 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.18] - 2026-08-13
+
+### Added
+- **Spotify widget settings tab**: new **🎧 Spotify** panel in Settings with
+  an enable/disable switch (creates/removes the box instantly), editable
+  Client ID, Client Secret and **Redirect URI**, live session status, and
+  **Connect with Spotify** / **Disconnect** buttons — no more hand-editing
+  `config.toml` or the code. The Redirect URI is editable so it can match
+  the one registered on `developer.spotify.com` exactly (default
+  `http://127.0.0.1:8899/callback`), and the local auth listener binds to its
+  port.
+- **First-class Spotify widget**: the now-playing box (cover art, progress
+  with elapsed/total times, volume slider, prev/play-pause/next controls,
+  device name, queue with jump-to-track) is now a first-class desktop box
+  created automatically at startup when enabled, instead of a hidden
+  config-only feature.
+
+### Changed
+- Spotify credentials are **no longer hardcoded** — Client ID / Client
+  Secret start empty and are configured from Settings (nothing ships
+  compiled-in).
+- **Widget boxes keep their position**: `Config::normalize()` no longer
+  drops fences whose id isn't a rule, so widget boxes (e.g. `widget:clima`)
+  survive settings previews and config saves.
+
+### Fixed
+- **Spotify box is draggable**: clicks in the box body now only capture the
+  widget controls; header drags move the box and the corner grip resizes it
+  like any other fence (previously every click was swallowed).
+
 ## [1.0.17] - 2026-08-13
 
 ### Added

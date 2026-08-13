@@ -45,7 +45,7 @@
 - **🔔 Toast notifications** — Visual feedback with a queue (🟢 drops, 🔵 organization) so they never overwrite each other
 - **🤖 Local AI (Ollama)** — Semantic classification, automatic fence creation, and rule generation from a text description via local LLM
 - **🧩 Lua widgets** — Programmable boxes that run user scripts (clocks, weather, launchers…) with a sandboxed API: drawing primitives, images, HTTP, interactivity and persistent state
-- **🎧 Spotify widget** — OAuth PKCE now-playing widget with cover art, progress + times, volume slider, playback controls, device name and queue (jump to any track)
+- **🎧 Spotify widget** — first-class now-playing box (cover art, progress + times, volume slider, playback controls, device name, queue) managed from its own Settings tab: enable/disable, Client ID/Secret, connect & disconnect
 - **↩️ Undo moves** — Moving files into fences is undoable (Ctrl+Z or the toast action)
 - **📐 Per-fence list/grid view** — Each rule picks its own view mode (auto/list/grid) from Settings → Rules
 
@@ -239,6 +239,32 @@ Scripts run in a sandboxed Lua VM with **no filesystem access and no process
 execution**: the only side effects are drawing, HTTP GETs (cached, bounded),
 `app:open` (launches the default app) and `app:notify`. Image and HTTP caches
 are size-bounded and expire after 5 minutes.
+
+## 🎧 Spotify widget
+
+A built-in (non-Lua) widget that shows what's playing: cover art, title /
+artist / album, progress bar with elapsed and total times, a volume slider
+(drag to adjust), previous / play-pause / next controls, the playback device
+name and a queue view (☰) where clicking any track jumps to it.
+
+Managed from **Settings → 🎧 Spotify**:
+
+- **Enable the widget on the desktop** — creates the box instantly when
+  checked; removing the check hides it.
+- **Client ID / Client Secret / Redirect URI** — editable fields persisted
+  in `config.toml` (empty by default; nothing is hardcoded). The Redirect
+  URI must match **exactly** (character for character, no trailing slash)
+  the one registered on `developer.spotify.com` — the default shown is
+  `http://127.0.0.1:8899/callback`, which Spotify accepts as a loopback
+  address.
+- **Connect with Spotify** — syncs the edited fields to the app, opens your
+  browser; after authorizing, the session persists (`spotify.json`) and
+  refreshes automatically.
+- **Disconnect** — forgets the session.
+
+OAuth uses **PKCE** (no secret needed at runtime); the secret is kept for
+completeness. The widget polls every 3 seconds while visible without blocking
+the UI, and only re-downloads the cover when it changes.
 
 ## 🏗️ Architecture
 

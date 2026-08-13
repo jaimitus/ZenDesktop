@@ -20,8 +20,6 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const REDIRECT_PORT: u16 = 8899;
-const REDIRECT_URI: &str = "http://127.0.0.1:8899/callback";
 const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 const AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
 const API_BASE: &str = "https://api.spotify.com/v1";
@@ -75,9 +73,28 @@ pub enum Status {
 
 /// `Clone` comparte el token (Arc<Mutex>): el poller y el hilo de interfaz
 /// refrescan y guardan sobre la misma sesion.
+/// Puerto de la URL de redireccion (para el listener local que captura el
+/// codigo de autorizacion). `http://host:puerto/path` -> puerto.
+pub fn redirect_port(uri: &str) -> u16 {
+    let rest = uri
+        .strip_prefix("http://")
+        .or_else(|| uri.strip_prefix("https://"))
+        .unwrap_or(uri);
+    let host_part = rest.split('/').next().unwrap_or("");
+    host_part
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .unwrap_or(80)
+}
+
 #[derive(Clone)]
 pub struct Spotify {
     client_id: String,
+    /// Client Secret (el flujo actual es PKCE y no lo usa, pero se conserva
+    /// en el cliente por si el flujo cambia a authorization-code con secreto).
+    client_secret: String,
+    /// Redirect URI exacta registrada en el dashboard de Spotify.
+    redirect_uri: String,
     token: Arc<Mutex<Option<Token>>>,
     /// code_verifier del flujo PKCE en curso (para canjear el codigo al volver).
     verifier: String,
@@ -109,10 +126,27 @@ impl Spotify {
         let token = Self::load_token(&store_path);
         Spotify {
             client_id,
+            client_secret: String::new(),
+            redirect_uri: "http://127.0.0.1:8899/callback".into(),
             token: Arc::new(Mutex::new(token)),
             verifier: String::new(),
             store_path,
         }
+    }
+
+    pub fn set_client_secret(&mut self, secret: String) {
+        self.client_secret = secret.trim().to_string();
+    }
+
+    pub fn set_redirect_uri(&mut self, uri: String) {
+        let uri = uri.trim().to_string();
+        if !uri.is_empty() {
+            self.redirect_uri = uri;
+        }
+    }
+
+    pub fn redirect_uri(&self) -> &str {
+        &self.redirect_uri
     }
 
     pub fn status(&self) -> Status {
@@ -139,9 +173,10 @@ impl Spotify {
         let challenge = code_challenge(&self.verifier);
         let scope = "user-read-playback-state user-modify-playback-state user-read-currently-playing";
         Ok(format!(
-            "{AUTHORIZE_URL}?client_id={}&response_type=code&redirect_uri={REDIRECT_URI}\
+            "{AUTHORIZE_URL}?client_id={}&response_type=code&redirect_uri={}\
              &scope={}&code_challenge_method=S256&code_challenge={challenge}",
             self.client_id.trim(),
+            urlencode(&self.redirect_uri),
             urlencode(scope),
         ))
     }
@@ -155,7 +190,7 @@ impl Spotify {
             .send_form(&[
                 ("grant_type", "authorization_code"),
                 ("code", code),
-                ("redirect_uri", REDIRECT_URI),
+                ("redirect_uri", self.redirect_uri.as_str()),
                 ("client_id", self.client_id.trim()),
                 ("code_verifier", verifier.as_str()),
             ])

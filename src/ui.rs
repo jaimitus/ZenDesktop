@@ -1171,11 +1171,11 @@ fn parse_code_from_request(req: &str) -> Option<String> {
     None
 }
 
-/// Escucha UNA conexion en 127.0.0.1:8899 (la redireccion del navegador),
-/// extrae el codigo y lo entrega a la UI por mensaje.
-fn start_spotify_redirect(controller: isize) {
+/// Escucha UNA conexion en 127.0.0.1:<puerto de la redirect URI> (la
+/// redireccion del navegador), extrae el codigo y lo entrega a la UI.
+fn start_spotify_redirect(port: u16, controller: isize) {
     thread::spawn(move || {
-        let listener = match TcpListener::bind(("127.0.0.1", spotify::REDIRECT_PORT)) {
+        let listener = match TcpListener::bind(("127.0.0.1", port)) {
             Ok(l) => l,
             Err(_) => return,
         };
@@ -1632,7 +1632,9 @@ impl App {
                 .parent()
                 .map(|p| p.join("spotify.json"))
                 .unwrap_or_else(|| PathBuf::from("spotify.json"));
-            let spotify = spotify::Spotify::new(cfg.spotify.client_id.clone(), spotify_store);
+            let mut spotify = spotify::Spotify::new(cfg.spotify.client_id.clone(), spotify_store);
+            spotify.set_client_secret(cfg.spotify.client_secret.clone());
+            spotify.set_redirect_uri(cfg.spotify.redirect_uri.clone());
 
             let mut app = Box::new(App {
                 cfg,
@@ -1732,6 +1734,8 @@ impl App {
 
             let delay_secs = (*ptr).cfg.general.startup_delay_seconds;
             (*ptr).startup_pending = delay_secs > 0;
+            // La caja del widget de Spotify se crea al arrancar si esta activado.
+            (*ptr).ensure_spotify_fence();
             (*ptr).build_fences()?;
             // Plantilla por defecto: se aplica al arrancar solo si la
             // disposicion de monitores coincide con la guardada (p.ej. dock ya
@@ -3712,14 +3716,69 @@ impl App {
         poll_spotify_now(self.spotify.clone(), self.controller.0 as isize);
     }
 
-    /// Inicia el flujo OAuth: abre el navegador y escucha la redireccion local.
-    fn spotify_connect(&mut self) {
+    /// Asegura la existencia de la caja del widget de Spotify segun
+    /// `cfg.spotify.enabled`: activado -> crea la entrada `[[fences]]
+    /// widget = "spotify"` si falta; desactivado -> la elimina.
+    fn ensure_spotify_fence(&mut self) {
+        let has_spot = self
+            .cfg
+            .fences
+            .iter()
+            .any(|f| f.widget.as_deref() == Some("spotify"));
+        if self.cfg.spotify.enabled && !has_spot {
+            let n = self.cfg.fences.iter().filter(|f| f.widget.is_some()).count() as i32;
+            self.cfg.fences.push(FenceLayout {
+                id: String32::new("widget:spotify"),
+                x: 120 + n * 32,
+                y: 120 + n * 32,
+                width: 320,
+                height: 240,
+                widget: Some("spotify".into()),
+                ..Default::default()
+            });
+        } else if !self.cfg.spotify.enabled {
+            self.cfg.fences.retain(|f| f.widget.as_deref() != Some("spotify"));
+        }
+    }
+
+    /// Aplica el Client ID/Secret/Redirect URI editados en la configuracion al
+    /// cliente Spotify vivo (lo llama el dialogo antes de conectar/guardar).
+    pub(crate) fn spotify_configure(&mut self, id: &str, secret: &str, redirect: &str) {
+        self.spotify.set_client_id(id.to_string());
+        self.spotify.set_client_secret(secret.to_string());
+        self.spotify.set_redirect_uri(redirect.to_string());
+    }
+
+    /// Estado + contexto para la pestana Spotify de la configuracion.
+    pub(crate) fn spotify_status_info(&self) -> (spotify::Status, String) {
+        let status = self.spotify.status();
+        let detail = match status {
+            spotify::Status::Ready => self
+                .spotify_np
+                .as_ref()
+                .map(|n| {
+                    if n.artist.is_empty() {
+                        n.title.clone()
+                    } else {
+                        format!("{} — {}", n.title, n.artist)
+                    }
+                })
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        (status, detail)
+    }
+
+    /// Inicia el flujo OAuth: abre el navegador y escucha la redireccion local
+    /// en el puerto de la redirect URI configurada.
+    pub(crate) fn spotify_connect(&mut self) {
         let Ok(url) = self.spotify.authorize_url() else { return };
         let wurl = wide(&url);
         unsafe {
             let _ = ShellExecuteW(None, w!("open"), PCWSTR(wurl.as_ptr()), None, None, SW_SHOWNORMAL);
         }
-        start_spotify_redirect(self.controller.0 as isize);
+        let port = spotify::redirect_port(self.spotify.redirect_uri());
+        start_spotify_redirect(port, self.controller.0 as isize);
     }
 
     /// Alterna entre la vista "now playing" y la cola de reproduccion.
@@ -3760,7 +3819,7 @@ impl App {
     }
 
     /// Cierra la sesion de Spotify: olvida el token y limpia el estado del widget.
-    fn spotify_sign_out(&mut self) {
+    pub(crate) fn spotify_sign_out(&mut self) {
         self.spotify.sign_out();
         self.spotify_np = None;
         self.spotify_cover = None;
@@ -5157,6 +5216,10 @@ impl App {
         self.theme = Theme::from_config(&self.cfg);
         self.tr = Tr::get(self.cfg.lang());
         self.spotify.set_client_id(self.cfg.spotify.client_id.clone());
+        self.spotify.set_client_secret(self.cfg.spotify.client_secret.clone());
+        self.spotify.set_redirect_uri(self.cfg.spotify.redirect_uri.clone());
+        // Caja del widget Spotify (nativo): se crea/elimina segun `enabled`.
+        self.ensure_spotify_fence();
         if let Ok(gfx) = Graphics::new(&self.cfg) {
             self.gfx = gfx;
         }
@@ -6492,19 +6555,24 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 }
                 let (x, y) = point_of(lparam);
 
-                // Widget de Spotify: clic en Conectar, controles o volumen.
+                // Widget de Spotify: clic en Conectar, controles o volumen. Los
+                // clics en la cabecera (fuera de ☰/⏻) y en el grip de
+                // redimension caen al flujo normal (mover/redimensionar).
                 if app.fences[index].layout.widget.as_deref() == Some("spotify") {
-                    let status = app.spotify.status();
-                    let (w_dip, h_dip, header, s) = {
+                    let (w_dip, h_dip, header, s, in_grip) = {
                         let f = &app.fences[index];
                         (
                             f.layout.width as f32 / f.scale,
                             f.visible_height(&app.theme) as f32 / f.scale,
                             f.header_h(&app.theme),
                             f.scale,
+                            x > f.layout.width - GRIP
+                                && y > f.visible_height(&app.theme) - GRIP
+                                && !f.layout.collapsed,
                         )
                     };
-                    // Boton de cola (☰) y de cerrar sesion (⏻) en la cabecera.
+                    let status = app.spotify.status();
+                    // Botones de la cabecera (☰ cola, ⏻ desconectar).
                     if status == spotify::Status::Ready {
                         let (cx, cy) = (x as f32 / s, y as f32 / s);
                         let qr = spotify_queue_btn_rect(w_dip, header);
@@ -6518,55 +6586,59 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                             return LRESULT(0);
                         }
                     }
-                    let lay = spotify_layout(w_dip, (h_dip - header).max(40.0));
-                    let (dx, dy) = (x as f32 / s, y as f32 / s - header);
-                    // En vista de cola: clic en una pista la reproduce.
-                    if status == spotify::Status::Ready && app.spotify_show_queue {
-                        let content_h = h_dip - header;
-                        let queue = app.spotify_queue.clone();
-                        let scroll = app.spotify_queue_scroll;
-                        for (i, item) in queue.iter().enumerate() {
-                            if let Some(r) = spotify_queue_row_rect(i, scroll, w_dip, content_h) {
-                                if dx >= r.left && dx <= r.right && dy >= r.top && dy <= r.bottom {
-                                    let uri = item.uri.clone();
-                                    app.spotify_play_track(uri);
-                                    return LRESULT(0);
+                    // Clic en el cuerpo (bajo la cabecera, fuera del grip).
+                    let header_px = (header * s) as i32;
+                    if y > header_px && !in_grip {
+                        let lay = spotify_layout(w_dip, (h_dip - header).max(40.0));
+                        let (dx, dy) = (x as f32 / s, y as f32 / s - header);
+                        // En vista de cola: clic en una pista la reproduce.
+                        if status == spotify::Status::Ready && app.spotify_show_queue {
+                            let content_h = h_dip - header;
+                            let queue = app.spotify_queue.clone();
+                            let scroll = app.spotify_queue_scroll;
+                            for (i, item) in queue.iter().enumerate() {
+                                if let Some(r) = spotify_queue_row_rect(i, scroll, w_dip, content_h) {
+                                    if dx >= r.left && dx <= r.right && dy >= r.top && dy <= r.bottom {
+                                        let uri = item.uri.clone();
+                                        app.spotify_play_track(uri);
+                                        return LRESULT(0);
+                                    }
                                 }
                             }
+                            return LRESULT(0);
                         }
-                        return LRESULT(0);
-                    }
-                    // Slider de volumen: ajusta y entra en modo arrastre.
-                    if status == spotify::Status::Ready && point_in(&lay.volume, dx, dy) {
-                        let percent = volume_from_x(&lay, dx);
-                        app.spotify_set_volume(percent);
-                        app.spotify_volume_drag = true;
-                        let _ = SetCapture(hwnd);
-                        let _ = app.render(index);
-                        return LRESULT(0);
-                    }
-                    let action = match status {
-                        spotify::Status::Ready => {
-                            if point_in(&lay.prev, dx, dy) {
-                                Some(0u8)
-                            } else if point_in(&lay.play, dx, dy) {
-                                Some(1)
-                            } else if point_in(&lay.next, dx, dy) {
-                                Some(2)
-                            } else {
-                                None
+                        // Slider de volumen: ajusta y entra en modo arrastre.
+                        if status == spotify::Status::Ready && point_in(&lay.volume, dx, dy) {
+                            let percent = volume_from_x(&lay, dx);
+                            app.spotify_set_volume(percent);
+                            app.spotify_volume_drag = true;
+                            let _ = SetCapture(hwnd);
+                            let _ = app.render(index);
+                            return LRESULT(0);
+                        }
+                        let action = match status {
+                            spotify::Status::Ready => {
+                                if point_in(&lay.prev, dx, dy) {
+                                    Some(0u8)
+                                } else if point_in(&lay.play, dx, dy) {
+                                    Some(1)
+                                } else if point_in(&lay.next, dx, dy) {
+                                    Some(2)
+                                } else {
+                                    None
+                                }
                             }
+                            _ => {
+                                if point_in(&lay.connect, dx, dy) { Some(3) } else { None }
+                            }
+                        };
+                        match action {
+                            Some(3) => app.spotify_connect(),
+                            Some(a) => app.spotify_control(a),
+                            None => {}
                         }
-                        _ => {
-                            if point_in(&lay.connect, dx, dy) { Some(3) } else { None }
-                        }
-                    };
-                    match action {
-                        Some(3) => app.spotify_connect(),
-                        Some(a) => app.spotify_control(a),
-                        None => {}
+                        return LRESULT(0);
                     }
-                    return LRESULT(0);
                 }
 
                 // Widget Lua generico (no Spotify): clic en el CUERPO -> la

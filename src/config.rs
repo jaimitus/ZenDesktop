@@ -147,23 +147,33 @@ impl Default for AiConfig {
     }
 }
 
-/// Client ID del widget de Spotify (OAuth PKCE, no requiere Client Secret).
-/// Se define aqui en el codigo, no en la interfaz: pega el tuyo de
-/// https://developer.spotify.com/dashboard (Redirect URI: http://127.0.0.1:8899/callback).
-pub const SPOTIFY_CLIENT_ID: &str = "";
+/// Redirect URI por defecto del widget de Spotify (debe coincidir EXACTAMENTE
+/// con la registrada en developer.spotify.com; editable desde Configuracion).
+pub const SPOTIFY_REDIRECT_URI: &str = "http://127.0.0.1:8899/callback";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SpotifyConfig {
-    /// Client ID de la aplicacion registrada en developer.spotify.com (PKCE,
-    /// no requiere Client Secret). Vacio => usa el de `SPOTIFY_CLIENT_ID`.
+    /// true => la caja widget de Spotify se crea en el escritorio.
+    pub enabled: bool,
+    /// Client ID de la aplicacion registrada en developer.spotify.com.
+    /// Se configura desde Configuracion -> Spotify (nada hardcodeado).
     pub client_id: String,
+    /// Client Secret de la misma aplicacion (el flujo OAuth usa PKCE y no lo
+    /// necesita, pero se persiste por si se cambia a flujo con secreto).
+    pub client_secret: String,
+    /// Redirect URI exacta registrada en el dashboard (debe coincidir al
+    /// caracter; el puerto se usa para el listener local de autorizacion).
+    pub redirect_uri: String,
 }
 
 impl Default for SpotifyConfig {
     fn default() -> Self {
         SpotifyConfig {
-            client_id: SPOTIFY_CLIENT_ID.into(),
+            enabled: true,
+            client_id: String::new(),
+            client_secret: String::new(),
+            redirect_uri: SPOTIFY_REDIRECT_URI.into(),
         }
     }
 }
@@ -806,10 +816,10 @@ impl Config {
             }
         }
 
-        // El Client ID de Spotify vive en el codigo; solo se sobreescribe por
-        // config.toml si se puso un valor ahi.
-        if self.spotify.client_id.trim().is_empty() {
-            self.spotify.client_id = SPOTIFY_CLIENT_ID.into();
+        self.spotify.client_id = self.spotify.client_id.trim().to_string();
+        self.spotify.client_secret = self.spotify.client_secret.trim().to_string();
+        if self.spotify.redirect_uri.trim().is_empty() {
+            self.spotify.redirect_uri = SPOTIFY_REDIRECT_URI.into();
         }
 
         let a = &mut self.appearance;

@@ -115,6 +115,9 @@ const ID_EDIT_AI_EMBED_MODEL: u16 = 35;
 const ID_EDIT_R_AI_DESC: u16 = 36;
 const ID_EDIT_WIDGET_NAME: u16 = 37;
 const ID_EDIT_WIDGET_CODE: u16 = 38;
+const ID_EDIT_SPOTIFY_CLIENT_ID: u16 = 39;
+const ID_EDIT_SPOTIFY_CLIENT_SECRET: u16 = 40;
+const ID_EDIT_SPOTIFY_REDIRECT: u16 = 41;
 
 const ID_CHECK_ORGANIZE_FOLDERS: u16 = 101;
 const ID_CHECK_ORGANIZE_START: u16 = 102;
@@ -136,6 +139,7 @@ const ID_CHECK_A_GRID: u16 = 154;
 const ID_CHECK_AI_ENABLE: u16 = 160;
 const ID_CHECK_AUTO_UPDATE: u16 = 161;
 const ID_CHECK_WIDGET_ENABLED: u16 = 170;
+const ID_CHECK_SPOTIFY_ENABLED: u16 = 171;
 
 const ID_BTN_NEW: u16 = 201;
 const ID_BTN_DEL: u16 = 202;
@@ -163,6 +167,8 @@ const ID_BTN_WIDGET_SAVE: u16 = 224;
 const ID_BTN_WIDGET_RELOAD: u16 = 225;
 const ID_BTN_WIDGET_ADD: u16 = 226;
 const ID_BTN_WIDGET_REMOVE: u16 = 227;
+const ID_BTN_SPOTIFY_CONNECT: u16 = 228;
+const ID_BTN_SPOTIFY_DISCONNECT: u16 = 229;
 
 // ---------------------------------------------------------------------------
 // Resultados asíncronos (hilo de trabajo -> hilo de UI del diálogo).
@@ -192,8 +198,11 @@ const BUSY_TIMER_ID: usize = 0x4E5;
 /// rafagas de cambios (tecleo + blur, doble clic, toggles rapidos).
 const PREVIEW_TIMER_ID: usize = 0x4E6;
 const PREVIEW_DEBOUNCE_MS: u32 = 200;
+/// Timer de 1 s que refresca el estado de Spotify mostrado en su pestana
+/// (el OAuth completa en segundo plano mientras el dialogo esta abierto).
+const SPOTIFY_STATUS_TIMER_ID: usize = 0x4E7;
 
-const ALL_EDITS: [u16; 36] = [
+const ALL_EDITS: [u16; 39] = [
     ID_EDIT_MAX_AGE, ID_EDIT_MIN_AGE, ID_EDIT_PURGE, ID_EDIT_R_TITLE, ID_EDIT_R_FOLDER,
     ID_EDIT_R_COLOR, ID_EDIT_R_EXTS, ID_EDIT_R_PATTERNS, ID_EDIT_R_GROUP_TITLE, ID_EDIT_A_BG, ID_EDIT_A_HOVER,
     ID_EDIT_A_BORDER, ID_EDIT_A_TITLE, ID_EDIT_A_TEXT, ID_EDIT_A_MUTED, ID_EDIT_A_SHADOW,
@@ -204,6 +213,7 @@ const ALL_EDITS: [u16; 36] = [
     ID_EDIT_TEMPLATE_NAME,
     ID_EDIT_R_MIN_SIZE, ID_EDIT_R_MAX_SIZE, ID_EDIT_R_NEWER, ID_EDIT_R_OLDER, ID_EDIT_R_REGEX,
     ID_EDIT_AI_EMBED_MODEL, ID_EDIT_R_AI_DESC, ID_EDIT_WIDGET_NAME,
+    ID_EDIT_SPOTIFY_CLIENT_ID, ID_EDIT_SPOTIFY_CLIENT_SECRET, ID_EDIT_SPOTIFY_REDIRECT,
 ];
 
 // Valores de teclas para patrones de match (las constantes VK_* no son
@@ -268,6 +278,7 @@ enum Panel {
     Ai,
     Updates,
     Widgets,
+    Spotify,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -405,6 +416,8 @@ struct Settings {
     // Fase de animacion del spinner (0..1) y si el timer de repintado esta vivo.
     spinner_phase: f32,
     busy_timer: bool,
+    /// Estado de Spotify mostrado en su pestana (se refresca por timer).
+    spotify_status: String,
 }
 
 const HEADER_H: f32 = 48.0;
@@ -1794,6 +1807,93 @@ impl Settings {
         self.icon_button(Rect { x: cx + 16.0, y, w: 140.0, h: 28.0 }, self.tr.btn_widget_save, ID_BTN_WIDGET_SAVE, self.widgets_selected.is_some());
     }
 
+    fn panel_spotify(&mut self, cy: f32) {
+        let (cx, _, cw, _) = self.content_area();
+        let mut y = cy + 10.0;
+        let tr = self.tr;
+
+        y = self.section(y, cx, cw, tr.sec_spotify);
+        y = self.check(y, cx, cw, ID_CHECK_SPOTIFY_ENABLED, tr.chk_spotify_enabled);
+
+        y += 6.0;
+        let id = self.cfg.spotify.client_id.clone();
+        y = self.field_row(y, (cx, cw), ID_EDIT_SPOTIFY_CLIENT_ID, tr.fld_spotify_client_id, &id, false);
+        let secret = self.cfg.spotify.client_secret.clone();
+        y = self.field_row(y, (cx, cw), ID_EDIT_SPOTIFY_CLIENT_SECRET, tr.fld_spotify_client_secret, &secret, false);
+        let redirect = self.cfg.spotify.redirect_uri.clone();
+        y = self.field_row(y, (cx, cw), ID_EDIT_SPOTIFY_REDIRECT, tr.fld_spotify_redirect, &redirect, false);
+
+        // Estado de la sesion (se refresca por timer mientras el dialogo esta abierto).
+        y += 4.0;
+        let status_text = self.spotify_status.clone();
+        let status_color = if status_text.contains(tr.msg_spotify_ready) {
+            col(C_ACCENT)
+        } else {
+            col(C_TEXT)
+        };
+        self.text(
+            &status_text,
+            Fmt::Body,
+            D2D_RECT_F {
+                left: cx + 16.0,
+                top: y + 4.0,
+                right: cx + cw - 16.0,
+                bottom: y + 28.0,
+            },
+            status_color,
+        );
+        y += 34.0;
+
+        // Botones Conectar / Desconectar.
+        let status = self.spotify_app_status();
+        let connected = status == crate::spotify::Status::Ready;
+        let configured = status != crate::spotify::Status::Unconfigured;
+        self.icon_button(Rect { x: cx + 16.0, y, w: 230.0, h: 32.0 }, tr.btn_spotify_connect, ID_BTN_SPOTIFY_CONNECT, configured && !connected);
+        self.icon_button(Rect { x: cx + 256.0, y, w: 150.0, h: 32.0 }, tr.btn_spotify_disconnect, ID_BTN_SPOTIFY_DISCONNECT, connected);
+
+        y += 48.0;
+        self.text(
+            tr.msg_spotify_note,
+            Fmt::Small,
+            D2D_RECT_F {
+                left: cx + 16.0,
+                top: y,
+                right: cx + cw - 16.0,
+                bottom: y + 40.0,
+            },
+            col(C_DIM),
+        );
+    }
+
+    /// Estado actual de Spotify (de la app viva; Unconfigured si no hay app).
+    fn spotify_app_status(&self) -> crate::spotify::Status {
+        if self.app.is_null() {
+            return crate::spotify::Status::Unconfigured;
+        }
+        unsafe { (*self.app).spotify_status_info().0 }
+    }
+
+    /// Refresca el texto de estado de la pestana Spotify desde la app.
+    fn spotify_refresh_status(&mut self) {
+        let (status, detail) = if self.app.is_null() {
+            (crate::spotify::Status::Unconfigured, String::new())
+        } else {
+            unsafe { (*self.app).spotify_status_info() }
+        };
+        let s = match status {
+            crate::spotify::Status::Unconfigured => self.tr.msg_spotify_unconfigured.to_string(),
+            crate::spotify::Status::LoggedOut => self.tr.msg_spotify_loggedout.to_string(),
+            crate::spotify::Status::Ready => {
+                if detail.is_empty() {
+                    self.tr.msg_spotify_ready.to_string()
+                } else {
+                    format!("{} — {detail}", self.tr.msg_spotify_ready)
+                }
+            }
+        };
+        self.spotify_status = s;
+    }
+
     fn widget_row(&mut self, r: &D2D_RECT_F, idx: usize) {
         let name = self.widgets_list[idx].clone();
         let selected = self.widgets_selected == Some(idx);
@@ -2144,7 +2244,7 @@ impl Settings {
         let h = self.size.1 - HEADER_H - BAR_H;
         self.fill_rr(0.0, y0, SIDEBAR_W, h, 0.0, col(C_SIDEBAR));
         self.draw_rr(Rect { x: SIDEBAR_W - 1.0, y: y0, w: 1.0, h }, 0.0, rgba(C_CARD_BORDER, 0.6), 1.0);
-        let items: [(Panel, &'static str); 7] = [
+        let items: [(Panel, &'static str); 8] = [
             (Panel::General, self.tr.nav_general),
             (Panel::Rules, self.tr.nav_rules),
             (Panel::Appearance, self.tr.nav_appearance),
@@ -2152,6 +2252,7 @@ impl Settings {
             (Panel::Ai, "🤖 IA (Ollama)"),
             (Panel::Updates, "🔄 Updates"),
             (Panel::Widgets, "🧩 Widgets"),
+            (Panel::Spotify, self.tr.nav_spotify),
         ];
         let mut y = y0 + 16.0;
         for (panel, label) in items {
@@ -2485,6 +2586,7 @@ impl Settings {
             Panel::Ai => self.panel_ai(scy),
             Panel::Updates => self.panel_updates(scy),
             Panel::Widgets => self.panel_widgets(scy),
+            Panel::Spotify => self.panel_spotify(scy),
         }
         // Limite de desplazamiento = el punto mas bajo del contenido dibujado.
         let max_bottom = self.regions[panel_start..]
@@ -2644,6 +2746,8 @@ impl Settings {
             Ctrl::Nav(Panel::Language),
             Ctrl::Nav(Panel::Ai),
             Ctrl::Nav(Panel::Updates),
+            Ctrl::Nav(Panel::Widgets),
+            Ctrl::Nav(Panel::Spotify),
         ];
         match self.panel {
             Panel::General => {
@@ -2748,6 +2852,16 @@ impl Settings {
                     Ctrl::Btn(ID_BTN_WIDGET_SAVE),
                 ]);
             }
+            Panel::Spotify => {
+                order.extend([
+                    Ctrl::Check(ID_CHECK_SPOTIFY_ENABLED),
+                    Ctrl::Field(ID_EDIT_SPOTIFY_CLIENT_ID),
+                    Ctrl::Field(ID_EDIT_SPOTIFY_CLIENT_SECRET),
+                    Ctrl::Field(ID_EDIT_SPOTIFY_REDIRECT),
+                    Ctrl::Btn(ID_BTN_SPOTIFY_CONNECT),
+                    Ctrl::Btn(ID_BTN_SPOTIFY_DISCONNECT),
+                ]);
+            }
         }
         order.push(Ctrl::Btn(ID_BTN_OK));
         order.push(Ctrl::Btn(ID_BTN_CANCEL));
@@ -2796,6 +2910,11 @@ impl Settings {
             Ctrl::Btn(ID_BTN_WIDGET_DEL) | Ctrl::Btn(ID_BTN_WIDGET_SAVE) => self.widgets_selected.is_some(),
             Ctrl::Btn(ID_BTN_WIDGET_ADD) => self.widget_can_add(),
             Ctrl::Btn(ID_BTN_WIDGET_REMOVE) => self.widget_can_remove(),
+            Ctrl::Btn(ID_BTN_SPOTIFY_CONNECT) => {
+                let s = self.spotify_app_status();
+                s != crate::spotify::Status::Unconfigured && s != crate::spotify::Status::Ready
+            }
+            Ctrl::Btn(ID_BTN_SPOTIFY_DISCONNECT) => self.spotify_app_status() == crate::spotify::Status::Ready,
             Ctrl::Btn(ID_BTN_GROUP) => self.rule_can_group(),
             Ctrl::Btn(ID_BTN_UNGROUP) => self.selected_is_grouped(),
             Ctrl::Btn(ID_BTN_UP) | Ctrl::Btn(ID_BTN_DOWN) => self.rule_can_move(if c == Ctrl::Btn(ID_BTN_UP) { -1 } else { 1 }),
@@ -2844,6 +2963,34 @@ impl Settings {
             Ctrl::Btn(ID_BTN_WIDGET_RELOAD) => self.widget_reload(),
             Ctrl::Btn(ID_BTN_WIDGET_ADD) => self.widget_add_as_box(),
             Ctrl::Btn(ID_BTN_WIDGET_REMOVE) => self.widget_remove_box(),
+            Ctrl::Btn(ID_BTN_SPOTIFY_CONNECT) => {
+                // Sincroniza el Client ID/Secret editados con la app antes de
+                // abrir el navegador de autorizacion.
+                if !self.app.is_null() {
+                    let id = self
+                        .edit_text(ID_EDIT_SPOTIFY_CLIENT_ID)
+                        .unwrap_or_else(|| self.cfg.spotify.client_id.clone());
+                    let secret = self
+                        .edit_text(ID_EDIT_SPOTIFY_CLIENT_SECRET)
+                        .unwrap_or_else(|| self.cfg.spotify.client_secret.clone());
+                    let redirect = self
+                        .edit_text(ID_EDIT_SPOTIFY_REDIRECT)
+                        .unwrap_or_else(|| self.cfg.spotify.redirect_uri.clone());
+                    unsafe {
+                        (*self.app).spotify_configure(&id, &secret, &redirect);
+                        (*self.app).spotify_connect();
+                    }
+                }
+                self.spotify_refresh_status();
+                self.preview_apply();
+            }
+            Ctrl::Btn(ID_BTN_SPOTIFY_DISCONNECT) => {
+                if !self.app.is_null() {
+                    unsafe { (*self.app).spotify_sign_out(); }
+                }
+                self.spotify_refresh_status();
+                self.invalidate();
+            }
             Ctrl::Folder(id) => {
                 self.pick_folder(id);
                 self.preview_apply();
@@ -3930,6 +4077,21 @@ impl Settings {
             cfg.appearance.grid_icon_size = v.clamp(16.0, 96.0);
         }
 
+        // Widget de Spotify: activacion, Client ID y Client Secret.
+        cfg.spotify.enabled = self.checked(ID_CHECK_SPOTIFY_ENABLED);
+        let sp_id = text(ID_EDIT_SPOTIFY_CLIENT_ID).trim().to_string();
+        if !sp_id.is_empty() {
+            cfg.spotify.client_id = sp_id;
+        }
+        let sp_secret = text(ID_EDIT_SPOTIFY_CLIENT_SECRET).trim().to_string();
+        if !sp_secret.is_empty() {
+            cfg.spotify.client_secret = sp_secret;
+        }
+        let sp_redirect = text(ID_EDIT_SPOTIFY_REDIRECT).trim().to_string();
+        if !sp_redirect.is_empty() {
+            cfg.spotify.redirect_uri = sp_redirect;
+        }
+
         // Idioma elegido en el selector.
         cfg.language = self.lang.code().into();
 
@@ -4400,6 +4562,15 @@ extern "system" fn dlg_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                     let state = &mut *state_from(hwnd);
                     let _ = KillTimer(hwnd, PREVIEW_TIMER_ID);
                     state.flush_preview();
+                } else if wparam.0 == SPOTIFY_STATUS_TIMER_ID {
+                    // Refresca el estado de Spotify (el OAuth puede completar
+                    // en segundo plano mientras el dialogo esta abierto).
+                    let state = &mut *state_from(hwnd);
+                    let before = state.spotify_status.clone();
+                    state.spotify_refresh_status();
+                    if state.spotify_status != before {
+                        state.invalidate();
+                    }
                 }
                 LRESULT(0)
             }
@@ -4459,6 +4630,7 @@ extern "system" fn dlg_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                 // Red de seguridad: si la ventana se destruye por otra via.
                 let _ = KillTimer(hwnd, BUSY_TIMER_ID);
                 let _ = KillTimer(hwnd, PREVIEW_TIMER_ID);
+                let _ = KillTimer(hwnd, SPOTIFY_STATUS_TIMER_ID);
                 // Sin PostQuitMessage: el bucle principal de la app decide.
                 LRESULT(0)
             }
@@ -4768,6 +4940,7 @@ fn initial_checks(cfg: &Config) -> HashMap<u16, bool> {
     m.insert(ID_CHECK_A_SEARCH, cfg.appearance.show_search);
     m.insert(ID_CHECK_A_GRID, cfg.appearance.grid_mode);
     m.insert(ID_CHECK_AI_ENABLE, cfg.ai.enabled);
+    m.insert(ID_CHECK_SPOTIFY_ENABLED, cfg.spotify.enabled);
     m
 }
 
@@ -4889,6 +5062,7 @@ pub fn open_dialog(current: &Config, app: *mut App) -> Option<Config> {
             target_px_size: (0, 0),
             spinner_phase: 0.0,
             busy_timer: false,
+            spotify_status: String::new(),
         };
 
         // Limpieza de flags stale: si una operacion quedo en curso al cerrar el
@@ -5081,6 +5255,8 @@ pub fn open_dialog(current: &Config, app: *mut App) -> Option<Config> {
         settings.refresh_rule_fields();
         settings.refresh_widget_fields();
         seed_edits(&settings);
+        settings.spotify_refresh_status();
+        let _ = SetTimer(hwnd, SPOTIFY_STATUS_TIMER_ID, 1000, None);
 
         let _ = ShowWindow(hwnd, SW_SHOW);
         settings.invalidate();
@@ -5177,6 +5353,9 @@ fn seed_edits(s: &Settings) {
         (ID_EDIT_AI_URL, s.cfg.ai.ollama_url.clone()),
         (ID_EDIT_AI_MODEL, s.cfg.ai.model.clone()),
         (ID_EDIT_AI_EMBED_MODEL, s.cfg.ai.embed_model.clone()),
+        (ID_EDIT_SPOTIFY_CLIENT_ID, s.cfg.spotify.client_id.clone()),
+        (ID_EDIT_SPOTIFY_CLIENT_SECRET, s.cfg.spotify.client_secret.clone()),
+        (ID_EDIT_SPOTIFY_REDIRECT, s.cfg.spotify.redirect_uri.clone()),
     ];
     for (id, value) in rows {
         if let Some(edit) = s.edits.get(&id).copied() {

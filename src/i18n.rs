@@ -254,6 +254,19 @@ pub struct Tr {
     pub fld_widget_name: &'static str,
     pub lbl_widget_code: &'static str,
     pub msg_widget_empty: &'static str,
+    // Spotify (widget nativo)
+    pub nav_spotify: &'static str,
+    pub sec_spotify: &'static str,
+    pub chk_spotify_enabled: &'static str,
+    pub fld_spotify_client_id: &'static str,
+    pub fld_spotify_client_secret: &'static str,
+    pub fld_spotify_redirect: &'static str,
+    pub btn_spotify_connect: &'static str,
+    pub btn_spotify_disconnect: &'static str,
+    pub msg_spotify_unconfigured: &'static str,
+    pub msg_spotify_loggedout: &'static str,
+    pub msg_spotify_ready: &'static str,
+    pub msg_spotify_note: &'static str,
 }
 
 macro_rules! tr {
@@ -429,6 +442,18 @@ pub static EN: Tr = tr! {
         fld_widget_name: "Name",
         lbl_widget_code: "Lua code",
         msg_widget_empty: "No widgets yet — create one with New",
+        nav_spotify: "🎧 Spotify",
+        sec_spotify: "Spotify widget",
+        chk_spotify_enabled: "Enable the Spotify widget on the desktop",
+        fld_spotify_client_id: "Client ID",
+        fld_spotify_client_secret: "Client Secret",
+        fld_spotify_redirect: "Redirect URI",
+        btn_spotify_connect: "Connect with Spotify",
+        btn_spotify_disconnect: "Disconnect",
+        msg_spotify_unconfigured: "Not configured — add your Client ID.",
+        msg_spotify_loggedout: "No session yet. Press Connect and authorize in the browser.",
+        msg_spotify_ready: "Connected to Spotify",
+        msg_spotify_note: "App registered on developer.spotify.com with redirect URI http://127.0.0.1:8899/callback",
 };
 
 pub static ES: Tr = tr! {
@@ -596,6 +621,18 @@ pub static ES: Tr = tr! {
         fld_widget_name: "Nombre",
         lbl_widget_code: "Código Lua",
         msg_widget_empty: "Aún no hay widgets — crea uno con Nuevo",
+        nav_spotify: "🎧 Spotify",
+        sec_spotify: "Widget de Spotify",
+        chk_spotify_enabled: "Activar el widget de Spotify en el escritorio",
+        fld_spotify_client_id: "Client ID",
+        fld_spotify_client_secret: "Client Secret",
+        fld_spotify_redirect: "Redirect URI",
+        btn_spotify_connect: "Conectar con Spotify",
+        btn_spotify_disconnect: "Desconectar",
+        msg_spotify_unconfigured: "Sin configurar — añade tu Client ID.",
+        msg_spotify_loggedout: "Aún no hay sesión. Pulsa Conectar y autoriza en el navegador.",
+        msg_spotify_ready: "Conectado a Spotify",
+        msg_spotify_note: "App registrada en developer.spotify.com con redirect URI http://127.0.0.1:8899/callback",
 };
 
 pub static DE: Tr = tr! {
@@ -763,6 +800,18 @@ pub static DE: Tr = tr! {
         fld_widget_name: "Name",
         lbl_widget_code: "Lua-Code",
         msg_widget_empty: "Noch keine Widgets — erstelle eines mit Neu",
+        nav_spotify: "🎧 Spotify",
+        sec_spotify: "Spotify-Widget",
+        chk_spotify_enabled: "Spotify-Widget auf dem Desktop aktivieren",
+        fld_spotify_client_id: "Client ID",
+        fld_spotify_client_secret: "Client Secret",
+        fld_spotify_redirect: "Redirect URI",
+        btn_spotify_connect: "Mit Spotify verbinden",
+        btn_spotify_disconnect: "Trennen",
+        msg_spotify_unconfigured: "Nicht konfiguriert — Client ID eintragen.",
+        msg_spotify_loggedout: "Noch keine Sitzung. Verbinden drücken und im Browser autorisieren.",
+        msg_spotify_ready: "Mit Spotify verbunden",
+        msg_spotify_note: "App auf developer.spotify.com registriert mit Redirect-URI http://127.0.0.1:8899/callback",
 };
 
 pub static FR: Tr = tr! {
@@ -930,6 +979,18 @@ pub static FR: Tr = tr! {
         fld_widget_name: "Nom",
         lbl_widget_code: "Code Lua",
         msg_widget_empty: "Aucun widget — créez-en un avec Nouveau",
+        nav_spotify: "🎧 Spotify",
+        sec_spotify: "Widget Spotify",
+        chk_spotify_enabled: "Activer le widget Spotify sur le bureau",
+        fld_spotify_client_id: "Client ID",
+        fld_spotify_client_secret: "Client Secret",
+        fld_spotify_redirect: "Redirect URI",
+        btn_spotify_connect: "Se connecter à Spotify",
+        btn_spotify_disconnect: "Se déconnecter",
+        msg_spotify_unconfigured: "Non configuré — ajoutez votre Client ID.",
+        msg_spotify_loggedout: "Pas encore de session. Connectez-vous et autorisez dans le navigateur.",
+        msg_spotify_ready: "Connecté à Spotify",
+        msg_spotify_note: "App enregistrée sur developer.spotify.com avec URI de redirection http://127.0.0.1:8899/callback",
 };
 
 pub static PT: Tr = tr! {
@@ -1097,6 +1158,18 @@ pub static PT: Tr = tr! {
         fld_widget_name: "Nome",
         lbl_widget_code: "Código Lua",
         msg_widget_empty: "Nenhum widget ainda — crie um com Novo",
+        nav_spotify: "🎧 Spotify",
+        sec_spotify: "Widget do Spotify",
+        chk_spotify_enabled: "Ativar o widget do Spotify na área de trabalho",
+        fld_spotify_client_id: "Client ID",
+        fld_spotify_client_secret: "Client Secret",
+        fld_spotify_redirect: "Redirect URI",
+        btn_spotify_connect: "Conectar ao Spotify",
+        btn_spotify_disconnect: "Desconectar",
+        msg_spotify_unconfigured: "Não configurado — adicione o seu Client ID.",
+        msg_spotify_loggedout: "Sem sessão ainda. Toque em Conectar e autorize no navegador.",
+        msg_spotify_ready: "Conectado ao Spotify",
+        msg_spotify_note: "App registada em developer.spotify.com com redirect URI http://127.0.0.1:8899/callback",
 };
 
 pub static IT: Tr = tr! {
@@ -1264,6 +1337,18 @@ pub static IT: Tr = tr! {
         fld_widget_name: "Nome",
         lbl_widget_code: "Codice Lua",
         msg_widget_empty: "Nessun widget — creane uno con Nuovo",
+        nav_spotify: "🎧 Spotify",
+        sec_spotify: "Widget Spotify",
+        chk_spotify_enabled: "Abilita il widget Spotify sul desktop",
+        fld_spotify_client_id: "Client ID",
+        fld_spotify_client_secret: "Client Secret",
+        fld_spotify_redirect: "Redirect URI",
+        btn_spotify_connect: "Collega con Spotify",
+        btn_spotify_disconnect: "Scollega",
+        msg_spotify_unconfigured: "Non configurato — aggiungi il tuo Client ID.",
+        msg_spotify_loggedout: "Ancora nessuna sessione. Premi Collega e autorizza nel browser.",
+        msg_spotify_ready: "Connesso a Spotify",
+        msg_spotify_note: "App registrata su developer.spotify.com con redirect URI http://127.0.0.1:8899/callback",
 };
 
 impl Tr {
