@@ -1,6 +1,6 @@
 [package]
 name          = "zendesktop"
-version       = "1.0.22"
+version       = "1.0.23"
 edition       = "2021"
 rust-version  = "1.75"
 authors       = ["ZenDesktop Core Team"]
@@ -85,8 +85,8 @@ features = [
 ]
 
 # ---------------------------------------------------------------------------
-# Recursos de Windows (iconos + version info) compilados por build.rs desde
-# assets/zendesktop.rc.
+# Recursos de Windows (iconos + version info). build.rs genera el .rc con la
+# version tomada de CARGO_PKG_VERSION y lo compila con embed-resource.
 [build-dependencies]
 embed-resource = "2"
 

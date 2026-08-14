@@ -225,7 +225,7 @@ static DROPBOX_PENDING_UPLOAD: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 const HOTKEY_ID: i32 = 0x5A45;
 /// Identificador unico del icono de bandeja ("ZD" en ASCII).
 const TRAY_UID: u32 = 0x5A44;
-/// Recurso del icono de bandeja embebido en el .exe (ver assets/zendesktop.rc).
+/// Recurso del icono de bandeja embebido en el .exe (generado por build.rs).
 const TRAY_ICON_RES: usize = 2;
 
 const CMD_ZEN: usize = 1;
@@ -8154,6 +8154,10 @@ impl Drop for App {
                 let _ = DestroyWindow(self.guides_hwnd);
             }
             for fence in self.fences.drain(..) {
+                // Revocar el registro OLE antes de destruir: si el shell aun
+                // tiene el drop target vivo al destruir la ventana, el cierre
+                // puede quedarse colgado en el subsistema OLE.
+                let _ = RevokeDragDrop(fence.hwnd);
                 let _ = DestroyWindow(fence.hwnd);
             }
             self.watcher.take();

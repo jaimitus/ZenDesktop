@@ -7,6 +7,20 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.23] - 2026-08-14
+
+### Fixed
+- **App hung on exit and after auto-update** — the fence windows were
+  destroyed at shutdown without revoking their OLE drop targets
+  (`RevokeDragDrop`), which could hang the process in the OLE subsystem and
+  keep the single-instance mutex held, so the freshly updated process never
+  took over. Shutdown now revokes every fence's drag & drop before destroying
+  its window.
+- **Wrong version shown in the EXE properties** — the version resource
+  (`VERSIONINFO`) was hardcoded in `assets/zendesktop.rc` and drifted behind
+  (still said 1.0.19). `build.rs` now generates the version resource from
+  `CARGO_PKG_VERSION`, so the EXE always matches `Cargo.toml`.
+
 ## [1.0.22] - 2026-08-14
 
 ### Fixed
