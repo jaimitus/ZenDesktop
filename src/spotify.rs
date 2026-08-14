@@ -271,6 +271,28 @@ impl Spotify {
         Ok(Some(parse_now_playing(&v)))
     }
 
+    /// Dispositivo de reproduccion activo: (volumen 0..100, nombre).
+    /// `currently-playing` no incluye el device, asi que se consulta aparte.
+    pub fn active_device(&self) -> Option<(u8, String)> {
+        let access = self.ensure_valid().ok()?;
+        let resp = ureq::get(&format!("{API_BASE}/me/player/devices"))
+            .timeout(Duration::from_secs(8))
+            .set("Authorization", &format!("Bearer {access}"))
+            .call()
+            .ok()?;
+        let body = resp.into_string().ok()?;
+        let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+        let devices = v["devices"].as_array()?;
+        for dev in devices {
+            if dev["is_active"].as_bool().unwrap_or(false) {
+                let vol = dev["volume_percent"].as_u64().unwrap_or(50).min(100) as u8;
+                let name = dev["name"].as_str().unwrap_or("").to_string();
+                return Some((vol, name));
+            }
+        }
+        None
+    }
+
     /// Pausa o reanuda la reproduccion segun el estado conocido del widget.
     pub fn set_playing(&self, playing: bool) -> Result<(), String> {
         let access = self.ensure_valid()?;
@@ -278,6 +300,7 @@ impl Spotify {
         ureq::put(&format!("{API_BASE}/me/player/{endpoint}"))
             .timeout(Duration::from_secs(8))
             .set("Authorization", &format!("Bearer {access}"))
+            .set("Content-Length", "0")
             .call()
             .map_err(|e| format!("{endpoint} failed: {e}"))?;
         Ok(())
@@ -288,6 +311,7 @@ impl Spotify {
         ureq::post(&format!("{API_BASE}/me/player/next"))
             .timeout(Duration::from_secs(8))
             .set("Authorization", &format!("Bearer {access}"))
+            .set("Content-Length", "0")
             .call()
             .map_err(|e| format!("next failed: {e}"))?;
         Ok(())
@@ -298,6 +322,7 @@ impl Spotify {
         ureq::post(&format!("{API_BASE}/me/player/previous"))
             .timeout(Duration::from_secs(8))
             .set("Authorization", &format!("Bearer {access}"))
+            .set("Content-Length", "0")
             .call()
             .map_err(|e| format!("previous failed: {e}"))?;
         Ok(())
@@ -364,6 +389,7 @@ impl Spotify {
         ureq::put(&format!("{API_BASE}/me/player/volume?volume_percent={}", percent.min(100)))
             .timeout(Duration::from_secs(8))
             .set("Authorization", &format!("Bearer {access}"))
+            .set("Content-Length", "0")
             .call()
             .map_err(|e| format!("volume failed: {e}"))?;
         Ok(())

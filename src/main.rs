@@ -19,6 +19,7 @@
 mod ai;
 mod changelog;
 mod config;
+mod dropbox;
 mod i18n;
 mod rules;
 mod settings;

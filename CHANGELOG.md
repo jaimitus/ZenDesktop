@@ -7,6 +7,43 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.19] - 2026-08-14
+
+### Added
+- **📁 Dropbox widget (first-class)**: a new **📁 Dropbox** panel in Settings
+  manages a desktop box that browses and syncs your Dropbox, exactly like the
+  Spotify widget:
+  - **App Key / App Secret / Redirect URI** — editable fields persisted in
+    `config.toml`, with a live session status and **Connect / Disconnect**
+    buttons. OAuth uses PKCE with `force_reapprove` so re-authorizing picks
+    up newly enabled scopes (fixes 401 `missing_scope` on stale tokens).
+  - **Enable the widget on the desktop** — creates/removes the box instantly.
+  - **File browser in the box**: click to select, double-click a folder to
+    enter it (breadcrumb shows the remote path), ⬆ to go up, double-click a
+    file to download and open it, and a **Sync** button for local ↔ remote.
+  - **Bidirectional drag & drop**: drag files out of the box (downloaded to
+    a temp file, then a native OLE drag) or drop files into the box from
+    Explorer or another fence (uploaded to the remote folder you're
+    browsing).
+
+### Fixed
+- **Spotify controls and volume did nothing**: the play/pause, next/previous
+  and volume calls are PUT/POST without a body, and ureq 2.x doesn't send
+  `Content-Length` for bodyless requests — Spotify rejected them with
+  `411 Length Required`. All four control calls now send `Content-Length: 0`.
+- **Spotify volume always showed 50%**: the now-playing endpoint doesn't
+  include the device, so the slider fell back to a hardcoded 50. The widget
+  now queries the active device (real volume + device name).
+- **Crash (access violation) when dropping onto boxes**: the OLE callbacks
+  built the `IDataObject` with `&*(pdataobj as *const IDataObject)`, which
+  read the COM object's vtable as if it were the pointer, so any COM call
+  jumped to `QueryInterface + offset`. The interface is now constructed with
+  `IDataObject::from_raw`, and internal drags skip COM inspection entirely.
+- **Heap corruption (0xc0000374) when dropping into the Dropbox box**: the
+  drop callback no longer touches the UI or re-reads the `IDataObject` in
+  the middle of a `DoDragDrop`. Drops are queued and processed by a message
+  after the drag loop ends; internal drops reuse the source fence's paths.
+
 ## [1.0.18] - 2026-08-13
 
 ### Added

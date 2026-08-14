@@ -118,6 +118,11 @@ const ID_EDIT_WIDGET_CODE: u16 = 38;
 const ID_EDIT_SPOTIFY_CLIENT_ID: u16 = 39;
 const ID_EDIT_SPOTIFY_CLIENT_SECRET: u16 = 40;
 const ID_EDIT_SPOTIFY_REDIRECT: u16 = 41;
+const ID_EDIT_DROPBOX_APP_KEY: u16 = 42;
+const ID_EDIT_DROPBOX_APP_SECRET: u16 = 46;
+const ID_EDIT_DROPBOX_REDIRECT: u16 = 43;
+const ID_EDIT_DROPBOX_LOCAL: u16 = 44;
+const ID_EDIT_DROPBOX_REMOTE: u16 = 45;
 
 const ID_CHECK_ORGANIZE_FOLDERS: u16 = 101;
 const ID_CHECK_ORGANIZE_START: u16 = 102;
@@ -140,6 +145,7 @@ const ID_CHECK_AI_ENABLE: u16 = 160;
 const ID_CHECK_AUTO_UPDATE: u16 = 161;
 const ID_CHECK_WIDGET_ENABLED: u16 = 170;
 const ID_CHECK_SPOTIFY_ENABLED: u16 = 171;
+const ID_CHECK_DROPBOX_ENABLED: u16 = 172;
 
 const ID_BTN_NEW: u16 = 201;
 const ID_BTN_DEL: u16 = 202;
@@ -169,6 +175,9 @@ const ID_BTN_WIDGET_ADD: u16 = 226;
 const ID_BTN_WIDGET_REMOVE: u16 = 227;
 const ID_BTN_SPOTIFY_CONNECT: u16 = 228;
 const ID_BTN_SPOTIFY_DISCONNECT: u16 = 229;
+const ID_BTN_DROPBOX_CONNECT: u16 = 230;
+const ID_BTN_DROPBOX_DISCONNECT: u16 = 231;
+const ID_BTN_DROPBOX_SYNC: u16 = 232;
 
 // ---------------------------------------------------------------------------
 // Resultados asíncronos (hilo de trabajo -> hilo de UI del diálogo).
@@ -202,7 +211,7 @@ const PREVIEW_DEBOUNCE_MS: u32 = 200;
 /// (el OAuth completa en segundo plano mientras el dialogo esta abierto).
 const SPOTIFY_STATUS_TIMER_ID: usize = 0x4E7;
 
-const ALL_EDITS: [u16; 39] = [
+const ALL_EDITS: [u16; 44] = [
     ID_EDIT_MAX_AGE, ID_EDIT_MIN_AGE, ID_EDIT_PURGE, ID_EDIT_R_TITLE, ID_EDIT_R_FOLDER,
     ID_EDIT_R_COLOR, ID_EDIT_R_EXTS, ID_EDIT_R_PATTERNS, ID_EDIT_R_GROUP_TITLE, ID_EDIT_A_BG, ID_EDIT_A_HOVER,
     ID_EDIT_A_BORDER, ID_EDIT_A_TITLE, ID_EDIT_A_TEXT, ID_EDIT_A_MUTED, ID_EDIT_A_SHADOW,
@@ -214,6 +223,7 @@ const ALL_EDITS: [u16; 39] = [
     ID_EDIT_R_MIN_SIZE, ID_EDIT_R_MAX_SIZE, ID_EDIT_R_NEWER, ID_EDIT_R_OLDER, ID_EDIT_R_REGEX,
     ID_EDIT_AI_EMBED_MODEL, ID_EDIT_R_AI_DESC, ID_EDIT_WIDGET_NAME,
     ID_EDIT_SPOTIFY_CLIENT_ID, ID_EDIT_SPOTIFY_CLIENT_SECRET, ID_EDIT_SPOTIFY_REDIRECT,
+    ID_EDIT_DROPBOX_APP_KEY, ID_EDIT_DROPBOX_APP_SECRET, ID_EDIT_DROPBOX_REDIRECT, ID_EDIT_DROPBOX_LOCAL, ID_EDIT_DROPBOX_REMOTE,
 ];
 
 // Valores de teclas para patrones de match (las constantes VK_* no son
@@ -279,6 +289,7 @@ enum Panel {
     Updates,
     Widgets,
     Spotify,
+    Dropbox,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -418,6 +429,7 @@ struct Settings {
     busy_timer: bool,
     /// Estado de Spotify mostrado en su pestana (se refresca por timer).
     spotify_status: String,
+    dropbox_status: String,
 }
 
 const HEADER_H: f32 = 48.0;
@@ -1865,6 +1877,99 @@ impl Settings {
         );
     }
 
+    fn panel_dropbox(&mut self, cy: f32) {
+        let (cx, _, cw, _) = self.content_area();
+        let mut y = cy + 10.0;
+        let tr = self.tr;
+
+        y = self.section(y, cx, cw, tr.sec_dropbox);
+        y = self.check(y, cx, cw, ID_CHECK_DROPBOX_ENABLED, tr.chk_dropbox_enabled);
+
+        y += 6.0;
+        let key = self.cfg.dropbox.app_key.clone();
+        y = self.field_row(y, (cx, cw), ID_EDIT_DROPBOX_APP_KEY, tr.fld_dropbox_app_key, &key, false);
+        let secret = self.cfg.dropbox.app_secret.clone();
+        y = self.field_row(y, (cx, cw), ID_EDIT_DROPBOX_APP_SECRET, tr.fld_dropbox_app_secret, &secret, false);
+        let redirect = self.cfg.dropbox.redirect_uri.clone();
+        y = self.field_row(y, (cx, cw), ID_EDIT_DROPBOX_REDIRECT, tr.fld_dropbox_redirect, &redirect, false);
+        let local = self.cfg.dropbox.local_folder.clone();
+        y = self.folder_row(y, cx, cw, ID_EDIT_DROPBOX_LOCAL, tr.fld_dropbox_local, &local);
+        y += 4.0;
+        let remote = self.cfg.dropbox.remote_folder.clone();
+        y = self.field_row(y, (cx, cw), ID_EDIT_DROPBOX_REMOTE, tr.fld_dropbox_remote, &remote, false);
+
+        // Estado de la sesion (se refresca por timer mientras el dialogo esta abierto).
+        y += 4.0;
+        let status_text = self.dropbox_status.clone();
+        let status_color = if status_text.contains(tr.msg_dropbox_ready) {
+            col(C_ACCENT)
+        } else {
+            col(C_TEXT)
+        };
+        self.text(
+            &status_text,
+            Fmt::Body,
+            D2D_RECT_F {
+                left: cx + 16.0,
+                top: y + 4.0,
+                right: cx + cw - 16.0,
+                bottom: y + 28.0,
+            },
+            status_color,
+        );
+        y += 34.0;
+
+        // Botones Conectar / Desconectar / Sincronizar.
+        let status = self.dropbox_app_status();
+        let connected = status == crate::dropbox::Status::Ready;
+        let configured = status != crate::dropbox::Status::Unconfigured;
+        self.icon_button(Rect { x: cx + 16.0, y, w: 230.0, h: 32.0 }, tr.btn_dropbox_connect, ID_BTN_DROPBOX_CONNECT, configured && !connected);
+        self.icon_button(Rect { x: cx + 256.0, y, w: 150.0, h: 32.0 }, tr.btn_dropbox_disconnect, ID_BTN_DROPBOX_DISCONNECT, connected);
+        self.icon_button(Rect { x: cx + 416.0, y, w: 170.0, h: 32.0 }, tr.btn_dropbox_sync, ID_BTN_DROPBOX_SYNC, connected);
+
+        y += 48.0;
+        self.text(
+            tr.msg_dropbox_note,
+            Fmt::Small,
+            D2D_RECT_F {
+                left: cx + 16.0,
+                top: y,
+                right: cx + cw - 16.0,
+                bottom: y + 40.0,
+            },
+            col(C_DIM),
+        );
+    }
+
+    /// Estado actual de Dropbox (de la app viva; Unconfigured si no hay app).
+    fn dropbox_app_status(&self) -> crate::dropbox::Status {
+        if self.app.is_null() {
+            return crate::dropbox::Status::Unconfigured;
+        }
+        unsafe { (*self.app).dropbox_status_info().0 }
+    }
+
+    /// Refresca el texto de estado de la pestana Dropbox desde la app.
+    fn dropbox_refresh_status(&mut self) {
+        let (status, detail) = if self.app.is_null() {
+            (crate::dropbox::Status::Unconfigured, String::new())
+        } else {
+            unsafe { (*self.app).dropbox_status_info() }
+        };
+        let s = match status {
+            crate::dropbox::Status::Unconfigured => self.tr.msg_dropbox_unconfigured.to_string(),
+            crate::dropbox::Status::LoggedOut => self.tr.msg_dropbox_loggedout.to_string(),
+            crate::dropbox::Status::Ready => {
+                if detail.is_empty() {
+                    self.tr.msg_dropbox_ready.to_string()
+                } else {
+                    format!("{} — {detail}", self.tr.msg_dropbox_ready)
+                }
+            }
+        };
+        self.dropbox_status = s;
+    }
+
     /// Estado actual de Spotify (de la app viva; Unconfigured si no hay app).
     fn spotify_app_status(&self) -> crate::spotify::Status {
         if self.app.is_null() {
@@ -2244,7 +2349,7 @@ impl Settings {
         let h = self.size.1 - HEADER_H - BAR_H;
         self.fill_rr(0.0, y0, SIDEBAR_W, h, 0.0, col(C_SIDEBAR));
         self.draw_rr(Rect { x: SIDEBAR_W - 1.0, y: y0, w: 1.0, h }, 0.0, rgba(C_CARD_BORDER, 0.6), 1.0);
-        let items: [(Panel, &'static str); 8] = [
+        let items: [(Panel, &'static str); 9] = [
             (Panel::General, self.tr.nav_general),
             (Panel::Rules, self.tr.nav_rules),
             (Panel::Appearance, self.tr.nav_appearance),
@@ -2253,6 +2358,7 @@ impl Settings {
             (Panel::Updates, "🔄 Updates"),
             (Panel::Widgets, "🧩 Widgets"),
             (Panel::Spotify, self.tr.nav_spotify),
+            (Panel::Dropbox, self.tr.nav_dropbox),
         ];
         let mut y = y0 + 16.0;
         for (panel, label) in items {
@@ -2587,6 +2693,7 @@ impl Settings {
             Panel::Updates => self.panel_updates(scy),
             Panel::Widgets => self.panel_widgets(scy),
             Panel::Spotify => self.panel_spotify(scy),
+            Panel::Dropbox => self.panel_dropbox(scy),
         }
         // Limite de desplazamiento = el punto mas bajo del contenido dibujado.
         let max_bottom = self.regions[panel_start..]
@@ -2748,6 +2855,7 @@ impl Settings {
             Ctrl::Nav(Panel::Updates),
             Ctrl::Nav(Panel::Widgets),
             Ctrl::Nav(Panel::Spotify),
+            Ctrl::Nav(Panel::Dropbox),
         ];
         match self.panel {
             Panel::General => {
@@ -2860,6 +2968,19 @@ impl Settings {
                     Ctrl::Field(ID_EDIT_SPOTIFY_REDIRECT),
                     Ctrl::Btn(ID_BTN_SPOTIFY_CONNECT),
                     Ctrl::Btn(ID_BTN_SPOTIFY_DISCONNECT),
+                ]);
+            }
+            Panel::Dropbox => {
+                order.extend([
+                    Ctrl::Check(ID_CHECK_DROPBOX_ENABLED),
+                    Ctrl::Field(ID_EDIT_DROPBOX_APP_KEY),
+                    Ctrl::Field(ID_EDIT_DROPBOX_APP_SECRET),
+                    Ctrl::Field(ID_EDIT_DROPBOX_REDIRECT),
+                    Ctrl::Field(ID_EDIT_DROPBOX_LOCAL),
+                    Ctrl::Field(ID_EDIT_DROPBOX_REMOTE),
+                    Ctrl::Btn(ID_BTN_DROPBOX_CONNECT),
+                    Ctrl::Btn(ID_BTN_DROPBOX_DISCONNECT),
+                    Ctrl::Btn(ID_BTN_DROPBOX_SYNC),
                 ]);
             }
         }
@@ -2989,6 +3110,40 @@ impl Settings {
                     unsafe { (*self.app).spotify_sign_out(); }
                 }
                 self.spotify_refresh_status();
+                self.invalidate();
+            }
+            Ctrl::Btn(ID_BTN_DROPBOX_CONNECT) => {
+                // Sincroniza el App Key / Redirect URI editados con la app
+                // antes de abrir el navegador de autorizacion.
+                if !self.app.is_null() {
+                    let key = self
+                        .edit_text(ID_EDIT_DROPBOX_APP_KEY)
+                        .unwrap_or_else(|| self.cfg.dropbox.app_key.clone());
+                    let secret = self
+                        .edit_text(ID_EDIT_DROPBOX_APP_SECRET)
+                        .unwrap_or_else(|| self.cfg.dropbox.app_secret.clone());
+                    let redirect = self
+                        .edit_text(ID_EDIT_DROPBOX_REDIRECT)
+                        .unwrap_or_else(|| self.cfg.dropbox.redirect_uri.clone());
+                    unsafe {
+                        (*self.app).dropbox_configure(&key, &secret, &redirect);
+                        (*self.app).dropbox_connect();
+                    }
+                }
+                self.dropbox_refresh_status();
+                self.preview_apply();
+            }
+            Ctrl::Btn(ID_BTN_DROPBOX_DISCONNECT) => {
+                if !self.app.is_null() {
+                    unsafe { (*self.app).dropbox_sign_out(); }
+                }
+                self.dropbox_refresh_status();
+                self.invalidate();
+            }
+            Ctrl::Btn(ID_BTN_DROPBOX_SYNC) => {
+                if !self.app.is_null() {
+                    unsafe { (*self.app).dropbox_sync_now(); }
+                }
                 self.invalidate();
             }
             Ctrl::Folder(id) => {
@@ -4092,6 +4247,29 @@ impl Settings {
             cfg.spotify.redirect_uri = sp_redirect;
         }
 
+        // Widget de Dropbox: activacion, App Key, Redirect URI y carpetas.
+        cfg.dropbox.enabled = self.checked(ID_CHECK_DROPBOX_ENABLED);
+        let db_key = text(ID_EDIT_DROPBOX_APP_KEY).trim().to_string();
+        if !db_key.is_empty() {
+            cfg.dropbox.app_key = db_key;
+        }
+        let db_secret = text(ID_EDIT_DROPBOX_APP_SECRET).trim().to_string();
+        if !db_secret.is_empty() {
+            cfg.dropbox.app_secret = db_secret;
+        }
+        let db_redirect = text(ID_EDIT_DROPBOX_REDIRECT).trim().to_string();
+        if !db_redirect.is_empty() {
+            cfg.dropbox.redirect_uri = db_redirect;
+        }
+        let db_local = text(ID_EDIT_DROPBOX_LOCAL).trim().to_string();
+        if !db_local.is_empty() {
+            cfg.dropbox.local_folder = db_local;
+        }
+        let db_remote = text(ID_EDIT_DROPBOX_REMOTE).trim().to_string();
+        if !db_remote.is_empty() {
+            cfg.dropbox.remote_folder = db_remote;
+        }
+
         // Idioma elegido en el selector.
         cfg.language = self.lang.code().into();
 
@@ -4171,6 +4349,8 @@ impl Settings {
     fn pick_folder(&mut self, id: u16) {
         let title = if id == ID_EDIT_G_ROOT {
             self.tr.fld_root_folder
+        } else if id == ID_EDIT_DROPBOX_LOCAL {
+            self.tr.fld_dropbox_local
         } else {
             self.tr.fld_archive_folder
         };
@@ -4569,6 +4749,11 @@ extern "system" fn dlg_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                     let before = state.spotify_status.clone();
                     state.spotify_refresh_status();
                     if state.spotify_status != before {
+                        state.invalidate();
+                    }
+                    let db_before = state.dropbox_status.clone();
+                    state.dropbox_refresh_status();
+                    if state.dropbox_status != db_before {
                         state.invalidate();
                     }
                 }
@@ -5063,6 +5248,7 @@ pub fn open_dialog(current: &Config, app: *mut App) -> Option<Config> {
             spinner_phase: 0.0,
             busy_timer: false,
             spotify_status: String::new(),
+            dropbox_status: String::new(),
         };
 
         // Limpieza de flags stale: si una operacion quedo en curso al cerrar el
@@ -5256,6 +5442,7 @@ pub fn open_dialog(current: &Config, app: *mut App) -> Option<Config> {
         settings.refresh_widget_fields();
         seed_edits(&settings);
         settings.spotify_refresh_status();
+        settings.dropbox_refresh_status();
         let _ = SetTimer(hwnd, SPOTIFY_STATUS_TIMER_ID, 1000, None);
 
         let _ = ShowWindow(hwnd, SW_SHOW);
@@ -5356,6 +5543,11 @@ fn seed_edits(s: &Settings) {
         (ID_EDIT_SPOTIFY_CLIENT_ID, s.cfg.spotify.client_id.clone()),
         (ID_EDIT_SPOTIFY_CLIENT_SECRET, s.cfg.spotify.client_secret.clone()),
         (ID_EDIT_SPOTIFY_REDIRECT, s.cfg.spotify.redirect_uri.clone()),
+        (ID_EDIT_DROPBOX_APP_KEY, s.cfg.dropbox.app_key.clone()),
+        (ID_EDIT_DROPBOX_APP_SECRET, s.cfg.dropbox.app_secret.clone()),
+        (ID_EDIT_DROPBOX_REDIRECT, s.cfg.dropbox.redirect_uri.clone()),
+        (ID_EDIT_DROPBOX_LOCAL, s.cfg.dropbox.local_folder.clone()),
+        (ID_EDIT_DROPBOX_REMOTE, s.cfg.dropbox.remote_folder.clone()),
     ];
     for (id, value) in rows {
         if let Some(edit) = s.edits.get(&id).copied() {

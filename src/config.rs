@@ -122,6 +122,8 @@ pub struct Config {
     pub widgets_disabled: Vec<String>,
     /// Configuracion del widget de Spotify (OAuth PKCE).
     pub spotify: SpotifyConfig,
+    /// Configuracion del widget de Dropbox (OAuth PKCE + sync de carpeta).
+    pub dropbox: DropboxConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +176,43 @@ impl Default for SpotifyConfig {
             client_id: String::new(),
             client_secret: String::new(),
             redirect_uri: SPOTIFY_REDIRECT_URI.into(),
+        }
+    }
+}
+
+/// Redirect URI por defecto del widget de Dropbox (debe coincidir EXACTAMENTE
+/// con la registrada en dropbox.com/developers; editable desde Configuracion).
+pub const DROPBOX_REDIRECT_URI: &str = "http://127.0.0.1:8897/callback";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DropboxConfig {
+    /// true => la caja widget de Dropbox se crea en el escritorio.
+    pub enabled: bool,
+    /// App Key de la aplicacion registrada en dropbox.com/developers.
+    /// Se configura desde Configuracion -> Dropbox (nada hardcodeado).
+    pub app_key: String,
+    /// App Secret de la aplicacion registrada en dropbox.com/developers.
+    /// Con OAuth PKCE no es imprescindible, pero se guarda por completitud.
+    pub app_secret: String,
+    /// Redirect URI exacta registrada en la App Console (debe coincidir al
+    /// caracter; el puerto se usa para el listener local de autorizacion).
+    pub redirect_uri: String,
+    /// Carpeta local que se sincroniza con la carpeta remota de Dropbox.
+    pub local_folder: String,
+    /// Carpeta remota de Dropbox (ruta con prefijo /, "/" = raiz).
+    pub remote_folder: String,
+}
+
+impl Default for DropboxConfig {
+    fn default() -> Self {
+        DropboxConfig {
+            enabled: false,
+            app_key: String::new(),
+            app_secret: String::new(),
+            redirect_uri: DROPBOX_REDIRECT_URI.into(),
+            local_folder: String::new(),
+            remote_folder: "/ZenDesktop".into(),
         }
     }
 }
@@ -596,6 +635,7 @@ impl Default for Config {
             language: "en".into(),
             widgets_disabled: Vec::new(),
             spotify: SpotifyConfig::default(),
+            dropbox: DropboxConfig::default(),
         }
     }
 }
@@ -820,6 +860,18 @@ impl Config {
         self.spotify.client_secret = self.spotify.client_secret.trim().to_string();
         if self.spotify.redirect_uri.trim().is_empty() {
             self.spotify.redirect_uri = SPOTIFY_REDIRECT_URI.into();
+        }
+        self.dropbox.app_key = self.dropbox.app_key.trim().to_string();
+        self.dropbox.app_secret = self.dropbox.app_secret.trim().to_string();
+        if self.dropbox.redirect_uri.trim().is_empty() {
+            self.dropbox.redirect_uri = DROPBOX_REDIRECT_URI.into();
+        }
+        self.dropbox.remote_folder = self.dropbox.remote_folder.trim().to_string();
+        if self.dropbox.remote_folder.is_empty() {
+            self.dropbox.remote_folder = "/ZenDesktop".into();
+        }
+        if !self.dropbox.remote_folder.starts_with('/') {
+            self.dropbox.remote_folder = format!("/{}", self.dropbox.remote_folder);
         }
 
         let a = &mut self.appearance;

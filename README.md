@@ -46,6 +46,7 @@
 - **🤖 Local AI (Ollama)** — Semantic classification, automatic fence creation, and rule generation from a text description via local LLM
 - **🧩 Lua widgets** — Programmable boxes that run user scripts (clocks, weather, launchers…) with a sandboxed API: drawing primitives, images, HTTP, interactivity and persistent state
 - **🎧 Spotify widget** — first-class now-playing box (cover art, progress + times, volume slider, playback controls, device name, queue) managed from its own Settings tab: enable/disable, Client ID/Secret, connect & disconnect
+- **📁 Dropbox widget** — browse, open and sync your Dropbox from a desktop box: folder navigation, download & open, local ↔ remote sync, and bidirectional drag & drop (drag files out, drop files in to upload) — managed from its own Settings tab
 - **↩️ Undo moves** — Moving files into fences is undoable (Ctrl+Z or the toast action)
 - **📐 Per-fence list/grid view** — Each rule picks its own view mode (auto/list/grid) from Settings → Rules
 
@@ -265,6 +266,34 @@ Managed from **Settings → 🎧 Spotify**:
 OAuth uses **PKCE** (no secret needed at runtime); the secret is kept for
 completeness. The widget polls every 3 seconds while visible without blocking
 the UI, and only re-downloads the cover when it changes.
+
+## 📁 Dropbox widget
+
+A built-in (non-Lua) widget that turns a desktop box into a small Dropbox
+browser: list files and folders, click to select, double-click a folder to
+enter it (the breadcrumb shows where you are), ⬆ to go up, and double-click a
+file to download and open it with its default app.
+
+Managed from **Settings → 📁 Dropbox**:
+
+- **Enable the widget on the desktop** — creates the box instantly when
+  checked; removing the check hides it.
+- **App Key / App Secret / Redirect URI** — editable fields persisted in
+  `config.toml`. The Redirect URI must match **exactly** the one registered
+  on `dropbox.com/developers` (default `http://127.0.0.1:8897/callback`).
+- **Connect with Dropbox** — syncs the fields, opens your browser, and after
+  authorizing the session persists (`dropbox.json`) and refreshes
+  automatically. Authorization uses `force_reapprove` so the token always
+  carries the scopes enabled in your App Console (Files read/write +
+  account email) — re-authorize after changing permissions there.
+- **Sync** — one-way local ↔ remote sync of the configured folders.
+- **Disconnect** — forgets the session.
+
+**Drag & drop works in both directions**: drag files out of the box (they're
+downloaded to a temp file first, then a native OLE drag lets you drop them in
+Explorer or another fence) and drop files into the box from Explorer or
+another fence — they're uploaded to the remote folder you're currently
+browsing.
 
 ## 🏗️ Architecture
 

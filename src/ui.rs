@@ -115,6 +115,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::config::{parse_color, wide, Config, FenceLayout, String32};
+use crate::dropbox;
 use crate::i18n::Tr;
 use crate::rules::{self, FenceContent};
 use crate::settings;
@@ -185,6 +186,37 @@ static SPOTIFY_POLLING: AtomicBool = AtomicBool::new(false);
 static SPOTIFY_LAST_COVER: Mutex<Option<String>> = Mutex::new(None);
 /// Cola de reproduccion: (context_uri, siguientes pistas).
 static SPOTIFY_QUEUE: Mutex<Option<(String, Vec<spotify::QueueItem>)>> = Mutex::new(None);
+
+/// El navegador devolvio el codigo de autorizacion de Dropbox (hilo redirect -> UI).
+const WM_ZEN_DROPBOX_AUTH: u32 = WM_APP + 0x1C;
+/// Un listado de carpeta remota llego del hilo de trabajo (para refrescar la
+/// vista de archivos de la caja Dropbox).
+const WM_ZEN_DROPBOX_FILES: u32 = WM_APP + 0x1D;
+/// Termino una pasada de sincronizacion local <-> remoto (reporte -> UI).
+const WM_ZEN_DROPBOX_SYNC: u32 = WM_APP + 0x1E;
+/// Un archivo remoto se descargo para abrirse (ruta local -> UI).
+const WM_ZEN_DROPBOX_OPEN: u32 = WM_APP + 0x1F;
+/// Termino una subida de archivos sueltos dentro de la caja Dropbox.
+const WM_ZEN_DROPBOX_UPLOADED: u32 = WM_APP + 0x21;
+/// Hay ficheros encolados en DROPBOX_PENDING_UPLOAD listos para subir
+/// (el callback OLE solo encola; la subida se procesa fuera de su contexto).
+const WM_ZEN_DROPBOX_UPLOAD_PENDING: u32 = WM_APP + 0x22;
+
+/// Codigo de autorizacion capturado por el listener de redireccion local.
+static DROPBOX_AUTH_CODE: Mutex<Option<String>> = Mutex::new(None);
+/// Ultimo listado de la carpeta remota (hilo -> UI).
+static DROPBOX_FILES: Mutex<Option<Vec<dropbox::DropboxEntry>>> = Mutex::new(None);
+/// Ultimo reporte de sincronizacion (hilo -> UI).
+static DROPBOX_SYNC: Mutex<Option<dropbox::SyncReport>> = Mutex::new(None);
+/// Evita lanzar varias syncs a la vez.
+static DROPBOX_SYNCING: AtomicBool = AtomicBool::new(false);
+/// Archivo descargado para abrir: (ruta local, ok).
+static DROPBOX_OPEN: Mutex<Option<(PathBuf, bool)>> = Mutex::new(None);
+/// Ultima subida por drop: (subidos, total).
+static DROPBOX_UPLOADED: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+/// Paths soltados sobre la caja Dropbox durante un drag OLE interno (se
+/// procesan en WM_ZEN_DRAG_DONE, cuando el bucle de DoDragDrop ha terminado).
+static DROPBOX_PENDING_UPLOAD: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 /// Identificador del atajo global Ctrl+Alt+Z ("ZE" en ASCII).
 const HOTKEY_ID: i32 = 0x5A45;
 /// Identificador unico del icono de bandeja ("ZD" en ASCII).
@@ -1100,7 +1132,14 @@ fn download_cover(url: &str) -> Option<CoverData> {
 /// crudo del HWND (los handles no son `Send`).
 fn fetch_spotify_and_post(sp: spotify::Spotify, controller: isize) {
     let np = sp.now_playing().ok().flatten();
-    let snapshot = np.map(|n| {
+    // El endpoint `currently-playing` no incluye el device: el volumen y el
+    // nombre del dispositivo se consultan aparte (siempre que haya sesion).
+    let device = sp.active_device();
+    let snapshot = np.map(|mut n| {
+        if let Some((vol, name)) = device {
+            n.volume_percent = vol;
+            n.device_name = name;
+        }
         // Solo se descarga/decodifica la portada cuando cambia de URL.
         let cover = {
             let mut last = SPOTIFY_LAST_COVER.lock().unwrap();
@@ -1171,6 +1210,58 @@ fn parse_code_from_request(req: &str) -> Option<String> {
     None
 }
 
+/// Consulta el listado de la carpeta remota en un hilo y publica el resultado.
+fn fetch_dropbox_files(db: dropbox::Dropbox, remote: String, controller: isize) {
+    thread::spawn(move || {
+        let entries = db.list_folder(&remote).ok();
+        *DROPBOX_FILES.lock().unwrap() = entries;
+        let _ = unsafe { PostMessageW(HWND(controller as *mut c_void), WM_ZEN_DROPBOX_FILES, WPARAM(0), LPARAM(0)) };
+    });
+}
+
+/// Ejecuta una pasada de sincronizacion local <-> remoto en un hilo.
+fn run_dropbox_sync(db: dropbox::Dropbox, local: PathBuf, remote: String, controller: isize) {
+    if DROPBOX_SYNCING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    thread::spawn(move || {
+        let report = db.sync_folder(&local, &remote);
+        *DROPBOX_SYNC.lock().unwrap() = Some(report);
+        DROPBOX_SYNCING.store(false, Ordering::SeqCst);
+        let _ = unsafe { PostMessageW(HWND(controller as *mut c_void), WM_ZEN_DROPBOX_SYNC, WPARAM(0), LPARAM(0)) };
+    });
+}
+
+/// Escucha UNA conexion en 127.0.0.1:<puerto de la redirect URI> (la
+/// redireccion del navegador), extrae el codigo y lo entrega a la UI.
+fn start_dropbox_redirect(port: u16, controller: isize) {
+    thread::spawn(move || {
+        let listener = match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let Ok((mut stream, _)) = listener.accept() else { return };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut buf = [0u8; 4096];
+        let Ok(n) = stream.read(&mut buf) else { return };
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let code = parse_code_from_request(&req);
+        let (status, html) = match &code {
+            Some(_) => ("200 OK", "ZenDesktop: ya puedes cerrar esta pestaña."),
+            None => ("400 Bad Request", "No se pudo completar la autorización."),
+        };
+        let body = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+            html.len()
+        );
+        let _ = stream.write_all(body.as_bytes());
+        if let Some(code) = code {
+            *DROPBOX_AUTH_CODE.lock().unwrap() = Some(code);
+            let _ = unsafe { PostMessageW(HWND(controller as *mut c_void), WM_ZEN_DROPBOX_AUTH, WPARAM(0), LPARAM(0)) };
+        }
+    });
+}
+
 /// Escucha UNA conexion en 127.0.0.1:<puerto de la redirect URI> (la
 /// redireccion del navegador), extrae el codigo y lo entrega a la UI.
 fn start_spotify_redirect(port: u16, controller: isize) {
@@ -1208,6 +1299,9 @@ enum DragMode {
     Resize,
     Select { start_x: f32, start_y: f32, curr_x: f32, curr_y: f32 },
     ItemDrag { item_idx: usize, start_x: i32, start_y: i32 },
+    /// Arrastre de un archivo remoto de Dropbox: hay que descargarlo a
+    /// una ruta local (temp) antes de lanzar el DoDragDrop OLE.
+    DropboxDrag { start_x: i32, start_y: i32 },
 }
 
 struct FenceTab {
@@ -1465,12 +1559,32 @@ pub struct App {
     deferred_config: Option<Config>,
     /// Archivos devueltos al escritorio: saltar el proximo organize.
     skip_next_organize: bool,
+    /// Rutas que transporta el drag interno en curso (las del origen). Se usa
+    /// en el drop sobre la caja Dropbox para subirlas sin re-leer el
+    /// IDataObject a mitad del bucle OLE (reentrada COM -> corrupcion).
+    last_drag_paths: Vec<PathBuf>,
     /// Historial de operaciones de archivo reversibles (Ctrl+Z).
     undo_stack: Vec<UndoOp>,
     /// Widgets programables en Lua (cajas a medida).
     widget_host: widgets::WidgetHost,
     /// Backend del widget de Spotify (PKCE + Web API).
     spotify: spotify::Spotify,
+    /// Backend del widget de Dropbox (PKCE + sync de carpeta).
+    dropbox: dropbox::Dropbox,
+    /// Ultimo listado de la carpeta remota (para pintar la caja Dropbox).
+    dropbox_files: Vec<dropbox::DropboxEntry>,
+    /// Email de la cuenta conectada (para el estado de la pestana y la caja).
+    dropbox_email: Option<String>,
+    /// Texto de estado de la ultima sincronizacion ("Sincronizado", errores...).
+    dropbox_sync_note: String,
+    /// Marca de tiempo (ms) del ultimo listado remoto (throttling).
+    dropbox_last_poll: u64,
+    /// Desplazamiento (en filas) de la lista de archivos de la caja Dropbox.
+    dropbox_scroll: i32,
+    /// Ruta remota mostrada en la caja (empieza en remote_folder y se navega).
+    dropbox_path: String,
+    /// Indice (dentro de dropbox_files) del item seleccionado con un clic.
+    dropbox_selected: Option<usize>,
     /// Ultima reproduccion conocida (para pintar el widget nativo).
     spotify_np: Option<spotify::NowPlaying>,
     /// Portada decodificada de la ultima reproduccion conocida.
@@ -1635,6 +1749,13 @@ impl App {
             let mut spotify = spotify::Spotify::new(cfg.spotify.client_id.clone(), spotify_store);
             spotify.set_client_secret(cfg.spotify.client_secret.clone());
             spotify.set_redirect_uri(cfg.spotify.redirect_uri.clone());
+            // Tokens de Dropbox viven junto a la config (no en config.toml).
+            let dropbox_store = cfg_path
+                .parent()
+                .map(|p| p.join("dropbox.json"))
+                .unwrap_or_else(|| PathBuf::from("dropbox.json"));
+            let mut dropbox = dropbox::Dropbox::new(cfg.dropbox.app_key.clone(), dropbox_store);
+            dropbox.set_redirect_uri(cfg.dropbox.redirect_uri.clone());
 
             let mut app = Box::new(App {
                 cfg,
@@ -1684,9 +1805,18 @@ impl App {
                 pending_toast: None,
                 deferred_config: None,
                 skip_next_organize: false,
+                last_drag_paths: Vec::new(),
                 undo_stack: Vec::new(),
                 widget_host,
                 spotify,
+                dropbox,
+                dropbox_files: Vec::new(),
+                dropbox_email: None,
+                dropbox_sync_note: String::new(),
+                dropbox_last_poll: 0,
+                dropbox_scroll: 0,
+                dropbox_path: String::new(),
+                dropbox_selected: None,
                 spotify_np: None,
                 spotify_cover: None,
                 spotify_last_poll: 0,
@@ -1736,6 +1866,8 @@ impl App {
             (*ptr).startup_pending = delay_secs > 0;
             // La caja del widget de Spotify se crea al arrancar si esta activado.
             (*ptr).ensure_spotify_fence();
+            // La caja del widget de Dropbox se crea al arrancar si esta activado.
+            (*ptr).ensure_dropbox_fence();
             (*ptr).build_fences()?;
             // Plantilla por defecto: se aplica al arrancar solo si la
             // disposicion de monitores coincide con la guardada (p.ej. dock ya
@@ -2114,6 +2246,13 @@ impl App {
             );
             let _ = ShowWindow(hwnd, SW_SHOWNA);
             self.fences.last_mut().unwrap().layout = layout;
+
+            // Las cajas widget tambien son destino de arrastre: permiten
+            // soltar ficheros dentro (p.ej. subir a Dropbox).
+            if let Some(target) = &self.drop_target {
+                let _ = RegisterDragDrop(hwnd, target);
+            }
+            DragAcceptFiles(hwnd, true);
         }
 
         // Mientras el retraso de inicio este pendiente, las cajas reconstruidas
@@ -2144,6 +2283,11 @@ impl App {
             if n > 0 {
                 paths.push(PathBuf::from(String::from_utf16_lossy(&buf[..n as usize])));
             }
+        }
+        // Widget Dropbox: soltar dentro sube los archivos a la carpeta remota.
+        if self.fences.get(index).and_then(|f| f.layout.widget.clone()).as_deref() == Some("dropbox") {
+            self.dropbox_upload_paths(paths);
+            return;
         }
         self.accept_drop(index, paths);
     }
@@ -2250,10 +2394,10 @@ impl App {
         }
         let hdrop = HDROP(ptr);
         let mut paths = Vec::new();
-        let count = DragQueryFileW(hdrop, 0xFFFFFFFF, None);
+        let count = DragQueryFileW(hdrop, 0xFFFFFFFF, None).min(10_000);
         for i in 0..count {
             let mut buf = vec![0u16; 4096];
-            let n = DragQueryFileW(hdrop, i, Some(&mut buf));
+            let n = DragQueryFileW(hdrop, i, Some(&mut buf)).min(4096);
             if n > 0 {
                 paths.push(PathBuf::from(String::from_utf16_lossy(&buf[..n as usize])));
             }
@@ -3412,9 +3556,12 @@ impl App {
     /// script Lua. Reutiliza la misma superficie DIB que una caja normal.
     fn render_widget_fence(&mut self, index: usize) -> WinResult<()> {
         let widget_name = self.fences[index].layout.widget.clone().unwrap_or_default();
-        // El widget de Spotify se pinta nativo (portada, controles, etc.).
+        // Los widgets nativos (Spotify / Dropbox) se pintan sin Lua.
         if widget_name == "spotify" {
             return self.render_spotify_fence(index);
+        }
+        if widget_name == "dropbox" {
+            return self.render_dropbox_fence(index);
         }
         let theme_ptr: *const Theme = &self.theme;
         let gfx_ptr: *const Graphics = &self.gfx;
@@ -3679,6 +3826,7 @@ impl App {
     /// y widgets dependientes del tiempo.
     fn widget_tick(&mut self) {
         self.spotify_tick();
+        self.dropbox_tick();
         let indices: Vec<usize> = self
             .fences
             .iter()
@@ -3871,6 +4019,487 @@ impl App {
             }
         }
         self.render_all();
+    }
+
+    // ---------------------------------------------------------------------
+    // Widget de Dropbox (nativo)
+    // ---------------------------------------------------------------------
+
+    /// true si la caja del widget Dropbox existe en el escritorio.
+    fn dropbox_present(&self) -> bool {
+        self.fences.iter().any(|f| f.layout.widget.as_deref() == Some("dropbox"))
+    }
+
+    /// Asegura la existencia de la caja del widget de Dropbox segun
+    /// `cfg.dropbox.enabled`: activado -> crea la entrada `[[fences]]
+    /// widget = "dropbox"` si falta; desactivado -> la elimina.
+    fn ensure_dropbox_fence(&mut self) {
+        let has_box = self
+            .cfg
+            .fences
+            .iter()
+            .any(|f| f.widget.as_deref() == Some("dropbox"));
+        if self.cfg.dropbox.enabled && !has_box {
+            let n = self.cfg.fences.iter().filter(|f| f.widget.is_some()).count() as i32;
+            self.cfg.fences.push(FenceLayout {
+                id: String32::new("widget:dropbox"),
+                x: 160 + n * 32,
+                y: 160 + n * 32,
+                width: 320,
+                height: 240,
+                widget: Some("dropbox".into()),
+                ..Default::default()
+            });
+        } else if !self.cfg.dropbox.enabled {
+            self.cfg.fences.retain(|f| f.widget.as_deref() != Some("dropbox"));
+        }
+    }
+
+    /// Aplica App Key / App Secret / Redirect URI editados en la configuracion
+    /// al cliente Dropbox vivo (lo llama el dialogo antes de conectar/guardar).
+    pub(crate) fn dropbox_configure(&mut self, key: &str, secret: &str, redirect: &str) {
+        self.dropbox.set_app_key(key.to_string());
+        self.dropbox.set_app_secret(secret.to_string());
+        self.dropbox.set_redirect_uri(redirect.to_string());
+    }
+
+    /// Estado + contexto para la pestana Dropbox de la configuracion.
+    pub(crate) fn dropbox_status_info(&self) -> (dropbox::Status, String) {
+        let status = self.dropbox.status();
+        let detail = match status {
+            dropbox::Status::Ready => self
+                .dropbox_email
+                .clone()
+                .unwrap_or_else(|| self.tr.msg_dropbox_ready.into()),
+            _ => String::new(),
+        };
+        (status, detail)
+    }
+
+    /// Inicia el flujo OAuth: abre el navegador y escucha la redireccion local
+    /// en el puerto de la redirect URI configurada.
+    pub(crate) fn dropbox_connect(&mut self) {
+        let Ok(url) = self.dropbox.authorize_url() else { return };
+        let wurl = wide(&url);
+        unsafe {
+            let _ = ShellExecuteW(None, w!("open"), PCWSTR(wurl.as_ptr()), None, None, SW_SHOWNORMAL);
+        }
+        let port = dropbox::redirect_port(self.dropbox.redirect_uri());
+        start_dropbox_redirect(port, self.controller.0 as isize);
+    }
+
+    /// Cierra la sesion de Dropbox: olvida el token y limpia el estado del widget.
+    pub(crate) fn dropbox_sign_out(&mut self) {
+        self.dropbox.sign_out();
+        self.dropbox_files.clear();
+        self.dropbox_email = None;
+        self.dropbox_sync_note.clear();
+        self.dropbox_path.clear();
+        self.dropbox_selected = None;
+        self.render_all();
+    }
+
+    /// Ruta remota a listar: la navegada si existe, si no la configurada.
+    fn dropbox_list_path(&self) -> String {
+        if self.dropbox_path.trim().is_empty() {
+            self.cfg.dropbox.remote_folder.clone()
+        } else {
+            self.dropbox_path.clone()
+        }
+    }
+
+    /// Navega a una carpeta remota (entrar en subcarpeta o volver arriba) y
+    /// re-lista su contenido.
+    fn dropbox_navigate(&mut self, path: String) {
+        self.dropbox_path = path;
+        self.dropbox_scroll = 0;
+        self.dropbox_selected = None;
+        let db = self.dropbox.clone();
+        let remote = self.dropbox_list_path();
+        fetch_dropbox_files(db, remote, self.controller.0 as isize);
+    }
+
+    /// Sube un nivel en la navegacion (del padre de la ruta actual hacia /).
+    fn dropbox_navigate_up(&mut self) {
+        let current = self.dropbox_list_path();
+        let parent = if current == "/" {
+            "/".to_string()
+        } else {
+            let trimmed = current.trim_end_matches('/');
+            match trimmed.rfind('/') {
+                Some(0) => "/".to_string(),
+                Some(i) => trimmed[..i].to_string(),
+                None => "/".to_string(),
+            }
+        };
+        self.dropbox_navigate(parent);
+    }
+
+    /// Abre una entrada de la lista: las carpetas navegan dentro; los
+    /// archivos se descargan a la carpeta local (o temporal) y se abren.
+    fn dropbox_open_entry(&mut self, entry: dropbox::DropboxEntry) {
+        if entry.is_dir {
+            self.dropbox_navigate(entry.path.clone());
+            return;
+        }
+        if self.dropbox.status() != dropbox::Status::Ready {
+            return;
+        }
+        let db = self.dropbox.clone();
+        let local_root = self.cfg.dropbox.local_folder.clone();
+        let controller = self.controller.0 as isize;
+        let remote = entry.path.clone();
+        thread::spawn(move || {
+            let rel = remote.trim_start_matches('/');
+            let dest = if local_root.trim().is_empty() {
+                std::env::temp_dir().join("zendesktop_dropbox").join(rel)
+            } else {
+                PathBuf::from(local_root).join(rel)
+            };
+            let ok = db.download(&remote, &dest).is_ok();
+            *DROPBOX_OPEN.lock().unwrap() = Some((dest, ok));
+            let _ = unsafe { PostMessageW(HWND(controller as *mut c_void), WM_ZEN_DROPBOX_OPEN, WPARAM(0), LPARAM(0)) };
+        });
+    }
+
+    /// Abre (o avisa del fallo de) el archivo descargado en el hilo de trabajo.
+    fn dropbox_apply_open(&mut self) {
+        if let Some((path, ok)) = DROPBOX_OPEN.lock().unwrap().take() {
+            if ok {
+                self.open_item(&path);
+            } else {
+                self.dropbox_sync_note = "⚠ descarga fallida".into();
+            }
+        }
+        self.render_all();
+    }
+
+    /// Descarga el archivo remoto a una ruta temporal y devuelve esa ruta
+    /// (None si falla). Se llama desde el fence_proc al iniciar el arrastre:
+    /// el DoDragDrop OLE necesita una ruta local real en disco.
+    fn dropbox_download_for_drag(&self, entry: &dropbox::DropboxEntry) -> Option<PathBuf> {
+        if self.dropbox.status() != dropbox::Status::Ready {
+            return None;
+        }
+        let rel = entry.path.trim_start_matches('/');
+        let dest = std::env::temp_dir().join("zendesktop_dropbox_drag").join(rel);
+        self.dropbox.download(&entry.path, &dest).ok()?;
+        Some(dest)
+    }
+
+    /// Sube archivos soltados dentro de la caja Dropbox a la carpeta remota
+    /// actual (donde se esta navegando). Lanza un hilo y refresca al acabar.
+    fn dropbox_upload_paths(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() || self.dropbox.status() != dropbox::Status::Ready {
+            return;
+        }
+        self.dropbox_sync_note = "↑ …".into();
+        self.render_all();
+        let db = self.dropbox.clone();
+        let remote = self.dropbox_list_path();
+        let controller = self.controller.0 as isize;
+        thread::spawn(move || {
+            let (ok, total) = db.upload_files(&paths, &remote);
+            *DROPBOX_UPLOADED.lock().unwrap() = Some((ok, total));
+            let _ = unsafe { PostMessageW(HWND(controller as *mut c_void), WM_ZEN_DROPBOX_UPLOADED, WPARAM(0), LPARAM(0)) };
+        });
+    }
+
+    /// Copia el resultado de la subida a la app, refresca la lista y avisa.
+    fn dropbox_apply_uploaded(&mut self) {
+        if let Some((ok, total)) = DROPBOX_UPLOADED.lock().unwrap().take() {
+            self.dropbox_sync_note = if ok == total {
+                format!("↑ {ok} subido(s)")
+            } else {
+                format!("↑ {ok}/{total} subido(s)")
+            };
+            if ok > 0 {
+                // Re-listar la carpeta actual para que aparezcan los archivos.
+                let db = self.dropbox.clone();
+                let remote = self.dropbox_list_path();
+                fetch_dropbox_files(db, remote, self.controller.0 as isize);
+            }
+        }
+        self.render_all();
+    }
+
+    /// Reconsulta el listado de la carpeta remota (con throttle de 5s).
+    fn dropbox_tick(&mut self) {
+        if !self.dropbox_present() {
+            return;
+        }
+        if self.dropbox.status() != dropbox::Status::Ready {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if now.saturating_sub(self.dropbox_last_poll) < 5000 {
+            return;
+        }
+        self.dropbox_last_poll = now;
+        let db = self.dropbox.clone();
+        let remote = self.dropbox_list_path();
+        fetch_dropbox_files(db, remote, self.controller.0 as isize);
+    }
+
+    /// Lanza una pasada de sincronizacion local <-> remoto en un hilo.
+    pub(crate) fn dropbox_sync_now(&mut self) {
+        if self.dropbox.status() != dropbox::Status::Ready {
+            return;
+        }
+        self.dropbox_sync_note = "…".into();
+        self.render_all();
+        let db = self.dropbox.clone();
+        let local = PathBuf::from(self.cfg.dropbox.local_folder.clone());
+        let remote = self.cfg.dropbox.remote_folder.clone();
+        run_dropbox_sync(db, local, remote, self.controller.0 as isize);
+    }
+
+    /// Copia el listado remoto del hilo de trabajo a la app y repinta.
+    fn dropbox_apply_files(&mut self) {
+        if let Some(files) = DROPBOX_FILES.lock().unwrap().take() {
+            self.dropbox_files = files;
+        }
+        if self.dropbox_selected.is_some_and(|s| s >= self.dropbox_files.len()) {
+            self.dropbox_selected = None;
+        }
+        if self.dropbox_email.is_none() && self.dropbox.status() == dropbox::Status::Ready {
+            let db = self.dropbox.clone();
+            self.dropbox_email = db.account_email();
+        }
+        self.render_all();
+    }
+
+    /// Copia el reporte de sincronizacion del hilo de trabajo a la app.
+    fn dropbox_apply_sync(&mut self) {
+        let tr = self.tr;
+        let mut note = String::new();
+        if let Some(r) = DROPBOX_SYNC.lock().unwrap().take() {
+            if !r.downloaded.is_empty() || !r.uploaded.is_empty() {
+                let dl = r.downloaded.len();
+                let ul = r.uploaded.len();
+                note = format!("↓ {dl} · ↑ {ul}");
+            } else if !r.errors.is_empty() {
+                note = format!("⚠ {}", r.errors.first().unwrap_or(&String::new()));
+            } else {
+                note = tr.msg_dropbox_synced.into();
+            }
+        }
+        self.dropbox_sync_note = note;
+        self.render_all();
+    }
+
+    /// Renderiza la caja widget de Dropbox: marco + cabecera + lista de
+    /// archivos de la carpeta remota + boton de sincronizacion.
+    fn render_dropbox_fence(&mut self, index: usize) -> WinResult<()> {
+        let theme_ptr: *const Theme = &self.theme;
+        let gfx_ptr: *const Graphics = &self.gfx;
+        let theme = unsafe { &*theme_ptr };
+        let gfx = unsafe { &*gfx_ptr };
+
+        let status = self.dropbox.status();
+        let files = self.dropbox_files.clone();
+        let scroll = self.dropbox_scroll.max(0) as usize;
+        let sync_note = self.dropbox_sync_note.clone();
+        let selected = self.dropbox_selected;
+        let status_line = match status {
+            dropbox::Status::Unconfigured => self.tr.msg_dropbox_unconfigured.to_string(),
+            dropbox::Status::LoggedOut => self.tr.msg_dropbox_loggedout.to_string(),
+            dropbox::Status::Ready => {
+                // Breadcrumb de la ruta navegada (mas util que el email aqui).
+                let path = self.dropbox_list_path();
+                if path == "/" {
+                    "📁 Dropbox".to_string()
+                } else {
+                    path
+                }
+            }
+        };
+
+        let fence = &mut self.fences[index];
+        let width = fence.layout.width.max(80);
+        let visual_height = fence.visible_height(theme).max(28);
+        let scale = fence.scale;
+        let header_dip = fence.header_h(theme);
+        let accent = fence.accent;
+
+        unsafe {
+            let recreate = match &fence.surface {
+                Some(s) => s.width != width || s.height != visual_height,
+                None => true,
+            };
+            if recreate {
+                fence.surface = Some(Surface::new(gfx, width, visual_height)?);
+            }
+            let surface = match fence.surface.as_ref() {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+            let bounds = RECT { left: 0, top: 0, right: width, bottom: visual_height };
+            surface.target.BindDC(surface.dc, &bounds)?;
+            surface.target.BeginDraw();
+            surface.target.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+
+            let w = width as f32 / scale;
+            let h = visual_height as f32 / scale;
+            let radius = theme.radius;
+            let brush = &surface.brush;
+
+            // Sombra, fondo y borde.
+            brush.SetColor(&theme.shadow);
+            surface.target.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT { rect: rect(1.5 * scale, 2.5 * scale, (w - 1.5) * scale, (h - 0.5) * scale), radiusX: radius * scale, radiusY: radius * scale },
+                brush,
+            );
+            brush.SetColor(&theme.background);
+            let body = D2D1_ROUNDED_RECT { rect: rect(0.0, 0.0, (w - 1.0) * scale, (h - 1.5) * scale), radiusX: radius * scale, radiusY: radius * scale };
+            surface.target.FillRoundedRectangle(&body, brush);
+            brush.SetColor(&theme.border);
+            surface.target.DrawRoundedRectangle(&body, brush, theme.border_width * scale, None);
+
+            // Cabecera.
+            let header_h = header_dip * scale;
+            brush.SetColor(&with_alpha(theme.text, 0.035));
+            surface.target.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT { rect: rect(0.0, 0.0, w * scale, header_h), radiusX: radius * scale, radiusY: radius * scale },
+                brush,
+            );
+            let pill_h = 14.0 * scale;
+            let pill_w = 3.5 * scale;
+            let pill_y = (theme.header * scale - pill_h) * 0.5;
+            brush.SetColor(&with_alpha(accent, 0.25));
+            surface.target.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT { rect: rect(8.0 * scale, pill_y, 8.0 * scale + pill_w, pill_y + pill_h), radiusX: pill_w * 0.5, radiusY: pill_w * 0.5 },
+                brush,
+            );
+            brush.SetColor(&theme.title);
+            surface.target.DrawText(
+                &wide_str("📁 Dropbox"),
+                &gfx.title_format,
+                &rect(18.0 * scale, 0.0, w * scale, header_h),
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+
+            // Cuerpo: estado, lista de archivos y pie con boton de sync.
+            let content_top = header_dip * scale;
+            let content_h = (h - header_dip).max(0.0);
+            brush.SetColor(&theme.muted);
+            surface.target.DrawText(
+                &wide_str(&status_line),
+                &gfx.meta_format,
+                &rect(12.0 * scale, content_top + 6.0 * scale, (w - 12.0) * scale, content_top + 26.0 * scale),
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+
+            let row_h = (theme.row * scale).max(22.0 * scale);
+            let list_top = content_top + 30.0 * scale;
+            let rows_visible = ((content_h - 30.0 * scale - 44.0 * scale) / row_h).floor().max(0.0) as usize;
+            for (i, file) in files.iter().skip(scroll).take(rows_visible).enumerate() {
+                let ry = list_top + i as f32 * row_h;
+                if selected == Some(scroll + i) {
+                    brush.SetColor(&with_alpha(accent, 0.20));
+                    surface.target.FillRoundedRectangle(
+                        &D2D1_ROUNDED_RECT { rect: rect(6.0 * scale, ry + 1.0 * scale, (w - 6.0) * scale, ry + row_h - 1.0 * scale), radiusX: 6.0 * scale, radiusY: 6.0 * scale },
+                        brush,
+                    );
+                }
+                if file.is_dir {
+                    brush.SetColor(&theme.muted);
+                } else {
+                    brush.SetColor(&theme.text);
+                }
+                let icon = if file.is_dir { "📁 " } else { "📄 " };
+                let name = format!("{icon}{}", file.name);
+                surface.target.DrawText(
+                    &wide_str(&name),
+                    &gfx.text_format,
+                    &rect(14.0 * scale, ry, (w - 60.0) * scale, ry + row_h),
+                    brush,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+                if !file.is_dir && file.size > 0 {
+                    let sz = rules::human_size(file.size);
+                    brush.SetColor(&theme.muted);
+                    surface.target.DrawText(
+                        &wide_str(&sz),
+                        &gfx.meta_format,
+                        &rect((w - 60.0) * scale, ry, (w - 12.0) * scale, ry + row_h),
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                }
+            }
+
+            // Pie: nota de sync + boton Subir + boton Sincronizar.
+            let foot_y = (h - 40.0) * scale;
+            brush.SetColor(&theme.muted);
+            surface.target.DrawText(
+                &wide_str(&sync_note),
+                &gfx.meta_format,
+                &rect(14.0 * scale, foot_y, (w - 190.0) * scale, (h - 8.0) * scale),
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+            let up_btn = D2D1_ROUNDED_RECT { rect: rect((w - 152.0) * scale, foot_y + 2.0 * scale, (w - 108.0) * scale, (h - 8.0) * scale), radiusX: 6.0 * scale, radiusY: 6.0 * scale };
+            if status == dropbox::Status::Ready {
+                brush.SetColor(&with_alpha(accent, 0.14));
+                surface.target.FillRoundedRectangle(&up_btn, brush);
+            }
+            brush.SetColor(&theme.text);
+            surface.target.DrawText(
+                &wide_str("⬆"),
+                &gfx.center_meta_format,
+                &up_btn.rect,
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+            let btn = D2D1_ROUNDED_RECT { rect: rect((w - 104.0) * scale, foot_y + 2.0 * scale, (w - 12.0) * scale, (h - 8.0) * scale), radiusX: 6.0 * scale, radiusY: 6.0 * scale };
+            if status == dropbox::Status::Ready {
+                brush.SetColor(&with_alpha(accent, 0.18));
+                surface.target.FillRoundedRectangle(&btn, brush);
+            }
+            brush.SetColor(&theme.text);
+            surface.target.DrawText(
+                &wide_str(self.tr.btn_dropbox_sync),
+                &gfx.meta_format,
+                &btn.rect,
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+
+            surface.target.EndDraw(None, None)?;
+
+            let screen = GetDC(None);
+            let position = POINT { x: fence.layout.x, y: fence.layout.y };
+            let size = SIZE { cx: width, cy: visual_height };
+            let source = POINT { x: 0, y: 0 };
+            let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+            let result = UpdateLayeredWindow(
+                fence.hwnd,
+                screen,
+                Some(&position as *const POINT),
+                Some(&size as *const SIZE),
+                surface.dc,
+                Some(&source as *const POINT),
+                COLORREF(0),
+                Some(&blend as *const BLENDFUNCTION),
+                ULW_ALPHA,
+            );
+            let _ = ReleaseDC(None, screen);
+            result?;
+        }
+        Ok(())
     }
 
     /// Renderiza la caja widget de Spotify: marco + cabecera + escena nativa
@@ -5220,6 +5849,11 @@ impl App {
         self.spotify.set_redirect_uri(self.cfg.spotify.redirect_uri.clone());
         // Caja del widget Spotify (nativo): se crea/elimina segun `enabled`.
         self.ensure_spotify_fence();
+        self.dropbox.set_app_key(self.cfg.dropbox.app_key.clone());
+        self.dropbox.set_app_secret(self.cfg.dropbox.app_secret.clone());
+        self.dropbox.set_redirect_uri(self.cfg.dropbox.redirect_uri.clone());
+        // Caja del widget Dropbox (nativo): se crea/elimina segun `enabled`.
+        self.ensure_dropbox_fence();
         if let Ok(gfx) = Graphics::new(&self.cfg) {
             self.gfx = gfx;
         }
@@ -5954,6 +6588,13 @@ extern "system" fn controller_proc(
                     // El bucle OLE ya termino; a partir de aqui es seguro
                     // procesar cambios de disco y reconstruir las fences.
                     app.dragging = false;
+                    // Drops encolados sobre la caja Dropbox durante un drag
+                    // interno: subirlos ahora que el bucle OLE ha terminado.
+                    let pending: Vec<PathBuf> =
+                        std::mem::take(&mut *DROPBOX_PENDING_UPLOAD.lock().unwrap());
+                    if !pending.is_empty() {
+                        app.dropbox_upload_paths(pending);
+                    }
                     if let Some(cfg) = app.deferred_config.take() {
                         app.apply_config(cfg);
                     }
@@ -6041,6 +6682,59 @@ extern "system" fn controller_proc(
                 // La cola llego del hilo de trabajo: copiarla a la app y repintar.
                 if let Some(app) = app_from(hwnd) {
                     app.spotify_apply_queue();
+                }
+                LRESULT(0)
+            }
+            WM_ZEN_DROPBOX_AUTH => {
+                // El navegador devolvio el codigo: canjearlo por tokens.
+                if let Some(app) = app_from(hwnd) {
+                    if let Some(code) = DROPBOX_AUTH_CODE.lock().unwrap().take() {
+                        if app.dropbox.complete_auth(&code).is_ok() {
+                            let db = app.dropbox.clone();
+                            app.dropbox_email = db.account_email();
+                            app.dropbox_sync_now();
+                        }
+                    }
+                    app.render_all();
+                }
+                LRESULT(0)
+            }
+            WM_ZEN_DROPBOX_FILES => {
+                if let Some(app) = app_from(hwnd) {
+                    app.dropbox_apply_files();
+                }
+                LRESULT(0)
+            }
+            WM_ZEN_DROPBOX_SYNC => {
+                if let Some(app) = app_from(hwnd) {
+                    app.dropbox_apply_sync();
+                }
+                LRESULT(0)
+            }
+            WM_ZEN_DROPBOX_OPEN => {
+                if let Some(app) = app_from(hwnd) {
+                    app.dropbox_apply_open();
+                }
+                LRESULT(0)
+            }
+            WM_ZEN_DROPBOX_UPLOADED => {
+                if let Some(app) = app_from(hwnd) {
+                    app.dropbox_apply_uploaded();
+                }
+                LRESULT(0)
+            }
+            WM_ZEN_DROPBOX_UPLOAD_PENDING => {
+                if let Some(app) = app_from(hwnd) {
+                    // Si llega durante un drag interno (el mensaje se posteo a
+                    // mitad del bucle OLE), se deja encolado: WM_ZEN_DRAG_DONE
+                    // lo drenara al terminar, ya con la UI segura.
+                    if !app.dragging {
+                        let pending: Vec<PathBuf> =
+                            std::mem::take(&mut *DROPBOX_PENDING_UPLOAD.lock().unwrap());
+                        if !pending.is_empty() {
+                            app.dropbox_upload_paths(pending);
+                        }
+                    }
                 }
                 LRESULT(0)
             }
@@ -6297,20 +6991,38 @@ unsafe extern "system" fn drop_target_drag_enter(
     this: *mut c_void,
     pdataobj: *mut c_void,
     _keys: MODIFIERKEYS_FLAGS,
-    _pt: POINTL,
+    pt: POINTL,
     pdweffect: *mut DROPEFFECT,
 ) -> windows::core::HRESULT {
     let target = &*(this as *const FenceDropTarget);
-    // Durante un drag saliente (DoDragDrop en curso), no aceptar drops
-    // entrantes en ninguna fence — evitamos access violation.
+    // Durante un drag saliente (DoDragDrop en curso) solo la caja del widget
+    // Dropbox acepta drops entrantes: los ficheros se encolan y se suben en
+    // WM_ZEN_DRAG_DONE, cuando el bucle OLE ha terminado y es seguro tocar la
+    // UI (evita el access violation de procesar el drop a mitad del drag).
     if (*target.app).dragging {
-        if !pdweffect.is_null() { *pdweffect = DROPEFFECT_NONE; }
-        return windows::core::HRESULT(0);
+        let hwnd = WindowFromPoint(POINT { x: pt.x, y: pt.y });
+        let is_dropbox = (*target.app)
+            .fences
+            .iter()
+            .any(|f| f.hwnd == hwnd && f.layout.widget.as_deref() == Some("dropbox"));
+        if !is_dropbox {
+            if !pdweffect.is_null() { *pdweffect = DROPEFFECT_NONE; }
+            return windows::core::HRESULT(0);
+        }
     }
-    let files = if pdataobj.is_null() {
+    let files = if (*target.app).dragging {
+        // Drag interno de la propia app: siempre trae ficheros (CF_HDROP),
+        // asi que no hace falta (ni conviene) inspeccionar el IDataObject a
+        // mitad del bucle OLE.
+        true
+    } else if pdataobj.is_null() {
         false
     } else {
-        let data = &*(pdataobj as *const IDataObject);
+        // OJO: el IDataObject se construye con from_raw (transmute del puntero
+        // recibido), NUNCA con &*(pdataobj as *const IDataObject): eso leeria
+        // la vtable del objeto como si fuera el puntero y la llamada COM
+        // acabaria saltando a (QueryInterface + offset) -> access violation.
+        let data: IDataObject = windows::core::Interface::from_raw(pdataobj);
         let fmt = FORMATETC {
             cfFormat: CF_HDROP.0,
             ptd: std::ptr::null_mut(),
@@ -6330,16 +7042,25 @@ unsafe extern "system" fn drop_target_drag_enter(
 unsafe extern "system" fn drop_target_drag_over(
     this: *mut c_void,
     _keys: MODIFIERKEYS_FLAGS,
-    _pt: POINTL,
+    pt: POINTL,
     pdweffect: *mut DROPEFFECT,
 ) -> windows::core::HRESULT {
     let target = &*(this as *const FenceDropTarget);
+    let mut ok = target.accepts_files.get();
+    // Durante un drag interno, solo la caja del widget Dropbox muestra el
+    // cursor de soltar (el resto de cajas siguen rechazando, como DragEnter).
+    if (*target.app).dragging {
+        let hwnd = WindowFromPoint(POINT { x: pt.x, y: pt.y });
+        let is_dropbox = (*target.app)
+            .fences
+            .iter()
+            .any(|f| f.hwnd == hwnd && f.layout.widget.as_deref() == Some("dropbox"));
+        if !is_dropbox {
+            ok = false;
+        }
+    }
     if !pdweffect.is_null() {
-        *pdweffect = if target.accepts_files.get() {
-            DROPEFFECT_MOVE
-        } else {
-            DROPEFFECT_NONE
-        };
+        *pdweffect = if ok { DROPEFFECT_MOVE } else { DROPEFFECT_NONE };
     }
     windows::core::HRESULT(0)
 }
@@ -6356,16 +7077,45 @@ unsafe extern "system" fn drop_target_drop(
     pdweffect: *mut DROPEFFECT,
 ) -> windows::core::HRESULT {
     let app = &mut *(*(this as *const FenceDropTarget)).app;
-    // Durante un drag saliente, ignorar drops entrantes.
+    let hwnd = WindowFromPoint(POINT { x: pt.x, y: pt.y });
+    let is_dropbox = app
+        .index_of(hwnd)
+        .and_then(|i| app.fences.get(i))
+        .is_some_and(|f| f.layout.widget.as_deref() == Some("dropbox"));
+    // Soltar dentro de la caja del widget Dropbox sube los ficheros a la
+    // carpeta remota en la que se esta navegando. El callback OLE nunca toca
+    // la UI (render/refresco) porque reentraria en el bucle de DoDragDrop del
+    // origen y provocaria access violation: solo encola las rutas y avisa con
+    // un mensaje, que se procesa al volver al bucle de mensajes.
+    if is_dropbox && !pdataobj.is_null() {
+        // Drag interno (de otra caja): las rutas ya las conoce la app, no hace
+        // falta re-leer el IDataObject dentro del bucle OLE (esa reentrada COM
+        // corrompia el heap). Drag externo (Explorer): se extraen con cuidado.
+        let paths = if app.dragging {
+            app.last_drag_paths.clone()
+        } else {
+            let data: IDataObject = windows::core::Interface::from_raw(pdataobj);
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| App::paths_from_idata(&data)))
+                .unwrap_or_default()
+        };
+        if !paths.is_empty() {
+            DROPBOX_PENDING_UPLOAD.lock().unwrap().extend(paths);
+            let _ = PostMessageW(app.controller, WM_ZEN_DROPBOX_UPLOAD_PENDING, WPARAM(0), LPARAM(0));
+            if !pdweffect.is_null() { *pdweffect = DROPEFFECT_MOVE; }
+            return windows::core::HRESULT(0);
+        }
+    }
+    // Durante un drag saliente, el resto de cajas rechazan el drop entrante
+    // (procesarlo a mitad del bucle OLE causaba access violation).
     if app.dragging {
         if !pdweffect.is_null() { *pdweffect = DROPEFFECT_NONE; }
         return windows::core::HRESULT(0);
     }
-    let hwnd = WindowFromPoint(POINT { x: pt.x, y: pt.y });
     let mut moved = 0usize;
     if !pdataobj.is_null() {
-        let data = &*(pdataobj as *const IDataObject);
-        let paths = App::paths_from_idata(data);
+        let data: IDataObject = windows::core::Interface::from_raw(pdataobj);
+        let paths = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| App::paths_from_idata(&data)))
+            .unwrap_or_default();
         if let Some(index) = app.index_of(hwnd) {
             // Un drop OLE interno puede caer sobre una subcarpeta dibujada
             // dentro de la fence, no solo sobre su raiz. Resolverlo aqui evita
@@ -6637,6 +7387,63 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                             Some(a) => app.spotify_control(a),
                             None => {}
                         }
+                        return LRESULT(0);
+                    }
+                }
+
+                // Widget de Dropbox: clic en el cuerpo -> boton de sync y
+                // scroll con la rueda. La cabecera y el grip caen al flujo
+                // normal (mover / redimensionar).
+                if app.fences[index].layout.widget.as_deref() == Some("dropbox") {
+                    let f = &app.fences[index];
+                    let header_px = (f.header_h(&app.theme) * f.scale) as i32;
+                    let in_grip = x > f.layout.width - GRIP
+                        && y > f.visible_height(&app.theme) - GRIP
+                        && !f.layout.collapsed;
+                    if y > header_px && !in_grip {
+                        let s = f.scale;
+                        let w_dip = f.layout.width as f32 / s;
+                        let h_dip = f.visible_height(&app.theme) as f32 / s;
+                        let header_dip = f.header_h(&app.theme);
+                        let (dx, dy) = (x as f32 / s, y as f32 / s);
+                        // Boton Subir (⬆) y Sincronizar (pie de la caja).
+                        if dy > h_dip - 40.0 {
+                            if dx > w_dip - 104.0 {
+                                if app.dropbox.status() == dropbox::Status::Ready {
+                                    app.dropbox_sync_now();
+                                }
+                                let _ = app.render(index);
+                                return LRESULT(0);
+                            }
+                            if dx > w_dip - 152.0 && dx <= w_dip - 108.0 {
+                                app.dropbox_navigate_up();
+                                let _ = app.render(index);
+                                return LRESULT(0);
+                            }
+                        }
+                        // Clic en una fila: seleccionar y preparar el arrastre
+                        // (al superar el umbral se descarga y se lanza el drag
+                        // OLE; el doble clic navega/abre via WM_LBUTTONDBLCLK).
+                        if app.dropbox.status() == dropbox::Status::Ready {
+                            let row_h_dip = app.theme.row.max(22.0);
+                            let list_top_dip = header_dip + 30.0;
+                            let list_bottom_dip = h_dip - 44.0;
+                            if dy > list_top_dip && dy < list_bottom_dip {
+                                let idx = ((dy - list_top_dip) / row_h_dip).floor() as usize;
+                                let item = app.dropbox_scroll.max(0) as usize + idx;
+                                if item < app.dropbox_files.len() {
+                                    app.dropbox_selected = Some(item);
+                                    let file = &app.dropbox_files[item];
+                                    if !file.is_dir {
+                                        app.fences[index].drag = DragMode::DropboxDrag { start_x: x, start_y: y };
+                                        let _ = SetCapture(hwnd);
+                                    }
+                                    let _ = app.render(index);
+                                    return LRESULT(0);
+                                }
+                            }
+                        }
+                        let _ = app.render(index);
                         return LRESULT(0);
                     }
                 }
@@ -6947,6 +7754,43 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                     return LRESULT(0);
                 }
 
+                // Arrastre de un archivo remoto de Dropbox: al superar el
+                // umbral se descarga a temp (sincrono) y se lanza el drag OLE,
+                // exactamente igual que el drag de items locales.
+                if let DragMode::DropboxDrag { start_x, start_y } = app.fences[index].drag.clone() {
+                    if (wparam.0 & 0x0001) != 0 {
+                        let dx = (x - start_x).abs();
+                        let dy = (y - start_y).abs();
+                        if dx > 4 || dy > 4 {
+                            let _ = ReleaseCapture();
+                            app.fences[index].drag = DragMode::None;
+                            let paths: Vec<PathBuf> = app
+                                .dropbox_selected
+                                .and_then(|i| app.dropbox_files.get(i))
+                                .filter(|e| !e.is_dir)
+                                .and_then(|e| app.dropbox_download_for_drag(e))
+                                .into_iter()
+                                .collect();
+                            if !paths.is_empty() {
+                                app.last_drag_paths = paths.clone();
+                                app.dragging = true;
+                                start_ole_drag(&paths);
+                                if PostMessageW(
+                                    app.controller,
+                                    WM_ZEN_DRAG_DONE,
+                                    WPARAM(0),
+                                    LPARAM(0),
+                                ).is_err() {
+                                    app.dragging = false;
+                                }
+                            }
+                            return LRESULT(0);
+                        }
+                    } else {
+                        app.fences[index].drag = DragMode::None;
+                    }
+                }
+
                 let mode = app.fences[index].drag.clone();
 
                 if let DragMode::ItemDrag { item_idx: _, start_x, start_y } = mode {
@@ -6960,6 +7804,7 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                             if !paths.is_empty() {
                                 let _ = ReleaseCapture();
                                 app.fences[index].drag = DragMode::None;
+                                app.last_drag_paths = paths.clone();
                                 app.dragging = true;
 
                                 start_ole_drag(&paths);
@@ -7172,6 +8017,14 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                     let _ = ReleaseCapture();
                     return LRESULT(0);
                 }
+                // Arrastre de un archivo de Dropbox: soltar sin superar el
+                // umbral simplemente cancela (la descarga solo se lanza al
+                // mover, no al soltar).
+                if let DragMode::DropboxDrag { .. } = app.fences[index].drag {
+                    let _ = ReleaseCapture();
+                    app.fences[index].drag = DragMode::None;
+                    return LRESULT(0);
+                }
                 let drag_state = app.fences[index].drag.clone();
                 if let DragMode::ItemDrag { .. } = drag_state {
                     let _ = ReleaseCapture();
@@ -7213,6 +8066,33 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
             }
             WM_LBUTTONDBLCLK => {
                 let (x, y) = point_of(lparam);
+                // Widget Dropbox: doble clic en una fila -> abrir archivo
+                // (descarga y lanza) o entrar en una carpeta.
+                if app.fences[index].layout.widget.as_deref() == Some("dropbox") {
+                    let f = &app.fences[index];
+                    let header_px = (f.header_h(&app.theme) * f.scale) as i32;
+                    let in_grip = x > f.layout.width - GRIP
+                        && y > f.visible_height(&app.theme) - GRIP
+                        && !f.layout.collapsed;
+                    if y > header_px && !in_grip && app.dropbox.status() == dropbox::Status::Ready {
+                        let s = f.scale;
+                        let header_dip = f.header_h(&app.theme);
+                        let dy = y as f32 / s;
+                        let row_h_dip = app.theme.row.max(22.0);
+                        let list_top_dip = header_dip + 30.0;
+                        let h_dip = f.visible_height(&app.theme) as f32 / s;
+                        if dy > list_top_dip && dy < h_dip - 44.0 {
+                            let idx = ((dy - list_top_dip) / row_h_dip).floor() as usize;
+                            let item = app.dropbox_scroll.max(0) as usize + idx;
+                            if item < app.dropbox_files.len() {
+                                let entry = app.dropbox_files[item].clone();
+                                app.dropbox_open_entry(entry);
+                                return LRESULT(0);
+                            }
+                        }
+                    }
+                }
+                let (x, y) = point_of(lparam);
                 let header = (app.fences[index].header_h(&app.theme) * app.fences[index].scale) as i32;
                 let w_dip = app.fences[index].layout.width as f32 / app.fences[index].scale;
                 let s = app.fences[index].scale;
@@ -7241,6 +8121,22 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
             }
             WM_MOUSEWHEEL => {
                 let delta = ((wparam.0 >> 16) as i16) as i32 / WHEEL_DELTA as i32;
+                // Widget Dropbox: la rueda desplaza la lista de archivos.
+                if app.fences[index].layout.widget.as_deref() == Some("dropbox") {
+                    let f = &app.fences[index];
+                    let s = f.scale;
+                    let row_h = (app.theme.row * s).max(22.0 * s);
+                    let content_h = (f.visible_height(&app.theme) as f32 - f.header_h(&app.theme) * s - 74.0 * s)
+                        .max(0.0);
+                    let visible = (content_h / row_h).floor().max(1.0) as usize;
+                    let max = (app.dropbox_files.len().saturating_sub(visible)) as i32;
+                    let next = (app.dropbox_scroll - delta * 3).clamp(0, max);
+                    if next != app.dropbox_scroll {
+                        app.dropbox_scroll = next;
+                        let _ = app.render(index);
+                    }
+                    return LRESULT(0);
+                }
                 // Widget Spotify en vista de cola: la rueda desplaza la lista.
                 if app.fences[index].layout.widget.as_deref() == Some("spotify") && app.spotify_show_queue {
                     let f = &app.fences[index];
