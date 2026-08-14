@@ -7,6 +7,15 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.22] - 2026-08-14
+
+### Fixed
+- **Dropbox widget disappeared after saving settings** — the "Enable
+  Dropbox widget" checkbox was missing from the dialog's initial state, so it
+  always read as unchecked and saving disabled the widget (removing its box).
+  The checkbox now reflects the real config value, so the widget survives
+  saving.
+
 ## [1.0.21] - 2026-08-14
 
 ### Added

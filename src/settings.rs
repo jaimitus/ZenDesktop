@@ -5462,6 +5462,7 @@ fn initial_checks(cfg: &Config) -> HashMap<u16, bool> {
     m.insert(ID_CHECK_A_GRID, cfg.appearance.grid_mode);
     m.insert(ID_CHECK_AI_ENABLE, cfg.ai.enabled);
     m.insert(ID_CHECK_SPOTIFY_ENABLED, cfg.spotify.enabled);
+    m.insert(ID_CHECK_DROPBOX_ENABLED, cfg.dropbox.enabled);
     m.insert(ID_CHECK_MONITOR_ENABLED, cfg.monitor.enabled);
     m
 }
