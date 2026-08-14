@@ -112,6 +112,8 @@ const ID_EDIT_R_NEWER: u16 = 31;
 const ID_EDIT_R_OLDER: u16 = 32;
 const ID_EDIT_R_REGEX: u16 = 33;
 const ID_EDIT_AI_EMBED_MODEL: u16 = 35;
+const ID_EDIT_A_MAT_OPACITY: u16 = 36;
+const ID_EDIT_A_MAT_TINT: u16 = 37;
 const ID_EDIT_R_AI_DESC: u16 = 36;
 const ID_EDIT_WIDGET_NAME: u16 = 37;
 const ID_EDIT_WIDGET_CODE: u16 = 38;
@@ -211,7 +213,7 @@ const PREVIEW_DEBOUNCE_MS: u32 = 200;
 /// (el OAuth completa en segundo plano mientras el dialogo esta abierto).
 const SPOTIFY_STATUS_TIMER_ID: usize = 0x4E7;
 
-const ALL_EDITS: [u16; 44] = [
+const ALL_EDITS: [u16; 46] = [
     ID_EDIT_MAX_AGE, ID_EDIT_MIN_AGE, ID_EDIT_PURGE, ID_EDIT_R_TITLE, ID_EDIT_R_FOLDER,
     ID_EDIT_R_COLOR, ID_EDIT_R_EXTS, ID_EDIT_R_PATTERNS, ID_EDIT_R_GROUP_TITLE, ID_EDIT_A_BG, ID_EDIT_A_HOVER,
     ID_EDIT_A_BORDER, ID_EDIT_A_TITLE, ID_EDIT_A_TEXT, ID_EDIT_A_MUTED, ID_EDIT_A_SHADOW,
@@ -224,6 +226,7 @@ const ALL_EDITS: [u16; 44] = [
     ID_EDIT_AI_EMBED_MODEL, ID_EDIT_R_AI_DESC, ID_EDIT_WIDGET_NAME,
     ID_EDIT_SPOTIFY_CLIENT_ID, ID_EDIT_SPOTIFY_CLIENT_SECRET, ID_EDIT_SPOTIFY_REDIRECT,
     ID_EDIT_DROPBOX_APP_KEY, ID_EDIT_DROPBOX_APP_SECRET, ID_EDIT_DROPBOX_REDIRECT, ID_EDIT_DROPBOX_LOCAL, ID_EDIT_DROPBOX_REMOTE,
+    ID_EDIT_A_MAT_OPACITY, ID_EDIT_A_MAT_TINT,
 ];
 
 // Valores de teclas para patrones de match (las constantes VK_* no son
@@ -311,6 +314,7 @@ enum Ctrl {
     Lang(Lang),
     Template(usize),
     Theme(&'static str),
+    Material(&'static str),
     WidgetRow(usize),
     None,
 }
@@ -1574,6 +1578,54 @@ impl Settings {
             let label = crate::config::Appearance::preset_label(key);
             self.theme_chip(x0 + i as f32 * (chip_w + chip_gap), y, chip_w, 26.0, key, label);
         }
+
+        // Material de fondo de las cajas (acrilico/desenfoque estilo Windows 11).
+        y += 26.0 + 16.0;
+        y = self.section(y, cx, cw, self.tr.sec_material);
+        let mats: [&'static str; 4] = ["none", "acrylic", "blur", "mica"];
+        let mchip_w = ((cw - 32.0 - (mats.len() - 1) as f32 * chip_gap) / mats.len() as f32).min(150.0);
+        for (i, key) in mats.iter().enumerate() {
+            let label = match *key {
+                "acrylic" => self.tr.mat_acrylic,
+                "blur" => self.tr.mat_blur,
+                "mica" => self.tr.mat_mica,
+                _ => self.tr.mat_none,
+            };
+            self.material_chip(x0 + i as f32 * (mchip_w + chip_gap), y, mchip_w, 26.0, key, label);
+        }
+        y += 26.0 + 14.0;
+        y = self.num_row(y, cx, ID_EDIT_A_MAT_OPACITY, self.tr.fld_material_opacity, &format!("{:.0}", self.cfg.appearance.material_opacity * 100.0));
+        let _ = self.num_row(y, cx, ID_EDIT_A_MAT_TINT, self.tr.fld_material_tint, &format!("{}", self.cfg.appearance.material_tint));
+    }
+
+    /// Chip del material de fondo de las cajas (ninguno / acrilico / blur).
+    fn material_chip(&mut self, x: f32, y: f32, w: f32, h: f32, key: &'static str, label: &str) {
+        let selected = self.cfg.appearance.material == key;
+        let over = self.hover == Some(Ctrl::Material(key));
+        let bg = if selected {
+            col(C_ACTIVE)
+        } else if over {
+            col(C_HOVER)
+        } else {
+            col("#00000000")
+        };
+        self.fill_rr(x, y, w, h, 7.0, bg);
+        self.draw_rr(
+            Rect { x, y, w, h },
+            7.0,
+            if selected { rgba(C_ACCENT, 0.7) } else { rgba(C_FIELD_BORDER, 0.6) },
+            1.0,
+        );
+        self.text(
+            label,
+            Fmt::Small,
+            D2D_RECT_F { left: x + 4.0, top: y + 4.0, right: x + w - 4.0, bottom: y + h - 2.0 },
+            if selected { col(C_TEXT) } else { col(C_MUTED) },
+        );
+        self.add_region(
+            Ctrl::Material(key),
+            D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h },
+        );
     }
 
     /// Chip de tema visual (igual que los chips de idioma).
@@ -2923,6 +2975,8 @@ impl Settings {
                     Ctrl::Field(ID_EDIT_A_TITLE_SIZE),
                     Ctrl::Field(ID_EDIT_A_TEXT_SIZE),
                     Ctrl::Field(ID_EDIT_A_SNAP),
+                    Ctrl::Field(ID_EDIT_A_MAT_OPACITY),
+                    Ctrl::Field(ID_EDIT_A_MAT_TINT),
                     Ctrl::Check(ID_CHECK_A_ICONS),
                     Ctrl::Check(ID_CHECK_A_COUNTER),
                     Ctrl::Check(ID_CHECK_A_SEARCH),
@@ -3215,6 +3269,11 @@ impl Settings {
             Ctrl::Theme(key) => {
                 self.cfg.appearance.apply_preset(key);
                 self.refresh_appearance_fields();
+                self.hover = None;
+                self.preview_apply();
+            }
+            Ctrl::Material(key) => {
+                self.cfg.appearance.material = key.to_string();
                 self.hover = None;
                 self.preview_apply();
             }
@@ -4218,6 +4277,20 @@ impl Settings {
             Ok(v) => v,
             Err(_) => {
                 self.warn(&bad_number(self.tr.fld_snap));
+                return None;
+            }
+        };
+        cfg.appearance.material_opacity = match text(ID_EDIT_A_MAT_OPACITY).trim().parse::<f32>() {
+            Ok(v) => (v / 100.0).clamp(0.05, 0.95),
+            Err(_) => {
+                self.warn(&bad_number(self.tr.fld_material_opacity));
+                return None;
+            }
+        };
+        cfg.appearance.material_tint = match text(ID_EDIT_A_MAT_TINT).trim().parse::<u8>() {
+            Ok(v) => v.clamp(0, 255),
+            Err(_) => {
+                self.warn(&bad_number(self.tr.fld_material_tint));
                 return None;
             }
         };
@@ -5535,6 +5608,8 @@ fn seed_edits(s: &Settings) {
         (ID_EDIT_A_TITLE_SIZE, format!("{}", s.cfg.appearance.title_size)),
         (ID_EDIT_A_TEXT_SIZE, format!("{}", s.cfg.appearance.text_size)),
         (ID_EDIT_A_SNAP, format!("{}", s.cfg.appearance.snap_grid)),
+        (ID_EDIT_A_MAT_OPACITY, format!("{:.0}", s.cfg.appearance.material_opacity * 100.0)),
+        (ID_EDIT_A_MAT_TINT, format!("{}", s.cfg.appearance.material_tint)),
         (ID_EDIT_A_GRID_SIZE, format!("{}", s.cfg.appearance.grid_item_size as u32)),
         (ID_EDIT_A_GRID_ICON, format!("{}", s.cfg.appearance.grid_icon_size as u32)),
         (ID_EDIT_AI_URL, s.cfg.ai.ollama_url.clone()),

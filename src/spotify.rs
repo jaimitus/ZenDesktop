@@ -395,6 +395,18 @@ impl Spotify {
         Ok(())
     }
 
+    /// Salta a una posicion en milisegundos de la pista actual.
+    pub fn seek(&self, position_ms: u32) -> Result<(), String> {
+        let access = self.ensure_valid()?;
+        ureq::put(&format!("{API_BASE}/me/player/seek?position_ms={position_ms}"))
+            .timeout(Duration::from_secs(8))
+            .set("Authorization", &format!("Bearer {access}"))
+            .set("Content-Length", "0")
+            .call()
+            .map_err(|e| format!("seek failed: {e}"))?;
+        Ok(())
+    }
+
     /// Olvida la sesion (borra el token de disco y de memoria).
     pub fn sign_out(&mut self) {
         *self.token.lock().unwrap() = None;

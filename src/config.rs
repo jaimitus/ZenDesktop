@@ -303,6 +303,18 @@ pub struct Appearance {
     pub grid_item_size: f32,
     /// Tamano del icono dentro de cada celda (px, 16..96).
     pub grid_icon_size: f32,
+    /// Material de fondo de las cajas: "none" | "acrylic" | "blur" | "mica".
+    /// Acrilico/desenfoque usan la API de composicion de ventanas
+    /// (SetWindowCompositionAttribute), que funciona en ventanas layered
+    /// como las cajas; el efecto se ve detras del fondo translucido.
+    /// Mica usa el backdrop de DWM (Windows 11) y requiere cajas no-layered.
+    pub material: String,
+    /// Opacidad del fondo translucido de la caja cuando hay material activo
+    /// (0.05..0.95). Mas baja = se ve mas el efecto del sistema.
+    pub material_opacity: f32,
+    /// Intensidad del tinte del acrilico (0..255). El Mica usa el tinte del
+    /// propio sistema, este valor solo afecta a "acrylic".
+    pub material_tint: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -603,6 +615,9 @@ impl Default for Appearance {
             grid_mode: false,
             grid_item_size: 72.0,
             grid_icon_size: 48.0,
+            material: "none".into(),
+            material_opacity: 0.22,
+            material_tint: 150,
         }
     }
 }
@@ -867,6 +882,14 @@ impl Config {
             self.dropbox.redirect_uri = DROPBOX_REDIRECT_URI.into();
         }
         self.dropbox.remote_folder = self.dropbox.remote_folder.trim().to_string();
+
+        // Material de fondo: valores desconocidos (config editada a mano)
+        // caen al modo sin material; opacidad y tinte se acotan.
+        if !matches!(self.appearance.material.as_str(), "none" | "acrylic" | "blur" | "mica") {
+            self.appearance.material = "none".into();
+        }
+        self.appearance.material_opacity = self.appearance.material_opacity.clamp(0.05, 0.95);
+        self.appearance.material_tint = self.appearance.material_tint.clamp(0, 255);
         if self.dropbox.remote_folder.is_empty() {
             self.dropbox.remote_folder = "/ZenDesktop".into();
         }

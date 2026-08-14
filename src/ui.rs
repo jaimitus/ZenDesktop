@@ -32,7 +32,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::core::{w, GUID, Interface, Result as WinResult, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{
@@ -48,7 +48,7 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
     D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
     D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
-    D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE, D2D1_ELLIPSE, D2D1_ROUNDED_RECT,
+    D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE, D2D1_ROUNDED_RECT,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
@@ -58,14 +58,18 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS, DWRITE_TRIMMING,
     DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
+use windows::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DWM_WINDOW_CORNER_PREFERENCE,
+};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC,
+    CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteDC,
     DeleteObject, DrawTextW, Ellipse, GetDC, GetStockObject, GetTextExtentPoint32W,
     ReleaseDC, ScreenToClient, SelectObject, SetBkMode, SetTextColor, ValidateRect, AC_SRC_ALPHA,
     AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
     DT_CENTER, DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL, TRANSPARENT, HBITMAP,
-    HDC, HGDIOBJ, IntersectClipRect, NULL_PEN, RestoreDC, SaveDC,
+    HDC, HGDIOBJ, HRGN, IntersectClipRect, NULL_PEN, RestoreDC, SaveDC, SetWindowRgn,
     EnumDisplayMonitors, GetMonitorInfoW, HMONITOR, MonitorFromWindow, MONITORINFO,
     MONITOR_DEFAULTTONEAREST,
 };
@@ -81,7 +85,7 @@ use windows::Win32::Graphics::Imaging::{
 };
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Memory::{
     GlobalLock, GlobalUnlock, VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
     PAGE_READWRITE,
@@ -313,14 +317,7 @@ fn draw_pin_glyph(
     unsafe {
         brush.SetColor(&color);
         // Cabeza (circulo relleno).
-        target.FillEllipse(
-            &D2D1_ELLIPSE {
-                point: D2D_POINT_2F { x: cx, y: cy - 2.8 * scale },
-                radiusX: 1.7 * scale,
-                radiusY: 1.7 * scale,
-            },
-            brush,
-        );
+        fill_circle(target, brush, cx, cy - 2.8 * scale, 1.7 * scale);
         // Eje vertical.
         target.DrawLine(
             D2D_POINT_2F { x: cx, y: cy - 1.4 * scale },
@@ -424,6 +421,130 @@ fn with_alpha(c: D2D1_COLOR_F, a: f32) -> D2D1_COLOR_F {
         g: c.g,
         b: c.b,
         a,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Material de fondo de las cajas (acrilico/desenfoque estilo Windows 11).
+// Las cajas son ventanas `WS_EX_LAYERED`, asi que se usa la API de
+// composicion de ventanas (SetWindowCompositionAttribute, no documentada)
+// en vez de los backdrops de DWM, que requieren ventanas no-layered.
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+struct AccentPolicy {
+    accent_state: u32,
+    accent_flags: u32,
+    gradient_color: u32,
+    animation_id: u32,
+}
+
+#[repr(C)]
+struct WindowCompositionAttribData {
+    attrib: u32,
+    pv_data: *mut c_void,
+    cb_data: usize,
+}
+
+type SetWindowCompositionAttributeFn = unsafe extern "system" fn(HWND, *mut WindowCompositionAttribData) -> i32;
+
+/// Aplica un estado de acento (desenfoque/acrilico/mica) a una ventana.
+/// `state`: 0 = desactivado, 3 = blur, 4 = acrilico, 5 = host backdrop / mica. `color` es ABGR.
+/// Se carga por GetProcAddress porque la funcion no esta documentada.
+unsafe fn set_window_accent(hwnd: HWND, state: u32, flags: u32, color: u32) -> i32 {
+    let Ok(user32) = LoadLibraryW(w!("user32.dll")) else { return 0 };
+    let Some(proc) = GetProcAddress(user32, PCSTR(b"SetWindowCompositionAttribute\0".as_ptr())) else {
+        return 0;
+    };
+    let f: SetWindowCompositionAttributeFn = std::mem::transmute(proc);
+    let mut policy = AccentPolicy {
+        accent_state: state,
+        accent_flags: flags,
+        gradient_color: color,
+        animation_id: 0,
+    };
+    let mut data = WindowCompositionAttribData {
+        attrib: 0x13, // WCA_ACCENT_POLICY
+        pv_data: (&mut policy as *mut AccentPolicy).cast(),
+        cb_data: std::mem::size_of::<AccentPolicy>(),
+    };
+    f(hwnd, &mut data)
+}
+
+/// Aplica el material de fondo elegido en configuracion a una caja.
+/// Recorta la ventana de la caja a una region redondeada (radio del tema).
+/// En modo material el backdrop acrilico cubre todo el rectangulo, asi que las
+/// esquinas quedan con el esmerilado y la caja parece cuadrada; con la region,
+/// el recorte de la esquina muestra el escritorio nitido (look redondeado real).
+/// El sistema toma posesion de la region: no hay que hacer DeleteObject.
+fn apply_fence_region(hwnd: HWND, width: i32, height: i32, radius_px: i32) {
+    if radius_px <= 0 || width <= 0 || height <= 0 {
+        unsafe {
+            let _ = SetWindowRgn(hwnd, HRGN::default(), true);
+        }
+        return;
+    }
+    unsafe {
+        let d = (radius_px * 2).max(1);
+        let region = CreateRoundRectRgn(0, 0, width, height, d, d);
+        if !region.is_invalid() {
+            let _ = SetWindowRgn(hwnd, region, true);
+        }
+    }
+}
+
+/// Con el material activo el fondo translucido de la caja se rebaja para
+/// que el desenfoque del sistema se vea a traves (ver `render`).
+fn apply_fence_backdrop(hwnd: HWND, material: &str, bg: D2D1_COLOR_F, tint: u8) {
+    unsafe {
+        // En Windows 11, indicar la preferencia de esquinas redondeadas a DWM
+        let corner_pref = DWMWCP_ROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &corner_pref as *const _ as *const c_void,
+            std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+        );
+
+        match material {
+            // ACCENT_ENABLE_ACRYLICBLURBEHIND: desenfoque + tinte del tema.
+            "acrylic" => {
+                let a = tint as u32;
+                let r = (bg.r * 255.0) as u32;
+                let g = (bg.g * 255.0) as u32;
+                let b = (bg.b * 255.0) as u32;
+                set_window_accent(hwnd, 4, 0, (a << 24) | (b << 16) | (g << 8) | r);
+            }
+            // "mica": Desenfoque acrilico con tinte translucido mas ligero para look Mica.
+            "mica" => {
+                let a = ((tint as u32) * 3) / 5;
+                let r = (bg.r * 255.0) as u32;
+                let g = (bg.g * 255.0) as u32;
+                let b = (bg.b * 255.0) as u32;
+                set_window_accent(hwnd, 4, 0, (a << 24) | (b << 16) | (g << 8) | r);
+            }
+            // ACCENT_ENABLE_BLURBEHIND: solo desenfoque, sin tinte.
+            "blur" => {
+                set_window_accent(hwnd, 3, 2, 0);
+            }
+            // ACCENT_DISABLED: sin material.
+            _ => {
+                set_window_accent(hwnd, 0, 0, 0);
+            }
+        }
+    }
+}
+
+/// Fondo translucido de la caja segun el material de fondo activo y la
+/// opacidad configurada. Con material se rebaja la opacidad para que el
+/// efecto del sistema se vea a traves del fondo de la caja.
+fn material_bg(theme_bg: D2D1_COLOR_F, material: &str, opacity: f32) -> D2D1_COLOR_F {
+    match material {
+        // El desenfoque sin tinte necesita un poco mas de cuerpo para que el
+        // texto conserve contraste sobre fondos oscuros.
+        "blur" => with_alpha(theme_bg, (opacity + 0.08).min(1.0)),
+        "mica" | "acrylic" => with_alpha(theme_bg, opacity),
+        _ => theme_bg,
     }
 }
 
@@ -1005,6 +1126,7 @@ unsafe fn query_icon_index(path: &[u16], use_attributes: bool) -> Option<i32> {
 
 /// Portada decodificada (BGRA premultiplicado no; JPEG opaco => A=255) lista
 /// para construir un ID2D1Bitmap.
+#[derive(Clone)]
 struct CoverData {
     width: u32,
     height: u32,
@@ -1032,25 +1154,78 @@ struct SpotifyLayout {
 }
 
 fn spotify_layout(w: f32, h: f32) -> SpotifyLayout {
-    let pad = 12.0;
-    let cs = (h - pad * 2.0 - 34.0).clamp(40.0, 96.0);
+    let pad = 12.0_f32.min(w * 0.05).max(8.0);
+    let cs = (h - 78.0).clamp(44.0, 92.0);
     let cover = D2D_RECT_F { left: pad, top: pad, right: pad + cs, bottom: pad + cs };
-    let text_x = pad + cs + pad;
+    let text_x = pad + cs + 12.0;
     let text_w = (w - text_x - pad).max(40.0);
-    // La barra de progreso deja hueco a los lados para los tiempos (mm:ss).
+
+    // Barra de progreso con margen para las etiquetas de tiempo (mm:ss)
     let time_w = 34.0;
-    let progress = D2D_RECT_F { left: pad + time_w, top: h - 62.0, right: w - pad - time_w, bottom: h - 57.0 };
-    let volume = D2D_RECT_F { left: pad + 26.0, top: h - 46.0, right: w - pad, bottom: h - 38.0 };
-    let controls_y = h - 32.0;
-    let controls_h = 26.0;
-    let btn_w = ((w - pad * 2.0) / 3.0).clamp(32.0, 56.0);
-    let total_w = btn_w * 3.0;
-    let start_x = pad + ((w - pad * 2.0) - total_w) / 2.0;
-    let prev = D2D_RECT_F { left: start_x, top: controls_y, right: start_x + btn_w, bottom: controls_y + controls_h };
-    let play = D2D_RECT_F { left: start_x + btn_w, top: controls_y, right: start_x + btn_w * 2.0, bottom: controls_y + controls_h };
-    let next = D2D_RECT_F { left: start_x + btn_w * 2.0, top: controls_y, right: start_x + btn_w * 3.0, bottom: controls_y + controls_h };
-    let connect = D2D_RECT_F { left: pad, top: h / 2.0 - 14.0, right: w - pad, bottom: h / 2.0 + 14.0 };
-    SpotifyLayout { cover, progress, volume, connect, prev, play, next, text_x, text_w }
+    let prog_y = (h - 52.0).max(cover.bottom + 10.0);
+    let progress = D2D_RECT_F {
+        left: pad + time_w + 4.0,
+        top: prog_y,
+        right: w - pad - time_w - 4.0,
+        bottom: prog_y + 6.0,
+    };
+
+    // Fila inferior de controles (Play hero circular, Prev y Next a los lados)
+    let ctrl_y = (h - 36.0).max(prog_y + 12.0);
+    let ctrl_h = 28.0;
+    let cx = w * 0.5;
+
+    let play = D2D_RECT_F {
+        left: cx - 16.0,
+        top: ctrl_y,
+        right: cx + 16.0,
+        bottom: ctrl_y + ctrl_h,
+    };
+    let prev = D2D_RECT_F {
+        left: cx - 48.0,
+        top: ctrl_y + 2.0,
+        right: cx - 22.0,
+        bottom: ctrl_y + ctrl_h - 2.0,
+    };
+    let next = D2D_RECT_F {
+        left: cx + 22.0,
+        top: ctrl_y + 2.0,
+        right: cx + 48.0,
+        bottom: ctrl_y + ctrl_h - 2.0,
+    };
+
+    // Slider de volumen: a la izquierda de los controles con proporcion adecuada
+    let vol_left = pad + 18.0;
+    let max_vol_right = (cx - 56.0).max(vol_left + 45.0);
+    let vol_right = (vol_left + 65.0).min(max_vol_right);
+    let volume = D2D_RECT_F {
+        left: vol_left,
+        top: ctrl_y + 11.0,
+        right: vol_right,
+        bottom: ctrl_y + 17.0,
+    };
+
+    // Boton de conectar para el estado desconectado
+    let bw = 160.0_f32.min(w - 24.0);
+    let btn_y = (h * 0.5 + 24.0).min(h - 44.0).max(h * 0.5);
+    let connect = D2D_RECT_F {
+        left: (w - bw) * 0.5,
+        top: btn_y,
+        right: (w + bw) * 0.5,
+        bottom: btn_y + 32.0,
+    };
+
+    SpotifyLayout {
+        cover,
+        progress,
+        volume,
+        connect,
+        prev,
+        play,
+        next,
+        text_x,
+        text_w,
+    }
 }
 
 fn point_in(r: &D2D_RECT_F, x: f32, y: f32) -> bool {
@@ -1064,6 +1239,13 @@ fn volume_from_x(lay: &SpotifyLayout, x: f32) -> u8 {
     (t * 100.0).round() as u8
 }
 
+/// Posicion en ms a partir de la posicion X (DIP) sobre la barra de progreso.
+fn progress_from_x(lay: &SpotifyLayout, x: f32, duration_ms: u32) -> u32 {
+    let pw = (lay.progress.right - lay.progress.left).max(1.0);
+    let t = ((x - lay.progress.left) / pw).clamp(0.0, 1.0);
+    (t * duration_ms as f32).round() as u32
+}
+
 /// Milisegundos -> "m:ss" (p. ej. 83_000 -> "1:23").
 fn format_time(ms: u32) -> String {
     let secs = ms / 1000;
@@ -1073,36 +1255,52 @@ fn format_time(ms: u32) -> String {
 /// Boton de cerrar sesion (⏻) en la esquina superior derecha de la cabecera.
 /// Coordenadas DIP relativas a la cabecera (no al contenido).
 fn spotify_logout_rect(w: f32, header_dip: f32) -> D2D_RECT_F {
-    let s = 20.0;
+    let s = 22.0;
     D2D_RECT_F {
         left: w - s - 10.0,
-        top: (header_dip - s) / 2.0,
+        top: (header_dip - s) * 0.5,
         right: w - 10.0,
-        bottom: (header_dip - s) / 2.0 + s,
+        bottom: (header_dip - s) * 0.5 + s,
+    }
+}
+
+/// Boton "Abrir Spotify" del estado vacio (conectado sin reproduccion).
+/// Coordenadas DIP relativas al contenido bajo la cabecera.
+fn spotify_open_rect(w: f32, h: f32) -> D2D_RECT_F {
+    let bw = 160.0_f32.min(w - 24.0);
+    let btn_y = (h * 0.5 + 24.0).min(h - 44.0).max(h * 0.5);
+    D2D_RECT_F {
+        left: (w - bw) * 0.5,
+        top: btn_y,
+        right: (w + bw) * 0.5,
+        bottom: btn_y + 32.0,
     }
 }
 
 /// Boton de cola (☰) a la izquierda del de cerrar sesion en la cabecera.
 fn spotify_queue_btn_rect(w: f32, header_dip: f32) -> D2D_RECT_F {
-    let s = 20.0;
+    let s = 22.0;
     D2D_RECT_F {
         left: w - s * 2.0 - 10.0 - 6.0,
-        top: (header_dip - s) / 2.0,
+        top: (header_dip - s) * 0.5,
         right: w - s - 10.0 - 6.0,
-        bottom: (header_dip - s) / 2.0 + s,
+        bottom: (header_dip - s) * 0.5 + s,
     }
 }
 
-/// Alto de cada fila de la cola de Spotify (DIP).
-const SPOTIFY_QUEUE_ROW_H: f32 = 34.0;
+/// Alto reservado para la cabecera de la lista de cola (DIP).
+const SPOTIFY_QUEUE_HEADER_H: f32 = 32.0;
+
+/// Alto de cada fila de la cola de Spotify con separación (DIP).
+const SPOTIFY_QUEUE_ROW_H: f32 = 42.0;
 
 /// Rectangulo (DIP, relativo al contenido bajo la cabecera) de la fila `idx`
 /// de la cola, teniendo en cuenta el desplazamiento `scroll`. `None` si queda
 /// completamente fuera del area visible `content_h`.
 fn spotify_queue_row_rect(idx: usize, scroll: i32, w: f32, content_h: f32) -> Option<D2D_RECT_F> {
     let pad = 10.0;
-    let y = pad + idx as f32 * SPOTIFY_QUEUE_ROW_H - scroll as f32 * SPOTIFY_QUEUE_ROW_H;
-    let bottom = y + SPOTIFY_QUEUE_ROW_H;
+    let y = SPOTIFY_QUEUE_HEADER_H + idx as f32 * SPOTIFY_QUEUE_ROW_H - scroll as f32 * SPOTIFY_QUEUE_ROW_H;
+    let bottom = y + SPOTIFY_QUEUE_ROW_H - 4.0;
     if bottom <= 0.0 || y >= content_h {
         return None;
     }
@@ -1110,6 +1308,59 @@ fn spotify_queue_row_rect(idx: usize, scroll: i32, w: f32, content_h: f32) -> Op
 }
 
 /// Descarga y decodifica la portada (JPEG) a BGRA opaco.
+/// Logo de Spotify (PNG embebido en el binario) decodificado y redimensionado
+/// una sola vez a 128px (BGRA premultiplicado), para el estado vacio del widget.
+static SPOTIFY_LOGO: Mutex<Option<CoverData>> = Mutex::new(None);
+
+fn spotify_logo_data() -> Option<CoverData> {
+    let mut guard = SPOTIFY_LOGO.lock().unwrap();
+    if guard.is_none() {
+        const LOGO_PNG: &[u8] = include_bytes!("../logo_spotify.png");
+        *guard = image::load_from_memory(LOGO_PNG).ok().and_then(|img| {
+            // El PNG es el glyph de Spotify (verde) centrado sobre fondo blanco
+            // (4167x4167). Se recorta al contenido verde, el fondo blanco se
+            // vuelve transparente y se redimensiona a 128px (nitido a 150% DPI).
+            let rgba = img.to_rgba8();
+            let (iw, ih) = (rgba.width(), rgba.height());
+            let raw = rgba.as_raw();
+            let (mut minx, mut miny, mut maxx, mut maxy) = (iw, ih, 0u32, 0u32);
+            for y in 0..ih {
+                for x in 0..iw {
+                    let i = ((y * iw + x) * 4) as usize;
+                    let (r, g, b) = (raw[i] as u32, raw[i + 1] as u32, raw[i + 2] as u32);
+                    if g > 90 && g > r * 11 / 10 && g > b * 11 / 10 {
+                        minx = minx.min(x);
+                        miny = miny.min(y);
+                        maxx = maxx.max(x);
+                        maxy = maxy.max(y);
+                    }
+                }
+            }
+            if minx >= maxx || miny >= maxy {
+                return None;
+            }
+            let cropped =
+                image::imageops::crop_imm(&rgba, minx, miny, maxx - minx + 1, maxy - miny + 1).to_image();
+            let small = image::imageops::resize(&cropped, 128, 128, image::imageops::FilterType::Triangle);
+            let raw = small.as_raw();
+            let mut bgra = Vec::with_capacity(128 * 128 * 4);
+            for chunk in raw.chunks_exact(4) {
+                let (r, g, b, a) = (chunk[0] as u32, chunk[1] as u32, chunk[2] as u32, chunk[3] as u32);
+                // El fondo blanco del PNG se vuelve transparente (BGRA premultiplicado).
+                let alpha = if r >= 235 && g >= 235 && b >= 235 { 0 } else { a };
+                bgra.extend_from_slice(&[
+                    (b * alpha / 255) as u8,
+                    (g * alpha / 255) as u8,
+                    (r * alpha / 255) as u8,
+                    alpha as u8,
+                ]);
+            }
+            Some(CoverData { width: 128, height: 128, bgra })
+        });
+    }
+    guard.clone()
+}
+
 fn download_cover(url: &str) -> Option<CoverData> {
     if url.is_empty() {
         return None;
@@ -2098,6 +2349,9 @@ impl App {
                 Some(self as *mut App as *const c_void),
             )?;
 
+            // Material de fondo de la caja (acrilico/desenfoque/Mica translucido).
+            apply_fence_backdrop(hwnd, &self.cfg.appearance.material, self.theme.background, self.cfg.appearance.material_tint);
+
             let dpi = GetDpiForWindow(hwnd) as f32;
             let accent = color(&tabs[0].content.color);
             // Restaura la pestana activa de la misma caja (mejor esfuerzo tras
@@ -2143,6 +2397,14 @@ impl App {
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
             let _ = ShowWindow(hwnd, SW_SHOWNA);
+            // Esquinas redondeadas reales: la region recorta la ventana (y el
+            // backdrop acrilico) al radio del tema.
+            let fence_scale = self.fences.last().map(|f| f.scale).unwrap_or(1.0);
+            if self.cfg.appearance.material != "none" {
+                apply_fence_region(hwnd, layout.width, layout.height, (self.theme.radius * fence_scale) as i32);
+            } else {
+                let _ = unsafe { SetWindowRgn(hwnd, HRGN::default(), true) };
+            }
 
             // Mover layout al final: SetWindowPos de arriba usa layout.x/y/w/h.
             self.fences.last_mut().unwrap().layout = layout;
@@ -2210,6 +2472,8 @@ impl App {
                 self.instance,
                 Some(self as *mut App as *const c_void),
             )?;
+            // Las cajas widget tambien usan el material de fondo configurado.
+            apply_fence_backdrop(hwnd, &self.cfg.appearance.material, self.theme.background, self.cfg.appearance.material_tint);
             let dpi = GetDpiForWindow(hwnd) as f32;
             let fence = Fence {
                 hwnd,
@@ -2245,6 +2509,13 @@ impl App {
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
             let _ = ShowWindow(hwnd, SW_SHOWNA);
+            // Esquinas redondeadas para las cajas widget.
+            let widget_scale = self.fences.last().map(|f| f.scale).unwrap_or(1.0);
+            if self.cfg.appearance.material != "none" {
+                apply_fence_region(hwnd, layout.width, layout.height, (self.theme.radius * widget_scale) as i32);
+            } else {
+                let _ = unsafe { SetWindowRgn(hwnd, HRGN::default(), true) };
+            }
             self.fences.last_mut().unwrap().layout = layout;
 
             // Las cajas widget tambien son destino de arrastre: permiten
@@ -2457,6 +2728,53 @@ impl App {
         }
     }
 
+    /// Publica la superficie dibujada de una caja (ventana layered con alpha
+    /// por pixel via UpdateLayeredWindow).
+    fn present_fence_surface(
+        hwnd: HWND,
+        surface: &Surface,
+        position: POINT,
+        size: SIZE,
+        radius_px: i32,
+        material: &str,
+    ) -> WinResult<()> {
+        unsafe {
+            let screen = GetDC(None);
+            let source = POINT { x: 0, y: 0 };
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let result = UpdateLayeredWindow(
+                hwnd,
+                screen,
+                Some(&position as *const POINT),
+                Some(&size as *const SIZE),
+                surface.dc,
+                Some(&source as *const POINT),
+                COLORREF(0),
+                Some(&blend as *const BLENDFUNCTION),
+                ULW_ALPHA,
+            );
+            let _ = ReleaseDC(None, screen);
+            result?;
+
+            // Sincroniza la region redondeada con el tamano exacto de este frame.
+            // Si hay material de fondo (mica/acrylic/blur), la region recorta el
+            // backdrop esmerilado de DWM exactamente a las esquinas redondeadas
+            // de la caja, evitando que el fondo asome cuadrado por debajo.
+            if material != "none" && radius_px > 0 && size.cx > 0 && size.cy > 0 {
+                apply_fence_region(hwnd, size.cx, size.cy, radius_px);
+            } else {
+                let _ = SetWindowRgn(hwnd, HRGN::default(), true);
+            }
+
+            Ok(())
+        }
+    }
+
     /// Refresca el contenido de una sola fence y la repinta, sin tocar las demas.
     fn refresh_one_fence(&mut self, index: usize) {
         if self.dragging { return; }
@@ -2538,32 +2856,58 @@ impl App {
             let radius = theme.radius;
             let brush = &surface.brush;
 
-            // Sombra falsa: dos rectangulos redondeados con alfa muy bajo.
-            // Mas barato que un D2D1Effect de desenfoque gaussiano.
-            brush.SetColor(&theme.shadow);
-            surface.target.FillRoundedRectangle(
-                &D2D1_ROUNDED_RECT {
-                    rect: rect(1.5 * scale, 2.5 * scale, (w - 1.5) * scale, (h - 0.5) * scale),
+            let has_material = self.cfg.appearance.material != "none";
+
+            // Sombra falsa: dos rectangulos redondeados con alfa muy bajo (solo sin material activo).
+            if !has_material {
+                brush.SetColor(&theme.shadow);
+                surface.target.FillRoundedRectangle(
+                    &D2D1_ROUNDED_RECT {
+                        rect: rect(1.5 * scale, 2.5 * scale, (w - 1.5) * scale, (h - 0.5) * scale),
+                        radiusX: radius * scale,
+                        radiusY: radius * scale,
+                    },
+                    brush,
+                );
+            }
+
+            // Fondo translucido. Con material de fondo activo se rebaja la
+            // opacidad para que el acrilico/desenfoque del sistema se vea.
+            let bg_fill = material_bg(theme.background, &self.cfg.appearance.material, self.cfg.appearance.material_opacity);
+            brush.SetColor(&bg_fill);
+            let body = if has_material {
+                D2D1_ROUNDED_RECT {
+                    rect: rect(0.0, 0.0, width as f32, surface_height as f32),
                     radiusX: radius * scale,
                     radiusY: radius * scale,
-                },
-                brush,
-            );
-
-            // Fondo translucido.
-            brush.SetColor(&theme.background);
-            let body = D2D1_ROUNDED_RECT {
-                rect: rect(0.0, 0.0, (w - 1.0) * scale, (h - 1.5) * scale),
-                radiusX: radius * scale,
-                radiusY: radius * scale,
+                }
+            } else {
+                D2D1_ROUNDED_RECT {
+                    rect: rect(0.0, 0.0, (w - 1.0) * scale, (h - 1.5) * scale),
+                    radiusX: radius * scale,
+                    radiusY: radius * scale,
+                }
             };
             surface.target.FillRoundedRectangle(&body, brush);
 
-            // Borde de un pixel logico.
-            brush.SetColor(&theme.border);
+            // Borde de un pixel logico. Con material de fondo se aclara para
+            // que el contorno redondeado se distinga del backdrop esmerilado.
+            brush.SetColor(&if has_material {
+                // Literal fresco: con los colores del tema no se puede SUBIR el
+                // alpha via with_alpha (el alpha efectivo queda en el minimo),
+                // asi que se construye un color nuevo con el RGB del tema.
+                D2D1_COLOR_F { r: theme.border.r, g: theme.border.g, b: theme.border.b, a: 0.55 }
+            } else {
+                theme.border
+            });
             surface
                 .target
-                .DrawRoundedRectangle(&body, brush, theme.border_width * scale, None);
+                .DrawRoundedRectangle(
+                    &body,
+                    brush,
+                    theme.border_width * scale,
+                    None,
+                );
 
             // Fondo de la cabecera (Header Backdrop Bar)
             let header_h = fence.header_h(theme) * scale;
@@ -2902,17 +3246,7 @@ impl App {
                 );
 
                 brush.SetColor(&with_alpha(theme.background, 0.95));
-                surface.target.FillEllipse(
-                    &D2D1_ELLIPSE {
-                        point: D2D_POINT_2F {
-                            x: (rx + s * 0.5) * scale,
-                            y: (ry + 7.5) * scale,
-                        },
-                        radiusX: 0.9 * scale,
-                        radiusY: 0.9 * scale,
-                    },
-                    brush,
-                );
+                fill_circle(&surface.target, brush, (rx + s * 0.5) * scale, (ry + 7.5) * scale, 0.9 * scale);
             }
 
             // Chincheta "siempre visible": icono vectorial a la izquierda del
@@ -2932,14 +3266,7 @@ impl App {
                 brush.SetColor(&c);
                 // Cabeza de la chincheta (circulo relleno).
                 let head = D2D_POINT_2F { x: (rx + s * 0.5) * scale, y: (ry + 2.4) * scale };
-                surface.target.FillEllipse(
-                    &D2D1_ELLIPSE {
-                        point: head,
-                        radiusX: 2.0 * scale,
-                        radiusY: 2.0 * scale,
-                    },
-                    brush,
-                );
+                fill_circle(&surface.target, brush, head.x, head.y, 2.0 * scale);
                 // Eje vertical de la chincheta.
                 surface.target.DrawLine(
                     D2D_POINT_2F { x: head.x, y: (ry + 4.0) * scale },
@@ -3457,40 +3784,20 @@ impl App {
                 let _ = DestroyIcon(icon);
             }
 
-            // Publicacion atomica del frame con alfa por pixel.
-            let screen = GetDC(None);
+            // Publicacion del frame con alfa por pixel (ventana layered) o
+            // sobre el DC de la ventana (Mica real, caja no-layered).
             let mut win_rect = RECT::default();
             let _ = GetWindowRect(fence.hwnd, &mut win_rect);
             let cur_h = win_rect.bottom - win_rect.top;
-            
-            let position = POINT {
-                x: fence.layout.x,
-                y: fence.layout.y,
-            };
-            let size = SIZE {
-                cx: width,
-                cy: if fence.anim_step > 0 { cur_h } else { visual_height },
-            };
-            let source = POINT { x: 0, y: 0 };
-            let blend = BLENDFUNCTION {
-                BlendOp: AC_SRC_OVER as u8,
-                BlendFlags: 0,
-                SourceConstantAlpha: 255,
-                AlphaFormat: AC_SRC_ALPHA as u8,
-            };
-            let result = UpdateLayeredWindow(
+            let target_h = if fence.anim_step > 0 { cur_h } else { visual_height };
+            Self::present_fence_surface(
                 fence.hwnd,
-                screen,
-                Some(&position as *const POINT),
-                Some(&size as *const SIZE),
-                surface.dc,
-                Some(&source as *const POINT),
-                COLORREF(0),
-                Some(&blend as *const BLENDFUNCTION),
-                ULW_ALPHA,
-            );
-            let _ = ReleaseDC(None, screen);
-            result?;
+                surface,
+                POINT { x: fence.layout.x, y: fence.layout.y },
+                SIZE { cx: width, cy: target_h },
+                (theme.radius * scale) as i32,
+                &self.cfg.appearance.material,
+            )?;
         }
         Ok(())
     }
@@ -3618,25 +3925,50 @@ impl App {
             let radius = theme.radius;
             let brush = &surface.brush;
 
+            let has_material = self.cfg.appearance.material != "none";
+
             // Sombra, fondo y borde (identicos a una caja normal).
-            brush.SetColor(&theme.shadow);
-            surface.target.FillRoundedRectangle(
-                &D2D1_ROUNDED_RECT {
-                    rect: rect(1.5 * scale, 2.5 * scale, (w - 1.5) * scale, (h - 0.5) * scale),
+            if !has_material {
+                brush.SetColor(&theme.shadow);
+                surface.target.FillRoundedRectangle(
+                    &D2D1_ROUNDED_RECT {
+                        rect: rect(1.5 * scale, 2.5 * scale, (w - 1.5) * scale, (h - 0.5) * scale),
+                        radiusX: radius * scale,
+                        radiusY: radius * scale,
+                    },
+                    brush,
+                );
+            }
+            let bg_fill = material_bg(theme.background, &self.cfg.appearance.material, self.cfg.appearance.material_opacity);
+            brush.SetColor(&bg_fill);
+            let body = if has_material {
+                D2D1_ROUNDED_RECT {
+                    rect: rect(0.0, 0.0, width as f32, visual_height as f32),
                     radiusX: radius * scale,
                     radiusY: radius * scale,
-                },
-                brush,
-            );
-            brush.SetColor(&theme.background);
-            let body = D2D1_ROUNDED_RECT {
-                rect: rect(0.0, 0.0, (w - 1.0) * scale, (h - 1.5) * scale),
-                radiusX: radius * scale,
-                radiusY: radius * scale,
+                }
+            } else {
+                D2D1_ROUNDED_RECT {
+                    rect: rect(0.0, 0.0, (w - 1.0) * scale, (h - 1.5) * scale),
+                    radiusX: radius * scale,
+                    radiusY: radius * scale,
+                }
             };
             surface.target.FillRoundedRectangle(&body, brush);
-            brush.SetColor(&theme.border);
-            surface.target.DrawRoundedRectangle(&body, brush, theme.border_width * scale, None);
+            brush.SetColor(&if has_material {
+                // Literal fresco: con los colores del tema no se puede SUBIR el
+                // alpha via with_alpha (el alpha efectivo queda en el minimo),
+                // asi que se construye un color nuevo con el RGB del tema.
+                D2D1_COLOR_F { r: theme.border.r, g: theme.border.g, b: theme.border.b, a: 0.55 }
+            } else {
+                theme.border
+            });
+            surface.target.DrawRoundedRectangle(
+                &body,
+                brush,
+                theme.border_width * scale,
+                None,
+            );
 
             // Cabecera: fondo + divisoria + titulo.
             let header_h = fence.header_h(theme) * scale;
@@ -3731,21 +4063,23 @@ impl App {
                     }
                     DrawCmd::Circle { cx, cy, r, color: c } => {
                         brush.SetColor(&argb_color(*c));
-                        let e = D2D1_ELLIPSE {
-                            point: D2D_POINT_2F { x: cx * scale, y: header_h + cy * scale },
-                            radiusX: r * scale,
-                            radiusY: r * scale,
-                        };
-                        surface.target.FillEllipse(&e, brush);
+                        fill_circle(&surface.target, brush, cx * scale, header_h + cy * scale, r * scale);
                     }
                     DrawCmd::CircleStroke { cx, cy, r, width, color: c } => {
                         brush.SetColor(&argb_color(*c));
-                        let e = D2D1_ELLIPSE {
-                            point: D2D_POINT_2F { x: cx * scale, y: header_h + cy * scale },
+                        // Contorno de circulo via DrawRoundedRectangle (DrawEllipse
+                        // no renderiza en esta pipeline, igual que FillEllipse).
+                        let rr = D2D1_ROUNDED_RECT {
+                            rect: rect(
+                                (cx - r) * scale,
+                                header_h + (cy - r) * scale,
+                                (cx + r) * scale,
+                                header_h + (cy + r) * scale,
+                            ),
                             radiusX: r * scale,
                             radiusY: r * scale,
                         };
-                        surface.target.DrawEllipse(&e, brush, width * scale, None);
+                        surface.target.DrawRoundedRectangle(&rr, brush, width * scale, None);
                     }
                     DrawCmd::RoundRect { x, y, w: cw, h: ch, radius: rr, color: c, border_width, border_color } => {
                         let rr = D2D1_ROUNDED_RECT {
@@ -3795,29 +4129,14 @@ impl App {
 
             surface.target.EndDraw(None, None)?;
 
-            let screen = GetDC(None);
-            let position = POINT { x: fence.layout.x, y: fence.layout.y };
-            let size = SIZE { cx: width, cy: visual_height };
-            let source = POINT { x: 0, y: 0 };
-            let blend = BLENDFUNCTION {
-                BlendOp: AC_SRC_OVER as u8,
-                BlendFlags: 0,
-                SourceConstantAlpha: 255,
-                AlphaFormat: AC_SRC_ALPHA as u8,
-            };
-            let result = UpdateLayeredWindow(
+            Self::present_fence_surface(
                 fence.hwnd,
-                screen,
-                Some(&position as *const POINT),
-                Some(&size as *const SIZE),
-                surface.dc,
-                Some(&source as *const POINT),
-                COLORREF(0),
-                Some(&blend as *const BLENDFUNCTION),
-                ULW_ALPHA,
-            );
-            let _ = ReleaseDC(None, screen);
-            result?;
+                surface,
+                POINT { x: fence.layout.x, y: fence.layout.y },
+                SIZE { cx: width, cy: visual_height },
+                (theme.radius * scale) as i32,
+                &self.cfg.appearance.material,
+            )?;
         }
         Ok(())
     }
@@ -3929,6 +4248,13 @@ impl App {
         start_spotify_redirect(port, self.controller.0 as isize);
     }
 
+    /// Abre la app de escritorio de Spotify (protocolo `spotify:`).
+    fn spotify_open_app(&mut self) {
+        unsafe {
+            let _ = ShellExecuteW(None, w!("open"), w!("spotify:"), None, None, SW_SHOWNORMAL);
+        }
+    }
+
     /// Alterna entre la vista "now playing" y la cola de reproduccion.
     fn spotify_toggle_queue(&mut self) {
         if self.spotify_show_queue {
@@ -3979,15 +4305,49 @@ impl App {
     }
 
     /// Ajusta el volumen: actualiza el estado local al instante y envia el
-    /// cambio a Spotify en un hilo de trabajo.
-    fn spotify_set_volume(&mut self, percent: u8) {
+    /// cambio a Spotify con debounce para no saturar la API en arrastres.
+    fn spotify_set_volume(&mut self, percent: u8, force: bool) {
         if let Some(np) = self.spotify_np.as_mut() {
             np.volume_percent = percent;
         }
+        static LAST_VOL_SENT: Mutex<Option<Instant>> = Mutex::new(None);
+        let now = Instant::now();
+        let should_send = if force {
+            let mut guard = LAST_VOL_SENT.lock().unwrap();
+            *guard = Some(now);
+            true
+        } else {
+            let mut guard = LAST_VOL_SENT.lock().unwrap();
+            let allow = match *guard {
+                Some(prev) => now.duration_since(prev) >= Duration::from_millis(120),
+                None => true,
+            };
+            if allow {
+                *guard = Some(now);
+            }
+            allow
+        };
+        if should_send {
+            let sp = self.spotify.clone();
+            thread::spawn(move || {
+                let _ = sp.set_volume(percent);
+            });
+        }
+    }
+
+    /// Salta a una posicion en la pista actual y actualiza el estado local al instante.
+    fn spotify_seek(&mut self, position_ms: u32) {
+        if let Some(np) = self.spotify_np.as_mut() {
+            np.progress_ms = position_ms;
+        }
         let sp = self.spotify.clone();
+        let controller = self.controller.0 as isize;
         thread::spawn(move || {
-            let _ = sp.set_volume(percent);
+            let _ = sp.seek(position_ms);
+            thread::sleep(Duration::from_millis(300));
+            fetch_spotify_and_post(sp, controller);
         });
+        self.render_all();
     }
 
     /// Control de reproduccion (0=anterior, 1=play/pausa, 2=siguiente) en un
@@ -4347,17 +4707,38 @@ impl App {
             let radius = theme.radius;
             let brush = &surface.brush;
 
+            let has_material = self.cfg.appearance.material != "none";
+
             // Sombra, fondo y borde.
-            brush.SetColor(&theme.shadow);
-            surface.target.FillRoundedRectangle(
-                &D2D1_ROUNDED_RECT { rect: rect(1.5 * scale, 2.5 * scale, (w - 1.5) * scale, (h - 0.5) * scale), radiusX: radius * scale, radiusY: radius * scale },
-                brush,
-            );
-            brush.SetColor(&theme.background);
-            let body = D2D1_ROUNDED_RECT { rect: rect(0.0, 0.0, (w - 1.0) * scale, (h - 1.5) * scale), radiusX: radius * scale, radiusY: radius * scale };
+            if !has_material {
+                brush.SetColor(&theme.shadow);
+                surface.target.FillRoundedRectangle(
+                    &D2D1_ROUNDED_RECT { rect: rect(1.5 * scale, 2.5 * scale, (w - 1.5) * scale, (h - 0.5) * scale), radiusX: radius * scale, radiusY: radius * scale },
+                    brush,
+                );
+            }
+            let bg_fill = material_bg(theme.background, &self.cfg.appearance.material, self.cfg.appearance.material_opacity);
+            brush.SetColor(&bg_fill);
+            let body = if has_material {
+                D2D1_ROUNDED_RECT { rect: rect(0.0, 0.0, width as f32, visual_height as f32), radiusX: radius * scale, radiusY: radius * scale }
+            } else {
+                D2D1_ROUNDED_RECT { rect: rect(0.0, 0.0, (w - 1.0) * scale, (h - 1.5) * scale), radiusX: radius * scale, radiusY: radius * scale }
+            };
             surface.target.FillRoundedRectangle(&body, brush);
-            brush.SetColor(&theme.border);
-            surface.target.DrawRoundedRectangle(&body, brush, theme.border_width * scale, None);
+            brush.SetColor(&if has_material {
+                // Literal fresco: con los colores del tema no se puede SUBIR el
+                // alpha via with_alpha (el alpha efectivo queda en el minimo),
+                // asi que se construye un color nuevo con el RGB del tema.
+                D2D1_COLOR_F { r: theme.border.r, g: theme.border.g, b: theme.border.b, a: 0.55 }
+            } else {
+                theme.border
+            });
+            surface.target.DrawRoundedRectangle(
+                &body,
+                brush,
+                theme.border_width * scale,
+                None,
+            );
 
             // Cabecera.
             let header_h = header_dip * scale;
@@ -4480,24 +4861,14 @@ impl App {
 
             surface.target.EndDraw(None, None)?;
 
-            let screen = GetDC(None);
-            let position = POINT { x: fence.layout.x, y: fence.layout.y };
-            let size = SIZE { cx: width, cy: visual_height };
-            let source = POINT { x: 0, y: 0 };
-            let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
-            let result = UpdateLayeredWindow(
+            Self::present_fence_surface(
                 fence.hwnd,
-                screen,
-                Some(&position as *const POINT),
-                Some(&size as *const SIZE),
-                surface.dc,
-                Some(&source as *const POINT),
-                COLORREF(0),
-                Some(&blend as *const BLENDFUNCTION),
-                ULW_ALPHA,
-            );
-            let _ = ReleaseDC(None, screen);
-            result?;
+                surface,
+                POINT { x: fence.layout.x, y: fence.layout.y },
+                SIZE { cx: width, cy: visual_height },
+                (theme.radius * scale) as i32,
+                &self.cfg.appearance.material,
+            )?;
         }
         Ok(())
     }
@@ -4556,22 +4927,40 @@ impl App {
             let radius = theme.radius;
             let brush = &surface.brush;
 
-            // Sombra, fondo y borde.
-            brush.SetColor(&theme.shadow);
-            surface.target.FillRoundedRectangle(
-                &D2D1_ROUNDED_RECT { rect: rect(1.5 * scale, 2.5 * scale, (w - 1.5) * scale, (h - 0.5) * scale), radiusX: radius * scale, radiusY: radius * scale },
-                brush,
-            );
-            brush.SetColor(&theme.background);
-            let body = D2D1_ROUNDED_RECT { rect: rect(0.0, 0.0, (w - 1.0) * scale, (h - 1.5) * scale), radiusX: radius * scale, radiusY: radius * scale };
+            let has_material = self.cfg.appearance.material != "none";
+
+            // Sombra, fondo y borde de la caja.
+            if !has_material {
+                brush.SetColor(&theme.shadow);
+                surface.target.FillRoundedRectangle(
+                    &D2D1_ROUNDED_RECT { rect: rect(1.5 * scale, 2.5 * scale, (w - 1.5) * scale, (h - 0.5) * scale), radiusX: radius * scale, radiusY: radius * scale },
+                    brush,
+                );
+            }
+            let bg_fill = material_bg(theme.background, &self.cfg.appearance.material, self.cfg.appearance.material_opacity);
+            brush.SetColor(&bg_fill);
+            let body = if has_material {
+                D2D1_ROUNDED_RECT { rect: rect(0.0, 0.0, width as f32, visual_height as f32), radiusX: radius * scale, radiusY: radius * scale }
+            } else {
+                D2D1_ROUNDED_RECT { rect: rect(0.0, 0.0, (w - 1.0) * scale, (h - 1.5) * scale), radiusX: radius * scale, radiusY: radius * scale }
+            };
             surface.target.FillRoundedRectangle(&body, brush);
-            brush.SetColor(&theme.border);
-            surface.target.DrawRoundedRectangle(&body, brush, theme.border_width * scale, None);
+            brush.SetColor(&if has_material {
+                D2D1_COLOR_F { r: theme.border.r, g: theme.border.g, b: theme.border.b, a: 0.55 }
+            } else {
+                theme.border
+            });
+            surface.target.DrawRoundedRectangle(
+                &body,
+                brush,
+                theme.border_width * scale,
+                None,
+            );
 
             // Cabecera.
             let header_h = header_dip * scale;
             let base_h = theme.header * scale;
-            brush.SetColor(&with_alpha(theme.text, 0.035));
+            brush.SetColor(&with_alpha(theme.text, 0.04));
             surface.target.FillRoundedRectangle(
                 &D2D1_ROUNDED_RECT { rect: rect(0.0, 0.0, w * scale, header_h), radiusX: radius * scale, radiusY: radius * scale },
                 brush,
@@ -4585,68 +4974,198 @@ impl App {
                 1.0 * scale,
                 None,
             );
+
+            // Indicador luminoso de estado de Spotify en la cabecera.
+            let dot_x = pad + 4.0 * scale;
+            let dot_y = base_h * 0.5;
+            let is_ready = status == spotify::Status::Ready;
+            let is_playing = np.as_ref().map(|n| n.is_playing).unwrap_or(false);
+            
+            // Aura exterior del indicador
+            brush.SetColor(&argb_color(if is_ready && is_playing {
+                0x441ED760
+            } else if is_ready {
+                0x281ED760
+            } else {
+                0x1A888888
+            }));
+            fill_circle(&surface.target, brush, dot_x, dot_y, 6.0 * scale);
+            
+            // Punto central
+            brush.SetColor(&argb_color(if is_ready { 0xFF1ED760 } else { 0xFF777777 }));
+            fill_circle(&surface.target, brush, dot_x, dot_y, 3.2 * scale);
+
+            // Titulo "Spotify"
             let title = wide_str("Spotify");
             brush.SetColor(&theme.title);
             surface.target.DrawText(
                 &title,
                 &gfx.title_format,
-                &rect(pad + 10.0 * scale, 0.0, (w - pad) * scale, base_h),
+                &rect(dot_x + 10.0 * scale, 0.0, (w - pad) * scale, base_h),
                 brush,
                 D2D1_DRAW_TEXT_OPTIONS_CLIP,
                 DWRITE_MEASURING_MODE_NATURAL,
             );
 
-            // Boton de cola (☰) y cerrar sesion (⏻) en la cabecera, si hay sesion.
+            // Botones de accion en la cabecera: Cola (☰) y Cerrar sesion (⏻)
             if status == spotify::Status::Ready {
                 let qr = spotify_queue_btn_rect(w, header_dip);
-                brush.SetColor(&with_alpha(theme.text, if show_queue { 1.0 } else { 0.6 }));
-                surface.target.DrawText(
-                    &wide_str("☰"),
-                    &gfx.center_meta_format,
-                    &rect(qr.left * scale, qr.top * scale, qr.right * scale, qr.bottom * scale),
-                    brush,
-                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
+                let qr_rect = rect(qr.left * scale, qr.top * scale, qr.right * scale, qr.bottom * scale);
+                let qr_rr = D2D1_ROUNDED_RECT { rect: qr_rect, radiusX: 6.0 * scale, radiusY: 6.0 * scale };
+                
+                if show_queue {
+                    brush.SetColor(&argb_color(0x331ED760));
+                    surface.target.FillRoundedRectangle(&qr_rr, brush);
+                    brush.SetColor(&argb_color(0xFF1ED760));
+                    surface.target.DrawRoundedRectangle(&qr_rr, brush, 1.0 * scale, None);
+                    surface.target.DrawText(&wide_str("☰"), &gfx.center_meta_format, &qr_rect, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+                } else {
+                    brush.SetColor(&with_alpha(theme.text, 0.06));
+                    surface.target.FillRoundedRectangle(&qr_rr, brush);
+                    brush.SetColor(&with_alpha(theme.text, 0.7));
+                    surface.target.DrawText(&wide_str("☰"), &gfx.center_meta_format, &qr_rect, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+                }
+
                 let lr = spotify_logout_rect(w, header_dip);
-                brush.SetColor(&with_alpha(theme.text, 0.6));
-                surface.target.DrawText(
-                    &wide_str("⏻"),
-                    &gfx.center_meta_format,
-                    &rect(lr.left * scale, lr.top * scale, lr.right * scale, lr.bottom * scale),
-                    brush,
-                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
+                let lr_rect = rect(lr.left * scale, lr.top * scale, lr.right * scale, lr.bottom * scale);
+                let lr_rr = D2D1_ROUNDED_RECT { rect: lr_rect, radiusX: 6.0 * scale, radiusY: 6.0 * scale };
+                brush.SetColor(&with_alpha(theme.text, 0.06));
+                surface.target.FillRoundedRectangle(&lr_rr, brush);
+                brush.SetColor(&with_alpha(theme.text, 0.65));
+                surface.target.DrawText(&wide_str("⏻"), &gfx.center_meta_format, &lr_rect, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
             }
 
-            // Escena.
+            let content_h = (h - header_dip).max(40.0);
+
+            // Escena de contenido
             match status {
                 spotify::Status::Unconfigured => {
-                    brush.SetColor(&theme.text);
-                    let msg = wide_str("Configura el Client ID de Spotify en Ajustes → Widgets");
+                    let card_w = (w - 24.0).min(340.0);
+                    let card_h = 96.0_f32.min(content_h - 16.0).max(60.0);
+                    let card_x = (w - card_w) * 0.5 * scale;
+                    let card_y = header_h + (content_h - card_h) * 0.5 * scale;
+                    let card_rect = rect(card_x, card_y, card_x + card_w * scale, card_y + card_h * scale);
+                    let card_rr = D2D1_ROUNDED_RECT { rect: card_rect, radiusX: 10.0 * scale, radiusY: 10.0 * scale };
+
+                    brush.SetColor(&with_alpha(theme.text, 0.04));
+                    surface.target.FillRoundedRectangle(&card_rr, brush);
+                    brush.SetColor(&with_alpha(theme.border, 0.28));
+                    surface.target.DrawRoundedRectangle(&card_rr, brush, 1.0 * scale, None);
+
+                    brush.SetColor(&theme.title);
                     surface.target.DrawText(
-                        &msg,
+                        &wide_str("Spotify no configurado"),
                         &gfx.center_meta_format,
-                        &rect(12.0 * scale, header_h + 12.0 * scale, (w - 12.0) * scale, header_h + 44.0 * scale),
+                        &rect(card_x + 8.0 * scale, card_y + 16.0 * scale, card_x + card_w * scale - 8.0 * scale, card_y + 36.0 * scale),
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                    brush.SetColor(&with_alpha(theme.text, 0.55));
+                    surface.target.DrawText(
+                        &wide_str("Añade tu Client ID en Ajustes → Widgets"),
+                        &gfx.center_meta_format,
+                        &rect(card_x + 8.0 * scale, card_y + 40.0 * scale, card_x + card_w * scale - 8.0 * scale, card_y + 64.0 * scale),
                         brush,
                         D2D1_DRAW_TEXT_OPTIONS_CLIP,
                         DWRITE_MEASURING_MODE_NATURAL,
                     );
                 }
                 spotify::Status::LoggedOut => {
+                    let card_w = (w - 24.0).min(340.0);
+                    let card_h = (content_h - 16.0).clamp(100.0, 180.0);
+                    let card_x = (w - card_w) * 0.5 * scale;
+                    let card_y = header_h + (content_h - card_h) * 0.5 * scale;
+                    let card_rect = rect(card_x, card_y, card_x + card_w * scale, card_y + card_h * scale);
+                    let card_rr = D2D1_ROUNDED_RECT { rect: card_rect, radiusX: 12.0 * scale, radiusY: 12.0 * scale };
+
+                    brush.SetColor(&with_alpha(theme.text, 0.035));
+                    surface.target.FillRoundedRectangle(&card_rr, brush);
+                    brush.SetColor(&with_alpha(theme.border, 0.30));
+                    surface.target.DrawRoundedRectangle(&card_rr, brush, 1.0 * scale, None);
+
+                    let cxp = (w * 0.5) * scale;
+                    let cyp = card_y + 36.0 * scale;
+                    
+                    // Aura verde
+                    brush.SetColor(&argb_color(0x221ED760));
+                    fill_circle(&surface.target, brush, cxp, cyp, 26.0 * scale);
+
+                    // Logo de Spotify
+                    let logo_size = 36.0 * scale;
+                    let drew_logo = if let Some(logo) = spotify_logo_data() {
+                        if let Ok(bitmap) = surface.target.CreateBitmap(
+                            D2D_SIZE_U { width: logo.width, height: logo.height },
+                            Some(logo.bgra.as_ptr() as *const c_void),
+                            logo.width * 4,
+                            &D2D1_BITMAP_PROPERTIES {
+                                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                                dpiX: 96.0,
+                                dpiY: 96.0,
+                            },
+                        ) {
+                            let dest = D2D_RECT_F {
+                                left: cxp - logo_size * 0.5,
+                                top: cyp - logo_size * 0.5,
+                                right: cxp + logo_size * 0.5,
+                                bottom: cyp + logo_size * 0.5,
+                            };
+                            surface.target.DrawBitmap(&bitmap, Some(&dest), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if !drew_logo {
+                        let cr = 18.0 * scale;
+                        brush.SetColor(&argb_color(0xFF1ED760));
+                        surface.target.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(cxp - cr, cyp - cr, cxp + cr, cyp + cr), radiusX: cr, radiusY: cr }, brush);
+                        brush.SetColor(&D2D1_COLOR_F { r: 0.05, g: 0.1, b: 0.05, a: 1.0 });
+                        surface.target.DrawText(&wide_str("♪"), &gfx.center_meta_format, &rect(cxp - 10.0 * scale, cyp - 12.0 * scale, cxp + 10.0 * scale, cyp + 12.0 * scale), brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+                    }
+
+                    brush.SetColor(&theme.title);
+                    surface.target.DrawText(
+                        &wide_str("Conectar con Spotify"),
+                        &gfx.text_format,
+                        &rect(card_x + 8.0 * scale, cyp + 22.0 * scale, card_x + card_w * scale - 8.0 * scale, cyp + 42.0 * scale),
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                    brush.SetColor(&with_alpha(theme.text, 0.55));
+                    surface.target.DrawText(
+                        &wide_str("Controla tu música desde el escritorio"),
+                        &gfx.meta_format,
+                        &rect(card_x + 8.0 * scale, cyp + 42.0 * scale, card_x + card_w * scale - 8.0 * scale, cyp + 60.0 * scale),
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+
+                    // Boton de conexion
                     let cx = lay.connect.left * scale;
                     let cy = header_h + lay.connect.top * scale;
                     let cw = (lay.connect.right - lay.connect.left) * scale;
                     let ch = (lay.connect.bottom - lay.connect.top) * scale;
-                    brush.SetColor(&argb_color(0xFF1DB954));
-                    surface.target.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(cx, cy, cx + cw, cy + ch), radiusX: 8.0 * scale, radiusY: 8.0 * scale }, brush);
-                    brush.SetColor(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 });
-                    let msg = wide_str("Conectar con Spotify");
+                    let btn_rect = rect(cx, cy, cx + cw, cy + ch);
+                    let btn_rr = D2D1_ROUNDED_RECT { rect: btn_rect, radiusX: 14.0 * scale, radiusY: 14.0 * scale };
+
+                    // Sombra sutil del boton
+                    brush.SetColor(&with_alpha(theme.shadow, 0.25));
+                    surface.target.FillRoundedRectangle(
+                        &D2D1_ROUNDED_RECT { rect: rect(cx, cy + 1.5 * scale, cx + cw, cy + ch + 1.5 * scale), radiusX: 14.0 * scale, radiusY: 14.0 * scale },
+                        brush,
+                    );
+                    brush.SetColor(&argb_color(0xFF1ED760));
+                    surface.target.FillRoundedRectangle(&btn_rr, brush);
+                    brush.SetColor(&D2D1_COLOR_F { r: 0.03, g: 0.08, b: 0.03, a: 1.0 });
                     surface.target.DrawText(
-                        &msg,
+                        &wide_str("Iniciar sesión"),
                         &gfx.center_meta_format,
-                        &rect(cx, cy, cx + cw, cy + ch),
+                        &btn_rect,
                         brush,
                         D2D1_DRAW_TEXT_OPTIONS_CLIP,
                         DWRITE_MEASURING_MODE_NATURAL,
@@ -4654,182 +5173,434 @@ impl App {
                 }
                 spotify::Status::Ready => {
                     if show_queue {
-                        // Vista de cola: lista de las proximas pistas (con scroll).
-                        let content_h = h - header_dip;
-                        brush.SetColor(&with_alpha(theme.text, 0.55));
-                        surface.target.DrawText(
-                            &wide_str("Próximas"),
-                            &gfx.meta_format,
-                            &rect(12.0 * scale, header_h + 2.0 * scale, (w - 12.0) * scale, header_h + 20.0 * scale),
-                            brush,
-                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                            DWRITE_MEASURING_MODE_NATURAL,
-                        );
-                        if queue.is_empty() {
-                            brush.SetColor(&with_alpha(theme.text, 0.6));
-                            surface.target.DrawText(
-                                &wide_str("Cola vacía"),
-                                &gfx.center_meta_format,
-                                &rect(12.0 * scale, header_h + 34.0 * scale, (w - 12.0) * scale, header_h + 64.0 * scale),
-                                brush,
-                                D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                                DWRITE_MEASURING_MODE_NATURAL,
-                            );
-                        } else {
+                        // 1. Recorte de la lista para que las canciones se escondan por debajo de la cabecera
+                        let clip_top = header_h + SPOTIFY_QUEUE_HEADER_H * scale;
+                        let clip_bottom = (h - 2.0) * scale;
+                        let clip_rect = rect(0.0, clip_top, w * scale, clip_bottom);
+
+                        if !queue.is_empty() {
+                            surface.target.PushAxisAlignedClip(&clip_rect, D2D1_ANTIALIAS_MODE_ALIASED);
+
                             for (i, item) in queue.iter().enumerate() {
                                 let Some(r) = spotify_queue_row_rect(i, queue_scroll, w, content_h) else { continue };
-                                if i % 2 == 0 {
-                                    brush.SetColor(&with_alpha(theme.text, 0.03));
-                                    surface.target.FillRoundedRectangle(
-                                        &D2D1_ROUNDED_RECT { rect: rect(r.left * scale, header_h + r.top * scale, r.right * scale, header_h + r.bottom * scale), radiusX: 6.0 * scale, radiusY: 6.0 * scale },
-                                        brush,
-                                    );
-                                }
+                                let rx = r.left * scale;
+                                let ry = header_h + r.top * scale;
+                                let rw = (r.right - r.left) * scale;
+                                let rh = (r.bottom - r.top) * scale;
+                                let r_rect = rect(rx, ry, rx + rw, ry + rh);
+                                let r_rr = D2D1_ROUNDED_RECT { rect: r_rect, radiusX: 6.0 * scale, radiusY: 6.0 * scale };
+
+                                // Fondo sutil y borde de la fila
+                                brush.SetColor(&with_alpha(theme.text, if i % 2 == 0 { 0.05 } else { 0.02 }));
+                                surface.target.FillRoundedRectangle(&r_rr, brush);
+                                brush.SetColor(&with_alpha(theme.border, 0.22));
+                                surface.target.DrawRoundedRectangle(&r_rr, brush, 1.0 * scale, None);
+
+                                // Numero de pista
                                 let num = wide_str(&(i + 1).to_string());
                                 brush.SetColor(&with_alpha(theme.text, 0.45));
                                 surface.target.DrawText(
                                     &num,
-                                    &gfx.meta_format,
-                                    &rect(r.left * scale + 4.0 * scale, header_h + r.top * scale, r.left * scale + 24.0 * scale, header_h + r.bottom * scale),
+                                    &gfx.center_meta_format,
+                                    &rect(rx + 2.0 * scale, ry, rx + 24.0 * scale, ry + rh),
                                     brush,
                                     D2D1_DRAW_TEXT_OPTIONS_CLIP,
                                     DWRITE_MEASURING_MODE_NATURAL,
                                 );
-                                let tx = (r.left + 26.0) * scale;
-                                let tw = (r.right - r.left - 26.0) * scale;
+
+                                let tx = rx + 26.0 * scale;
+                                let tw = (rw - 32.0 * scale).max(10.0);
+                                
+                                // Titulo de la cancion
                                 brush.SetColor(&theme.text);
                                 surface.target.DrawText(
                                     &wide_str(&item.title),
                                     &gfx.text_format,
-                                    &rect(tx, header_h + r.top * scale + 2.0 * scale, tx + tw, header_h + r.top * scale + 20.0 * scale),
+                                    &rect(tx, ry + 2.0 * scale, tx + tw, ry + 20.0 * scale),
                                     brush,
                                     D2D1_DRAW_TEXT_OPTIONS_CLIP,
                                     DWRITE_MEASURING_MODE_NATURAL,
                                 );
-                                brush.SetColor(&with_alpha(theme.text, 0.5));
+
+                                // Artista
+                                brush.SetColor(&with_alpha(theme.text, 0.52));
                                 surface.target.DrawText(
                                     &wide_str(&item.artist),
-                                    &gfx.meta_format,
-                                    &rect(tx, header_h + r.top * scale + 20.0 * scale, tx + tw, header_h + r.bottom * scale),
+                                    &gfx.text_format,
+                                    &rect(tx, ry + 18.0 * scale, tx + tw, ry + 36.0 * scale),
                                     brush,
                                     D2D1_DRAW_TEXT_OPTIONS_CLIP,
                                     DWRITE_MEASURING_MODE_NATURAL,
                                 );
                             }
+
+                            surface.target.PopAxisAlignedClip();
+                        } else {
+                            brush.SetColor(&with_alpha(theme.text, 0.5));
+                            surface.target.DrawText(
+                                &wide_str("No hay canciones en la cola"),
+                                &gfx.center_meta_format,
+                                &rect(12.0 * scale, header_h + 46.0 * scale, (w - 12.0) * scale, header_h + 86.0 * scale),
+                                brush,
+                                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                                DWRITE_MEASURING_MODE_NATURAL,
+                            );
                         }
-                    } else {
-                    let np = np.unwrap_or_default();
-                    // Portada (o placeholder).
-                    let (cxp, cyp, csp) = (lay.cover.left * scale, header_h + lay.cover.top * scale, (lay.cover.right - lay.cover.left) * scale);
-                    if let Some((cw, ch, ref bgra)) = cover {
-                        if let Ok(bitmap) = surface.target.CreateBitmap(
-                            D2D_SIZE_U { width: cw, height: ch },
-                            Some(bgra.as_ptr() as *const c_void),
-                            cw * 4,
-                            &D2D1_BITMAP_PROPERTIES {
-                                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_IGNORE },
-                                dpiX: 96.0,
-                                dpiY: 96.0,
-                            },
-                        ) {
-                            let dest = D2D_RECT_F { left: cxp, top: cyp, right: cxp + csp, bottom: cyp + csp };
-                            surface.target.DrawBitmap(&bitmap, Some(&dest), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
-                        }
-                    } else {
-                        brush.SetColor(&with_alpha(theme.text, 0.06));
-                        surface.target.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(cxp, cyp, cxp + csp, cyp + csp), radiusX: 8.0 * scale, radiusY: 8.0 * scale }, brush);
-                    }
 
-                    // Titulo / artista / album.
-                    let tx = lay.text_x * scale;
-                    let tw = (lay.text_w * scale).max(20.0);
-                    brush.SetColor(&theme.title);
-                    surface.target.DrawText(&wide_str(&np.title), &gfx.title_format, &rect(tx, header_h + lay.cover.top * scale, tx + tw, header_h + lay.cover.top * scale + 22.0 * scale), brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
-                    brush.SetColor(&theme.text);
-                    surface.target.DrawText(&wide_str(&np.artist), &gfx.text_format, &rect(tx, header_h + (lay.cover.top + 24.0) * scale, tx + tw, header_h + (lay.cover.top + 44.0) * scale), brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
-                    brush.SetColor(&with_alpha(theme.text, 0.6));
-                    surface.target.DrawText(&wide_str(&np.album), &gfx.meta_format, &rect(tx, header_h + (lay.cover.top + 46.0) * scale, tx + tw, header_h + (lay.cover.top + 64.0) * scale), brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
-                    // Dispositivo de reproduccion (solo si hay hueco para no pisar la barra).
-                    if !np.device_name.is_empty() && lay.cover.top + 80.0 < lay.progress.top {
-                        brush.SetColor(&with_alpha(theme.text, 0.4));
-                        surface.target.DrawText(&wide_str(&np.device_name), &gfx.text_format, &rect(tx, header_h + (lay.cover.top + 66.0) * scale, tx + tw, header_h + (lay.cover.top + 82.0) * scale), brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
-                    }
+                        // 2. Cabecera fija de la cola dibujada encima con fondo para tapar cualquier paso
+                        let subheader_rect = rect(0.0, header_h, w * scale, clip_top);
+                        brush.SetColor(&bg_fill);
+                        surface.target.FillRectangle(&subheader_rect, brush);
 
-                    // Tiempos (mm:ss) flanqueando la barra de progreso.
-                    let ty = header_h + (lay.progress.top - 9.0) * scale;
-                    let tyb = header_h + (lay.progress.bottom + 9.0) * scale;
-                    brush.SetColor(&with_alpha(theme.text, 0.55));
-                    surface.target.DrawText(&wide_str(&format_time(np.progress_ms)), &gfx.meta_format, &rect(4.0 * scale, ty, lay.progress.left * scale - 2.0 * scale, tyb), brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
-                    surface.target.DrawText(&wide_str(&format_time(np.duration_ms)), &gfx.text_format, &rect(lay.progress.right * scale + 2.0 * scale, ty, (w - 4.0) * scale, tyb), brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
-
-                    // Barra de progreso.
-                    let (px, py, pw, ph) = (lay.progress.left * scale, header_h + lay.progress.top * scale, (lay.progress.right - lay.progress.left) * scale, (lay.progress.bottom - lay.progress.top) * scale);
-                    let half = ph * 0.5;
-                    brush.SetColor(&with_alpha(theme.text, 0.12));
-                    surface.target.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(px, py, px + pw, py + ph), radiusX: half, radiusY: half }, brush);
-                    let ratio = if np.duration_ms > 0 { np.progress_ms as f32 / np.duration_ms as f32 } else { 0.0 };
-                    brush.SetColor(&argb_color(0xFF1DB954));
-                    let fw = (pw * ratio.clamp(0.0, 1.0)).max(ph);
-                    surface.target.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(px, py, px + fw, py + ph), radiusX: half, radiusY: half }, brush);
-
-                    // Volumen (icono + slider).
-                    let (vx, vy, vw, vh) = (lay.volume.left * scale, header_h + lay.volume.top * scale, (lay.volume.right - lay.volume.left) * scale, (lay.volume.bottom - lay.volume.top) * scale);
-                    let icon_rect = D2D_RECT_F { left: 8.0 * scale, top: header_h + (lay.volume.top - 4.0) * scale, right: (8.0 + 20.0) * scale, bottom: header_h + (lay.volume.bottom + 4.0) * scale };
-                    brush.SetColor(&with_alpha(theme.text, 0.7));
-                    surface.target.DrawText(&wide_str("♪"), &gfx.center_meta_format, &icon_rect, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
-                    let vhalf = vh * 0.5;
-                    brush.SetColor(&with_alpha(theme.text, 0.12));
-                    surface.target.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(vx, vy, vx + vw, vy + vh), radiusX: vhalf, radiusY: vhalf }, brush);
-                    let vratio = np.volume_percent as f32 / 100.0;
-                    brush.SetColor(&argb_color(0xFF1DB954));
-                    let vf = (vw * vratio.clamp(0.0, 1.0)).max(vh);
-                    surface.target.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(vx, vy, vx + vf, vy + vh), radiusX: vhalf, radiusY: vhalf }, brush);
-                    let kx = vx + vw * vratio.clamp(0.0, 1.0);
-                    brush.SetColor(&theme.text);
-                    surface.target.FillEllipse(&D2D1_ELLIPSE { point: D2D_POINT_2F { x: kx, y: vy + vh * 0.5 }, radiusX: vh * 0.7, radiusY: vh * 0.7 }, brush);
-
-                    // Controles.
-                    let glyph = |state: bool| if state { "⏸" } else { "▶" };
-                    let controls: [(&str, D2D_RECT_F); 3] = [
-                        ("⏮", lay.prev),
-                        (glyph(np.is_playing), lay.play),
-                        ("⏭", lay.next),
-                    ];
-                    brush.SetColor(&theme.text);
-                    for (g, r) in controls {
+                        // Titulo de la cola
+                        let queue_header = format!("Cola de reproducción • {} temas", queue.len());
+                        brush.SetColor(&theme.title);
                         surface.target.DrawText(
-                            &wide_str(g),
-                            &gfx.center_meta_format,
-                            &rect(r.left * scale, header_h + r.top * scale, r.right * scale, header_h + r.bottom * scale),
+                            &wide_str(&queue_header),
+                            &gfx.text_format,
+                            &rect(14.0 * scale, header_h + 6.0 * scale, (w - 14.0) * scale, header_h + 26.0 * scale),
                             brush,
                             D2D1_DRAW_TEXT_OPTIONS_CLIP,
                             DWRITE_MEASURING_MODE_NATURAL,
                         );
-                    }
+                        brush.SetColor(&with_alpha(theme.border, 0.20));
+                        surface.target.DrawLine(
+                            D2D_POINT_2F { x: 12.0 * scale, y: clip_top },
+                            D2D_POINT_2F { x: (w - 12.0) * scale, y: clip_top },
+                            brush,
+                            1.0 * scale,
+                            None,
+                        );
+                    } else if let Some(np) = np {
+                        // Estado Activo: Reproduciendo cancion
+                        let (cxp, cyp, csp) = (lay.cover.left * scale, header_h + lay.cover.top * scale, (lay.cover.right - lay.cover.left) * scale);
+                        let cover_rr = D2D1_ROUNDED_RECT { rect: rect(cxp, cyp, cxp + csp, cyp + csp), radiusX: 8.0 * scale, radiusY: 8.0 * scale };
+
+                        // Sombra de la portada
+                        brush.SetColor(&with_alpha(theme.shadow, 0.35));
+                        surface.target.FillRoundedRectangle(
+                            &D2D1_ROUNDED_RECT { rect: rect(cxp + 1.0 * scale, cyp + 2.0 * scale, cxp + csp + 1.0 * scale, cyp + csp + 2.0 * scale), radiusX: 8.0 * scale, radiusY: 8.0 * scale },
+                            brush,
+                        );
+
+                        // Portada o vinilo con nota musical
+                        if let Some((cw, ch, ref bgra)) = cover {
+                            if let Ok(bitmap) = surface.target.CreateBitmap(
+                                D2D_SIZE_U { width: cw, height: ch },
+                                Some(bgra.as_ptr() as *const c_void),
+                                cw * 4,
+                                &D2D1_BITMAP_PROPERTIES {
+                                    pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_IGNORE },
+                                    dpiX: 96.0,
+                                    dpiY: 96.0,
+                                },
+                            ) {
+                                let dest = D2D_RECT_F { left: cxp, top: cyp, right: cxp + csp, bottom: cyp + csp };
+                                surface.target.DrawBitmap(&bitmap, Some(&dest), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                            }
+                        } else {
+                            // Vinilo estilizado de fondo
+                            brush.SetColor(&with_alpha(theme.text, 0.08));
+                            surface.target.FillRoundedRectangle(&cover_rr, brush);
+                            
+                            // Anillos de vinilo
+                            brush.SetColor(&with_alpha(theme.text, 0.12));
+                            surface.target.DrawRoundedRectangle(&cover_rr, brush, 1.0 * scale, None);
+                            
+                            let vcx = cxp + csp * 0.5;
+                            let vcy = cyp + csp * 0.5;
+                            brush.SetColor(&argb_color(0xFF1ED760));
+                            fill_circle(&surface.target, brush, vcx, vcy, csp * 0.18);
+                            brush.SetColor(&D2D1_COLOR_F { r: 0.05, g: 0.1, b: 0.05, a: 1.0 });
+                            surface.target.DrawText(&wide_str("♪"), &gfx.center_meta_format, &rect(vcx - 8.0 * scale, vcy - 10.0 * scale, vcx + 8.0 * scale, vcy + 10.0 * scale), brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+                        }
+
+                        // Borde suave de la portada
+                        brush.SetColor(&with_alpha(theme.border, 0.35));
+                        surface.target.DrawRoundedRectangle(&cover_rr, brush, 1.0 * scale, None);
+
+                        // Metadatos de la pista
+                        let tx = lay.text_x * scale;
+                        let tw = (lay.text_w * scale).max(20.0);
+                        let text_top = header_h + lay.cover.top * scale;
+
+                        // Titulo (destacado)
+                        brush.SetColor(&theme.title);
+                        surface.target.DrawText(
+                            &wide_str(&np.title),
+                            &gfx.title_format,
+                            &rect(tx, text_top - 1.0 * scale, tx + tw, text_top + 22.0 * scale),
+                            brush,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+
+                        // Artista
+                        brush.SetColor(&theme.text);
+                        surface.target.DrawText(
+                            &wide_str(&np.artist),
+                            &gfx.text_format,
+                            &rect(tx, text_top + 23.0 * scale, tx + tw, text_top + 43.0 * scale),
+                            brush,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+
+                        // Album
+                        brush.SetColor(&with_alpha(theme.text, 0.55));
+                        surface.target.DrawText(
+                            &wide_str(&np.album),
+                            &gfx.text_format,
+                            &rect(tx, text_top + 43.0 * scale, tx + tw, text_top + 61.0 * scale),
+                            brush,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+
+                        // Dispositivo activo (pastilla sutil)
+                        if !np.device_name.is_empty() && (text_top + 62.0 * scale) < (header_h + lay.progress.top * scale - 6.0 * scale) {
+                            let dev_txt = format!("🔊 {}", np.device_name);
+                            brush.SetColor(&with_alpha(theme.text, 0.06));
+                            let dev_rect = rect(tx, text_top + 63.0 * scale, tx + (tw * 0.85).min(180.0 * scale), text_top + 79.0 * scale);
+                            surface.target.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: dev_rect, radiusX: 5.0 * scale, radiusY: 5.0 * scale }, brush);
+                            brush.SetColor(&with_alpha(theme.text, 0.55));
+                            surface.target.DrawText(
+                                &wide_str(&dev_txt),
+                                &gfx.text_format,
+                                &rect(tx + 5.0 * scale, text_top + 63.0 * scale, tx + tw, text_top + 79.0 * scale),
+                                brush,
+                                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                                DWRITE_MEASURING_MODE_NATURAL,
+                            );
+                        }
+
+                        // Tiempos (mm:ss)
+                        let py = header_h + lay.progress.top * scale;
+                        let ph = (lay.progress.bottom - lay.progress.top) * scale;
+                        let ty = py - 7.0 * scale;
+                        let tyb = py + ph + 7.0 * scale;
+                        
+                        brush.SetColor(&with_alpha(theme.text, 0.55));
+                        surface.target.DrawText(
+                            &wide_str(&format_time(np.progress_ms)),
+                            &gfx.meta_format,
+                            &rect(4.0 * scale, ty, lay.progress.left * scale - 4.0 * scale, tyb),
+                            brush,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                        surface.target.DrawText(
+                            &wide_str(&format_time(np.duration_ms)),
+                            &gfx.text_format,
+                            &rect(lay.progress.right * scale + 4.0 * scale, ty, (w - 4.0) * scale, tyb),
+                            brush,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+
+                        // Barra de progreso interactiva
+                        let px = lay.progress.left * scale;
+                        let pw = (lay.progress.right - lay.progress.left) * scale;
+                        let half = ph * 0.5;
+                        
+                        // Pista base
+                        brush.SetColor(&with_alpha(theme.text, 0.14));
+                        surface.target.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(px, py, px + pw, py + ph), radiusX: half, radiusY: half }, brush);
+                        
+                        // Relleno de progreso
+                        let ratio = if np.duration_ms > 0 { np.progress_ms as f32 / np.duration_ms as f32 } else { 0.0 };
+                        let fw = (pw * ratio.clamp(0.0, 1.0)).max(ph);
+                        brush.SetColor(&argb_color(0xFF1ED760));
+                        surface.target.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(px, py, px + fw, py + ph), radiusX: half, radiusY: half }, brush);
+
+                        // Cabezal / thumb de progreso
+                        let kx = px + pw * ratio.clamp(0.0, 1.0);
+                        brush.SetColor(&argb_color(0x331ED760));
+                        fill_circle(&surface.target, brush, kx, py + half, 6.0 * scale);
+                        brush.SetColor(&D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 });
+                        fill_circle(&surface.target, brush, kx, py + half, 3.5 * scale);
+
+                        // Fila de controles y volumen
+                        // Boton Anterior (⏮)
+                        let pr_rect = rect(lay.prev.left * scale, header_h + lay.prev.top * scale, lay.prev.right * scale, header_h + lay.prev.bottom * scale);
+                        brush.SetColor(&with_alpha(theme.text, 0.06));
+                        surface.target.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: pr_rect, radiusX: 10.0 * scale, radiusY: 10.0 * scale }, brush);
+                        brush.SetColor(&with_alpha(theme.border, 0.20));
+                        surface.target.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: pr_rect, radiusX: 10.0 * scale, radiusY: 10.0 * scale }, brush, 1.0 * scale, None);
+                        brush.SetColor(&theme.text);
+                        surface.target.DrawText(&wide_str("⏮"), &gfx.center_meta_format, &pr_rect, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+
+                        // Boton Hero Play/Pausa (▶ / ⏸)
+                        let pcx = (lay.play.left + lay.play.right) * 0.5 * scale;
+                        let pcy = header_h + (lay.play.top + lay.play.bottom) * 0.5 * scale;
+                        let pr = ((lay.play.bottom - lay.play.top) * 0.5) * scale;
+
+                        // Sombra del boton Play
+                        brush.SetColor(&with_alpha(theme.shadow, 0.35));
+                        fill_circle(&surface.target, brush, pcx, pcy + 1.5 * scale, pr);
+                        
+                        // Circulo verde vibrante de Spotify
+                        brush.SetColor(&argb_color(0xFF1ED760));
+                        fill_circle(&surface.target, brush, pcx, pcy, pr);
+
+                        // Glifo centrado en contraste oscuro
+                        brush.SetColor(&D2D1_COLOR_F { r: 0.03, g: 0.08, b: 0.03, a: 1.0 });
+                        let glyph = if np.is_playing { "⏸" } else { "▶" };
+                        let glyph_rect = rect(pcx - pr, pcy - pr, pcx + pr, pcy + pr);
+                        surface.target.DrawText(&wide_str(glyph), &gfx.center_meta_format, &glyph_rect, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+
+                        // Boton Siguiente (⏭)
+                        let nx_rect = rect(lay.next.left * scale, header_h + lay.next.top * scale, lay.next.right * scale, header_h + lay.next.bottom * scale);
+                        brush.SetColor(&with_alpha(theme.text, 0.06));
+                        surface.target.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: nx_rect, radiusX: 10.0 * scale, radiusY: 10.0 * scale }, brush);
+                        brush.SetColor(&with_alpha(theme.border, 0.20));
+                        surface.target.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: nx_rect, radiusX: 10.0 * scale, radiusY: 10.0 * scale }, brush, 1.0 * scale, None);
+                        brush.SetColor(&theme.text);
+                        surface.target.DrawText(&wide_str("⏭"), &gfx.center_meta_format, &nx_rect, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+
+                        // Slider de volumen compacto
+                        let (vx, vy, vw, vh) = (lay.volume.left * scale, header_h + lay.volume.top * scale, (lay.volume.right - lay.volume.left) * scale, (lay.volume.bottom - lay.volume.top) * scale);
+                        let icon_rect = rect(vx - 16.0 * scale, vy - 6.0 * scale, vx - 2.0 * scale, vy + vh + 6.0 * scale);
+                        brush.SetColor(&with_alpha(theme.text, 0.6));
+                        surface.target.DrawText(&wide_str("♪"), &gfx.center_meta_format, &icon_rect, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+                        
+                        let vhalf = vh * 0.5;
+                        brush.SetColor(&with_alpha(theme.text, 0.14));
+                        surface.target.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(vx, vy, vx + vw, vy + vh), radiusX: vhalf, radiusY: vhalf }, brush);
+                        
+                        let vratio = np.volume_percent as f32 / 100.0;
+                        brush.SetColor(&argb_color(0xFF1ED760));
+                        let vf = (vw * vratio.clamp(0.0, 1.0)).max(vh);
+                        surface.target.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(vx, vy, vx + vf, vy + vh), radiusX: vhalf, radiusY: vhalf }, brush);
+                        
+                        let vkx = vx + vw * vratio.clamp(0.0, 1.0);
+                        brush.SetColor(&D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 });
+                        fill_circle(&surface.target, brush, vkx, vy + vh * 0.5, vh * 0.8);
+                    } else {
+                        // Estado en espera / Apagado (Spotify conectado sin pista)
+                        let card_w = (w - 24.0).min(340.0);
+                        let card_h = (content_h - 16.0).clamp(110.0, 200.0);
+                        let card_x = (w - card_w) * 0.5 * scale;
+                        let card_y = header_h + (content_h - card_h) * 0.5 * scale;
+                        let card_rect = rect(card_x, card_y, card_x + card_w * scale, card_y + card_h * scale);
+                        let card_rr = D2D1_ROUNDED_RECT { rect: card_rect, radiusX: 12.0 * scale, radiusY: 12.0 * scale };
+
+                        brush.SetColor(&with_alpha(theme.text, 0.035));
+                        surface.target.FillRoundedRectangle(&card_rr, brush);
+                        brush.SetColor(&with_alpha(theme.border, 0.30));
+                        surface.target.DrawRoundedRectangle(&card_rr, brush, 1.0 * scale, None);
+
+                        let cxp = (w * 0.5) * scale;
+                        let cyp = card_y + 38.0 * scale;
+
+                        // Aura verde ambiental de Spotify
+                        brush.SetColor(&argb_color(0x221ED760));
+                        fill_circle(&surface.target, brush, cxp, cyp, 28.0 * scale);
+                        brush.SetColor(&argb_color(0x441ED760));
+                        surface.target.DrawRoundedRectangle(
+                            &D2D1_ROUNDED_RECT { rect: rect(cxp - 24.0 * scale, cyp - 24.0 * scale, cxp + 24.0 * scale, cyp + 24.0 * scale), radiusX: 24.0 * scale, radiusY: 24.0 * scale },
+                            brush,
+                            1.0 * scale,
+                            None,
+                        );
+
+                        // Logo de Spotify (o circulo verde con glifo)
+                        let logo_size = 40.0 * scale;
+                        let drew_logo = if let Some(logo) = spotify_logo_data() {
+                            if let Ok(bitmap) = surface.target.CreateBitmap(
+                                D2D_SIZE_U { width: logo.width, height: logo.height },
+                                Some(logo.bgra.as_ptr() as *const c_void),
+                                logo.width * 4,
+                                &D2D1_BITMAP_PROPERTIES {
+                                    pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                                    dpiX: 96.0,
+                                    dpiY: 96.0,
+                                },
+                            ) {
+                                let dest = D2D_RECT_F {
+                                    left: cxp - logo_size * 0.5,
+                                    top: cyp - logo_size * 0.5,
+                                    right: cxp + logo_size * 0.5,
+                                    bottom: cyp + logo_size * 0.5,
+                                };
+                                surface.target.DrawBitmap(&bitmap, Some(&dest), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if !drew_logo {
+                            let cr = 20.0 * scale;
+                            brush.SetColor(&argb_color(0xFF1ED760));
+                            surface.target.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(cxp - cr, cyp - cr, cxp + cr, cyp + cr), radiusX: cr, radiusY: cr }, brush);
+                            brush.SetColor(&D2D1_COLOR_F { r: 0.03, g: 0.08, b: 0.03, a: 1.0 });
+                            surface.target.DrawText(&wide_str("♪"), &gfx.center_meta_format, &rect(cxp - 10.0 * scale, cyp - 12.0 * scale, cxp + 10.0 * scale, cyp + 12.0 * scale), brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+                        }
+
+                        // Textos elegantes
+                        brush.SetColor(&theme.title);
+                        surface.target.DrawText(
+                            &wide_str("Spotify en espera"),
+                            &gfx.text_format,
+                            &rect(card_x + 8.0 * scale, cyp + 24.0 * scale, card_x + card_w * scale - 8.0 * scale, cyp + 44.0 * scale),
+                            brush,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                        brush.SetColor(&with_alpha(theme.text, 0.55));
+                        surface.target.DrawText(
+                            &wide_str("Abre Spotify o reproduce una canción"),
+                            &gfx.meta_format,
+                            &rect(card_x + 8.0 * scale, cyp + 44.0 * scale, card_x + card_w * scale - 8.0 * scale, cyp + 62.0 * scale),
+                            brush,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+
+                        // Boton "Abrir Spotify" en estilo pastilla moderna
+                        let ob = spotify_open_rect(w, content_h);
+                        let (bx, by, bw, bh) = (
+                            ob.left * scale,
+                            header_h + ob.top * scale,
+                            (ob.right - ob.left) * scale,
+                            (ob.bottom - ob.top) * scale,
+                        );
+                        let ob_rect = rect(bx, by, bx + bw, by + bh);
+                        let ob_rr = D2D1_ROUNDED_RECT { rect: ob_rect, radiusX: 14.0 * scale, radiusY: 14.0 * scale };
+
+                        // Sombra del boton
+                        brush.SetColor(&with_alpha(theme.shadow, 0.30));
+                        surface.target.FillRoundedRectangle(
+                            &D2D1_ROUNDED_RECT { rect: rect(bx, by + 1.5 * scale, bx + bw, by + bh + 1.5 * scale), radiusX: 14.0 * scale, radiusY: 14.0 * scale },
+                            brush,
+                        );
+                        brush.SetColor(&argb_color(0xFF1ED760));
+                        surface.target.FillRoundedRectangle(&ob_rr, brush);
+                        brush.SetColor(&D2D1_COLOR_F { r: 0.03, g: 0.08, b: 0.03, a: 1.0 });
+                        surface.target.DrawText(
+                            &wide_str("▶  Abrir Spotify"),
+                            &gfx.center_meta_format,
+                            &ob_rect,
+                            brush,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
                     }
                 }
             }
 
             surface.target.EndDraw(None, None)?;
 
-            let screen = GetDC(None);
-            let position = POINT { x: fence.layout.x, y: fence.layout.y };
-            let size = SIZE { cx: width, cy: visual_height };
-            let source = POINT { x: 0, y: 0 };
-            let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
-            let result = UpdateLayeredWindow(
+            Self::present_fence_surface(
                 fence.hwnd,
-                screen,
-                Some(&position as *const POINT),
-                Some(&size as *const SIZE),
-                surface.dc,
-                Some(&source as *const POINT),
-                COLORREF(0),
-                Some(&blend as *const BLENDFUNCTION),
-                ULW_ALPHA,
-            );
-            let _ = ReleaseDC(None, screen);
-            result?;
+                surface,
+                POINT { x: fence.layout.x, y: fence.layout.y },
+                SIZE { cx: width, cy: visual_height },
+                (theme.radius * scale) as i32,
+                &self.cfg.appearance.material,
+            )?;
         }
         Ok(())
     }
@@ -5324,6 +6095,11 @@ impl App {
                 let (from, to) = if fence.anim_kind == 1 { (full_h, collapsed_h) } else { (collapsed_h, full_h) };
                 let cur = from + ((to - from) as f32 * progress) as i32;
                 let _ = unsafe { SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, fence.layout.width, cur, SWP_NOMOVE | SWP_NOACTIVATE) };
+                if self.cfg.appearance.material != "none" {
+                    apply_fence_region(hwnd, fence.layout.width, cur, (fence.scale * self.theme.radius) as i32);
+                } else {
+                    let _ = unsafe { SetWindowRgn(hwnd, HRGN::default(), true) };
+                }
                 let _ = self.render(i);
                 
                 if self.fences[i].anim_step == 0 {
@@ -7357,10 +8133,42 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                             }
                             return LRESULT(0);
                         }
-                        // Slider de volumen: ajusta y entra en modo arrastre.
-                        if status == spotify::Status::Ready && point_in(&lay.volume, dx, dy) {
+                        // Estado vacio (conectado, sin reproduccion): solo el
+                        // boton "Abrir Spotify" responde al clic.
+                        if status == spotify::Status::Ready && app.spotify_np.is_none() {
+                            let ob = spotify_open_rect(w_dip, (h_dip - header).max(40.0));
+                            if point_in(&ob, dx, dy) {
+                                app.spotify_open_app();
+                            }
+                            return LRESULT(0);
+                        }
+                        // Barra de progreso: saltar a la posicion (seek).
+                        let prog_hitbox = D2D_RECT_F {
+                            left: lay.progress.left - 4.0,
+                            top: lay.progress.top - 6.0,
+                            right: lay.progress.right + 4.0,
+                            bottom: lay.progress.bottom + 6.0,
+                        };
+                        if status == spotify::Status::Ready && point_in(&prog_hitbox, dx, dy) {
+                            if let Some(ref np) = app.spotify_np {
+                                if np.duration_ms > 0 {
+                                    let pos_ms = progress_from_x(&lay, dx, np.duration_ms);
+                                    app.spotify_seek(pos_ms);
+                                    return LRESULT(0);
+                                }
+                            }
+                        }
+
+                        // Slider de volumen: rectangulo con margen ampliado para facil click y arrastre.
+                        let vol_hitbox = D2D_RECT_F {
+                            left: lay.volume.left - 20.0,
+                            top: lay.volume.top - 10.0,
+                            right: lay.volume.right + 10.0,
+                            bottom: lay.volume.bottom + 10.0,
+                        };
+                        if status == spotify::Status::Ready && point_in(&vol_hitbox, dx, dy) {
                             let percent = volume_from_x(&lay, dx);
-                            app.spotify_set_volume(percent);
+                            app.spotify_set_volume(percent, true);
                             app.spotify_volume_drag = true;
                             let _ = SetCapture(hwnd);
                             let _ = app.render(index);
@@ -7749,7 +8557,7 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                         let lay = spotify_layout(w_dip, (h_dip - header).max(40.0));
                         volume_from_x(&lay, x as f32 / f.scale)
                     };
-                    app.spotify_set_volume(percent);
+                    app.spotify_set_volume(percent, false);
                     let _ = app.render(index);
                     return LRESULT(0);
                 }
@@ -7993,6 +8801,12 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                     height,
                     SWP_NOACTIVATE,
                 );
+                let rscale = app.fences[index].scale;
+                if app.cfg.appearance.material != "none" {
+                    apply_fence_region(hwnd, layout.width, height, (app.theme.radius * rscale) as i32);
+                } else {
+                    let _ = SetWindowRgn(hwnd, HRGN::default(), true);
+                }
                 let _ = app.render(index);
                 LRESULT(0)
             }
@@ -8015,6 +8829,9 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 if app.spotify_volume_drag {
                     app.spotify_volume_drag = false;
                     let _ = ReleaseCapture();
+                    if let Some(ref np) = app.spotify_np {
+                        app.spotify_set_volume(np.volume_percent, true);
+                    }
                     return LRESULT(0);
                 }
                 // Arrastre de un archivo de Dropbox: soltar sin superar el
@@ -8141,9 +8958,9 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 if app.fences[index].layout.widget.as_deref() == Some("spotify") && app.spotify_show_queue {
                     let f = &app.fences[index];
                     let content_h = f.visible_height(&app.theme) as f32 / f.scale - f.header_h(&app.theme);
-                    let visible = ((content_h - 10.0) / SPOTIFY_QUEUE_ROW_H).floor().max(1.0) as i32;
+                    let visible = ((content_h - SPOTIFY_QUEUE_HEADER_H) / SPOTIFY_QUEUE_ROW_H).floor().max(1.0) as i32;
                     let max = (app.spotify_queue.len() as i32 - visible).max(0);
-                    let next = (app.spotify_queue_scroll - delta * 3).clamp(0, max);
+                    let next = (app.spotify_queue_scroll - delta * 2).clamp(0, max);
                     if next != app.spotify_queue_scroll {
                         app.spotify_queue_scroll = next;
                         let _ = app.render(index);
@@ -8550,6 +9367,20 @@ fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
         top,
         right,
         bottom,
+    }
+}
+
+/// Circulo relleno via `FillRoundedRectangle`: `FillEllipse` no renderiza nada
+/// en esta pipeline (DCRenderTarget), asi que se usa un cuadrado con
+/// radio = mitad del lado, que es un circulo exacto.
+fn fill_circle(target: &ID2D1DCRenderTarget, brush: &ID2D1SolidColorBrush, cx: f32, cy: f32, r: f32) {
+    unsafe {
+        let rr = D2D1_ROUNDED_RECT {
+            rect: rect(cx - r, cy - r, cx + r, cy + r),
+            radiusX: r,
+            radiusY: r,
+        };
+        target.FillRoundedRectangle(&rr, brush);
     }
 }
 

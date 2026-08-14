@@ -16,6 +16,7 @@
 ## ✨ Features
 
 - **🪟 Floating translucent fences** — Group desktop files into elegant boxes with real alpha transparency
+- **🪄 Background materials** — Windows-11-style box backdrops from Settings → Appearance: **None / Acrylic / Blur / Mica**, with adjustable opacity and tint, plus real rounded corners that follow the window on every resize and roll-up
 - **📑 Tabbed fences** — Group multiple fences under tabs within a single window to save desktop space
 - **🔼 Roll-up fences** — Double click a fence's title bar to instantly roll it up, leaving only the title visible
 - **📌 Pin to Top** — A pin button in the header makes any fence float above all apps (always-on-top), ideal for an Inbox or a notes box
@@ -45,7 +46,7 @@
 - **🔔 Toast notifications** — Visual feedback with a queue (🟢 drops, 🔵 organization) so they never overwrite each other
 - **🤖 Local AI (Ollama)** — Semantic classification, automatic fence creation, and rule generation from a text description via local LLM
 - **🧩 Lua widgets** — Programmable boxes that run user scripts (clocks, weather, launchers…) with a sandboxed API: drawing primitives, images, HTTP, interactivity and persistent state
-- **🎧 Spotify widget** — first-class now-playing box (cover art, progress + times, volume slider, playback controls, device name, queue) managed from its own Settings tab: enable/disable, Client ID/Secret, connect & disconnect
+- **🎧 Spotify widget** — first-class now-playing box (cover art, progress + times, **click-to-seek**, volume slider, playback controls, device name, queue) managed from its own Settings tab: enable/disable, Client ID/Secret, connect & disconnect; shows the Spotify logo with an **Open Spotify** button when nothing is playing
 - **📁 Dropbox widget** — browse, open and sync your Dropbox from a desktop box: folder navigation, download & open, local ↔ remote sync, and bidirectional drag & drop (drag files out, drop files in to upload) — managed from its own Settings tab
 - **↩️ Undo moves** — Moving files into fences is undoable (Ctrl+Z or the toast action)
 - **📐 Per-fence list/grid view** — Each rule picks its own view mode (auto/list/grid) from Settings → Rules
@@ -54,29 +55,29 @@
 
 | Format | File | Best for |
 |---|---|---|
-| 🖥️ **Installer (EXE)** | `ZenDesktop-1.0.17-setup.exe` | Most users — wizard installer with Start Menu shortcut |
-| 📦 **Installer (MSI)** | `ZenDesktop-v1.0.17-x64.msi` | Enterprises / system-wide installs with clean uninstall |
-| 💾 **Portable** | `ZenDesktop-v1.0.17-portable.zip` | USB drives, custom paths, no installation |
+| 🖥️ **Installer (EXE)** | `ZenDesktop-1.0.20-setup.exe` | Most users — wizard installer with Start Menu shortcut |
+| 📦 **Installer (MSI)** | `ZenDesktop-v1.0.20-x64.msi` | Enterprises / system-wide installs with clean uninstall |
+| 💾 **Portable** | `ZenDesktop-v1.0.20-portable.zip` | USB drives, custom paths, no installation |
 
 All downloads are available at **[Releases](https://github.com/jaimitus/ZenDesktop/releases)**.
 
 ### 🖥️ EXE Installer (recommended)
 
-1. Download `ZenDesktop-1.0.17-setup.exe` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+1. Download `ZenDesktop-1.0.20-setup.exe` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Run the installer — accepts the license, installs to `Program Files\ZenDesktop`
 3. Start Menu shortcut is created automatically
 4. Uninstall via Windows Settings → Apps, or re-run the installer
 
 ### 📦 MSI Installer
 
-1. Download `ZenDesktop-v1.0.17-x64.msi` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+1. Download `ZenDesktop-v1.0.20-x64.msi` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Run the installer — it installs to `Program Files\ZenDesktop` for all users
 3. Start Menu shortcut is created automatically
 4. Uninstall via Windows Settings → Apps, or re-run the MSI
 
 ### 💾 Portable (for USB drives / custom paths)
 
-1. Download `ZenDesktop-v1.0.17-portable.zip` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+1. Download `ZenDesktop-v1.0.20-portable.zip` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Extract to any folder (e.g. `%APPDATA%\ZenDesktop\`)
 3. Run `ZenDesktop.exe` — it minimizes to the system tray
 4. **Optional**: Add a shortcut to `shell:startup` for auto-start with Windows

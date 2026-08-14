@@ -7,6 +7,42 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.20] - 2026-08-14
+
+### Added
+- **🪟 Background material (Mica / Acrylic / Blur)** — a new **Background
+  Material** section in Settings → Appearance picks the box backdrop:
+  **None**, **Acrylic**, **Blur** or **Mica**, with a background opacity slider
+  and an acrylic tint setting. Boxes become Windows-11-style translucent
+  surfaces (acrylic/blur use `SetWindowCompositionAttribute`, Mica uses the
+  DWM backdrop).
+- **🪄 Real rounded corners** — boxes are clipped with a rounded window region
+  that is re-synced on every frame (create, resize, roll-up, live preview), so
+  the corners stay rounded with the wallpaper showing through even when a
+  material is active. Includes `DWMWA_WINDOW_CORNER_PREFERENCE` so DWM also
+  rounds the window, and exact 1:1 geometry (no more 1px sliver where the
+  squared backdrop leaked through).
+- **🎧 Spotify empty state** — when Spotify is connected but nothing is
+  playing, the widget now shows the **embedded Spotify logo** with
+  “Nothing playing”, a hint and an **Open Spotify** button (launches the
+  desktop app) instead of a dead player with blank art and zeroed bars.
+- **🎨 Embedded Spotify logo** — `logo_spotify.png` ships inside the binary:
+  auto-cropped to the glyph, white background converted to transparency and
+  downscaled to 128px (crisp even at 150% DPI).
+- **⏩ Spotify seek** — click or drag the progress bar to jump to any
+  position in the current track.
+
+### Fixed
+- **Invisible D2D primitives** — `FillEllipse`/`DrawEllipse` don't render
+  anything on this pipeline (GDI-compatible DC render target); every ellipse
+  was silently invisible. All five call sites now draw circles with
+  `FillRoundedRectangle`/`DrawRoundedRectangle` (a square with radius = half
+  its side is an exact circle): the **volume slider knob**, the **pin heads**
+  (📌 header pin and item favorites), the **lock keyhole eye**, and the Lua
+  `circle` / `circle_stroke` primitives — previously these rendered nothing.
+
+---
+
 ## [1.0.19] - 2026-08-14
 
 ### Added
