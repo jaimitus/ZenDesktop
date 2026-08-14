@@ -7,6 +7,27 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.24] - 2026-08-14
+
+### Added
+- **Google Drive widget** — a first-class (non-Lua) box that turns a desktop
+  fence into a Google Drive client, managed from its own Settings tab:
+  OAuth PKCE login (Client ID / Client Secret / Redirect URI), folder
+  navigation with breadcrumb, download & open files, **bidirectional drag &
+  drop** (drag files out to Explorer/other fences, drop files in to upload),
+  and local ↔ remote folder sync.
+
+### Fixed
+- **Spotify widget stopped syncing after the access token was revoked** — the
+  token's `expires_at` still looked valid, so the app never refreshed it and
+  every poll failed with 401. Polling now detects 401/403 and force-refreshes
+  the token (retrying once) before giving up.
+- **Spotify widget exhausted the Web API quota** — Development-mode apps have
+  a request quota (429 `QUOTA_EXCEEDED`, distinct from rate limits). Polling
+  every 3 seconds (2-3 requests per poll) burned through it; the "now
+  playing" poll is now throttled to 30 seconds so a personal app stays within
+  quota.
+
 ## [1.0.23] - 2026-08-14
 
 ### Fixed

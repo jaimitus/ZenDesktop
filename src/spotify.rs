@@ -97,7 +97,7 @@ pub struct Spotify {
     redirect_uri: String,
     token: Arc<Mutex<Option<Token>>>,
     /// code_verifier del flujo PKCE en curso (para canjear el codigo al volver).
-    verifier: String,
+    verifier: Arc<Mutex<String>>,
     store_path: PathBuf,
 }
 
@@ -106,6 +106,12 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// true si el mensaje de error proviene de un 401/403 de la API de Spotify
+/// (el token fue revocado o no tiene permiso). Se usa para forzar el refresh.
+fn is_unauthorized_msg(msg: &str) -> bool {
+    msg.starts_with("401:") || msg.starts_with("403:")
 }
 
 /// code_verifier PKCE: 64 bytes aleatorios en base64url sin padding (86 chars).
@@ -129,7 +135,7 @@ impl Spotify {
             client_secret: String::new(),
             redirect_uri: "http://127.0.0.1:8899/callback".into(),
             token: Arc::new(Mutex::new(token)),
-            verifier: String::new(),
+            verifier: Arc::new(Mutex::new(String::new())),
             store_path,
         }
     }
@@ -169,8 +175,9 @@ impl Spotify {
         if self.client_id.trim().is_empty() {
             return Err("spotify: client_id not configured".into());
         }
-        self.verifier = generate_verifier();
-        let challenge = code_challenge(&self.verifier);
+        let verifier_str = generate_verifier();
+        *self.verifier.lock().unwrap() = verifier_str.clone();
+        let challenge = code_challenge(&verifier_str);
         let scope = "user-read-playback-state user-modify-playback-state user-read-currently-playing";
         Ok(format!(
             "{AUTHORIZE_URL}?client_id={}&response_type=code&redirect_uri={}\
@@ -184,19 +191,33 @@ impl Spotify {
     /// Intercambia el `code` devuelto por Spotify por el par de tokens y lo
     /// persiste en disco.
     pub fn complete_auth(&mut self, code: &str) -> Result<(), String> {
-        let verifier = self.verifier.clone();
-        let resp = ureq::post(TOKEN_URL)
+        let verifier = self.verifier.lock().unwrap().clone();
+        let mut form_data = vec![
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", self.redirect_uri.as_str()),
+            ("client_id", self.client_id.trim()),
+            ("code_verifier", verifier.as_str()),
+        ];
+        if !self.client_secret.is_empty() {
+            form_data.push(("client_secret", self.client_secret.as_str()));
+        }
+        let resp = match ureq::post(TOKEN_URL)
             .timeout(Duration::from_secs(15))
-            .send_form(&[
-                ("grant_type", "authorization_code"),
-                ("code", code),
-                ("redirect_uri", self.redirect_uri.as_str()),
-                ("client_id", self.client_id.trim()),
-                ("code_verifier", verifier.as_str()),
-            ])
-            .map_err(|e| format!("token request failed: {e}"))?;
+            .send_form(&form_data) {
+                Ok(r) => r,
+                Err(ureq::Error::Status(code, resp)) => {
+                    let err_body = resp.into_string().unwrap_or_default();
+                    return Err(format!("HTTP {code}: {err_body}"));
+                }
+                Err(e) => return Err(format!("token request failed: {e}")),
+            };
         let body = resp.into_string().map_err(|e| e.to_string())?;
         let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+        if let Some(err) = v.get("error") {
+            let desc = v.get("error_description").and_then(|d| d.as_str()).unwrap_or("");
+            return Err(format!("{err}: {desc}"));
+        }
         self.apply_token_response(v)?;
         Ok(())
     }
@@ -219,6 +240,36 @@ impl Spotify {
         Ok(())
     }
 
+    /// Intercambia un `refresh_token` por un access token nuevo. No toca el
+    /// estado del cliente: solo hace la llamada HTTP y devuelve el `Token`.
+    fn refresh_access_token(&self, refresh_token: &str) -> Result<Token, String> {
+        let mut form_data = vec![
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", self.client_id.trim()),
+        ];
+        if !self.client_secret.is_empty() {
+            form_data.push(("client_secret", self.client_secret.as_str()));
+        }
+        let resp = ureq::post(TOKEN_URL)
+            .timeout(Duration::from_secs(15))
+            .send_form(&form_data)
+            .map_err(|e| format!("refresh failed: {e}"))?;
+        let body = resp.into_string().map_err(|e| e.to_string())?;
+        let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+        let access = v["access_token"].as_str().ok_or("no access_token")?.to_string();
+        let expires_in = v["expires_in"].as_u64().unwrap_or(3600);
+        let refresh = v["refresh_token"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| refresh_token.to_string());
+        Ok(Token {
+            access_token: access,
+            refresh_token: refresh,
+            expires_at: now_ms() + expires_in * 1000,
+        })
+    }
+
     /// Refresca el access token si esta caducado (o a punto de caducar).
     fn ensure_valid(&self) -> Result<String, String> {
         let mut guard = self.token.lock().unwrap();
@@ -228,27 +279,22 @@ impl Spotify {
         if t.expires_at > now_ms() + 60_000 {
             return Ok(t.access_token.clone());
         }
-        let resp = ureq::post(TOKEN_URL)
-            .timeout(Duration::from_secs(15))
-            .send_form(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", t.refresh_token.as_str()),
-                ("client_id", self.client_id.trim()),
-            ])
-            .map_err(|e| format!("refresh failed: {e}"))?;
-        let body = resp.into_string().map_err(|e| e.to_string())?;
-        let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-        let access = v["access_token"].as_str().ok_or("no access_token")?.to_string();
-        let expires_in = v["expires_in"].as_u64().unwrap_or(3600);
-        let refresh = v["refresh_token"]
-            .as_str()
-            .map(str::to_string)
-            .unwrap_or_else(|| t.refresh_token.clone());
-        let nt = Token {
-            access_token: access,
-            refresh_token: refresh,
-            expires_at: now_ms() + expires_in * 1000,
+        let nt = self.refresh_access_token(&t.refresh_token)?;
+        self.save_token(&nt);
+        let out = nt.access_token.clone();
+        *guard = Some(nt);
+        Ok(out)
+    }
+
+    /// Renueva el access token ignorando `expires_at`. Se usa cuando la API
+    /// responde 401 con un token aparentemente valido (p. ej. Spotify lo
+    /// revoco al regenerar el Client Secret en el dashboard).
+    pub fn force_refresh(&self) -> Result<String, String> {
+        let mut guard = self.token.lock().unwrap();
+        let Some(t) = guard.as_ref() else {
+            return Err("not logged in".into());
         };
+        let nt = self.refresh_access_token(&t.refresh_token)?;
         self.save_token(&nt);
         let out = nt.access_token.clone();
         *guard = Some(nt);
@@ -258,6 +304,52 @@ impl Spotify {
     /// Pista en reproduccion ahora mismo (None si no hay nada sonando).
     pub fn now_playing(&self) -> Result<Option<NowPlaying>, String> {
         let access = self.ensure_valid()?;
+        match self.player_state(&access) {
+            // 401/403 => el token fue revocado antes de caducar: se renueva
+            // forzosamente y se reintenta una sola vez.
+            Err(e) if is_unauthorized_msg(&e) => {
+                let access = self.force_refresh()?;
+                self.player_state(&access)
+            }
+            other => other,
+        }
+    }
+
+    /// GET /me/player -> NowPlaying. Si no hay dispositivo/pista activa (204,
+    /// cuerpo vacio o `item: null`) cae a /me/player/currently-playing, que es
+    /// mas permisivo. Un 401/403 se propaga con prefijo para poder forzar el
+    /// refresh y reintentar desde `now_playing`.
+    fn player_state(&self, access: &str) -> Result<Option<NowPlaying>, String> {
+        match ureq::get(&format!("{API_BASE}/me/player"))
+            .timeout(Duration::from_secs(8))
+            .set("Authorization", &format!("Bearer {access}"))
+            .call()
+        {
+            Ok(r) => {
+                if r.status() == 204 {
+                    return self.currently_playing(access);
+                }
+                let body = r.into_string().map_err(|e| e.to_string())?;
+                if body.trim().is_empty() {
+                    return self.currently_playing(access);
+                }
+                let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+                if v.get("item").is_none() || v["item"].is_null() {
+                    return self.currently_playing(access);
+                }
+                Ok(Some(parse_now_playing(&v)))
+            }
+            Err(ureq::Error::Status(code, resp)) if code == 401 || code == 403 => {
+                let body = resp.into_string().unwrap_or_default();
+                Err(format!("{code}: {body}"))
+            }
+            Err(_) => self.currently_playing(access),
+        }
+    }
+
+    /// Pista actual via /me/player/currently-playing (sin informacion de
+    /// dispositivo/volumen; se consultan aparte con `active_device`).
+    fn currently_playing(&self, access: &str) -> Result<Option<NowPlaying>, String> {
         let resp = ureq::get(&format!("{API_BASE}/me/player/currently-playing"))
             .timeout(Duration::from_secs(8))
             .set("Authorization", &format!("Bearer {access}"))
@@ -267,7 +359,13 @@ impl Spotify {
             return Ok(None);
         }
         let body = resp.into_string().map_err(|e| e.to_string())?;
+        if body.trim().is_empty() {
+            return Ok(None);
+        }
         let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+        if v.get("item").is_none() || v["item"].is_null() {
+            return Ok(None);
+        }
         Ok(Some(parse_now_playing(&v)))
     }
 
@@ -457,10 +555,20 @@ fn parse_now_playing(v: &serde_json::Value) -> NowPlaying {
     }
 }
 
-/// Codifica el scope para la query string (solo los espacios, que en URLs
-/// pueden ir como %20 o +).
 fn urlencode(s: &str) -> String {
-    s.replace(' ', "%20")
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(out, "%{:02X}", b);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

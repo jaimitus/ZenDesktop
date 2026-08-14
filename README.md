@@ -48,6 +48,7 @@
 - **🧩 Lua widgets** — Programmable boxes that run user scripts (clocks, weather, launchers…) with a sandboxed API: drawing primitives, images, HTTP, interactivity and persistent state
 - **🎧 Spotify widget** — first-class now-playing box (cover art, progress + times, **click-to-seek**, volume slider, playback controls, device name, queue) managed from its own Settings tab: enable/disable, Client ID/Secret, connect & disconnect; shows the Spotify logo with an **Open Spotify** button when nothing is playing
 - **📁 Dropbox widget** — browse, open and sync your Dropbox from a desktop box: folder navigation, download & open, local ↔ remote sync, and bidirectional drag & drop (drag files out, drop files in to upload) — managed from its own Settings tab
+- **📁 Google Drive widget** — browse, open and sync your Google Drive from a desktop box: folder navigation, download & open, local ↔ remote sync, and bidirectional drag & drop — managed from its own Settings tab
 - **📊 System Monitor widget** — a live CPU / RAM / battery box refreshed every second, managed from its own Settings tab
 - **🖼️ Real thumbnails** — image files show actual photo thumbnails in grid view (WIC-based, cached), not generic icons
 - **📊 Per-fence statistics** — hover a fence title for a tooltip with item count, total size and file-type breakdown
@@ -60,29 +61,29 @@
 
 | Format | File | Best for |
 |---|---|---|
-| 🖥️ **Installer (EXE)** | `ZenDesktop-1.0.23-setup.exe` | Most users — wizard installer with Start Menu shortcut |
-| 📦 **Installer (MSI)** | `ZenDesktop-v1.0.23-x64.msi` | Enterprises / system-wide installs with clean uninstall |
-| 💾 **Portable** | `ZenDesktop-v1.0.23-portable.zip` | USB drives, custom paths, no installation |
+| 🖥️ **Installer (EXE)** | `ZenDesktop-1.0.24-setup.exe` | Most users — wizard installer with Start Menu shortcut |
+| 📦 **Installer (MSI)** | `ZenDesktop-v1.0.24-x64.msi` | Enterprises / system-wide installs with clean uninstall |
+| 💾 **Portable** | `ZenDesktop-v1.0.24-portable.zip` | USB drives, custom paths, no installation |
 
 All downloads are available at **[Releases](https://github.com/jaimitus/ZenDesktop/releases)**.
 
 ### 🖥️ EXE Installer (recommended)
 
-1. Download `ZenDesktop-1.0.23-setup.exe` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+1. Download `ZenDesktop-1.0.24-setup.exe` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Run the installer — accepts the license, installs to `Program Files\ZenDesktop`
 3. Start Menu shortcut is created automatically
 4. Uninstall via Windows Settings → Apps, or re-run the installer
 
 ### 📦 MSI Installer
 
-1. Download `ZenDesktop-v1.0.23-x64.msi` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+1. Download `ZenDesktop-v1.0.24-x64.msi` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Run the installer — it installs to `Program Files\ZenDesktop` for all users
 3. Start Menu shortcut is created automatically
 4. Uninstall via Windows Settings → Apps, or re-run the MSI
 
 ### 💾 Portable (for USB drives / custom paths)
 
-1. Download `ZenDesktop-v1.0.23-portable.zip` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
+1. Download `ZenDesktop-v1.0.24-portable.zip` from [Releases](https://github.com/jaimitus/ZenDesktop/releases)
 2. Extract to any folder (e.g. `%APPDATA%\ZenDesktop\`)
 3. Run `ZenDesktop.exe` — it minimizes to the system tray
 4. **Optional**: Add a shortcut to `shell:startup` for auto-start with Windows
@@ -270,8 +271,10 @@ Managed from **Settings → 🎧 Spotify**:
 - **Disconnect** — forgets the session.
 
 OAuth uses **PKCE** (no secret needed at runtime); the secret is kept for
-completeness. The widget polls every 3 seconds while visible without blocking
-the UI, and only re-downloads the cover when it changes.
+completeness. The widget polls every 30 seconds while visible without blocking
+the UI (a longer interval keeps Development-mode apps inside their Web API
+request quota), re-downloads the cover only when it changes, and force-refreshes
+the token if Spotify revokes it early.
 
 ## 📁 Dropbox widget
 
@@ -293,6 +296,34 @@ Managed from **Settings → 📁 Dropbox**:
   carries the scopes enabled in your App Console (Files read/write +
   account email) — re-authorize after changing permissions there.
 - **Sync** — one-way local ↔ remote sync of the configured folders.
+- **Disconnect** — forgets the session.
+
+**Drag & drop works in both directions**: drag files out of the box (they're
+downloaded to a temp file first, then a native OLE drag lets you drop them in
+Explorer or another fence) and drop files into the box from Explorer or
+another fence — they're uploaded to the remote folder you're currently
+browsing.
+
+## 📁 Google Drive widget
+
+A built-in (non-Lua) widget that turns a desktop box into a small Google
+Drive client: list files and folders, double-click a folder to enter it (the
+breadcrumb shows where you are), ⬆ to go up, and double-click a file to
+download and open it with its default app.
+
+Managed from **Settings → 📁 Google Drive**:
+
+- **Enable the widget on the desktop** — creates the box instantly when
+  checked; removing the check hides it.
+- **Client ID / Client Secret / Redirect URI** — editable fields persisted in
+  `config.toml`. The Redirect URI must match **exactly** the one registered
+  in the Google Cloud Console (default `http://127.0.0.1:8898/callback`).
+- **Local folder / Drive folder** — the local path and the remote folder (ID
+  or `root` for "My Drive") used by the sync.
+- **Connect with Google Drive** — syncs the fields, opens your browser, and
+  after authorizing the session persists (`gdrive.json`) and refreshes
+  automatically. OAuth uses **PKCE**.
+- **Sync** — local ↔ remote sync of the configured folders.
 - **Disconnect** — forgets the session.
 
 **Drag & drop works in both directions**: drag files out of the box (they're
@@ -326,6 +357,9 @@ browsing.
 │   ├── ai.rs              # HTTP client for Ollama
 │   ├── updater.rs         # Auto-update via GitHub Releases
 │   ├── spotify.rs         # Spotify OAuth PKCE + Web API client
+│   ├── dropbox.rs         # Dropbox OAuth PKCE + file sync client
+│   ├── gdrive.rs          # Google Drive OAuth PKCE + file sync client
+│   ├── monitor.rs         # System monitor (CPU/RAM/battery) sampler
 │   ├── widgets/mod.rs     # Lua widget sandbox (drawing, http, images, state)
 │   └── i18n.rs            # Translations (6 languages)
 ├── widgets/               # Bundled example widget scripts (clock, notas, clima, contador)

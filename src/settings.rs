@@ -126,6 +126,11 @@ const ID_EDIT_DROPBOX_APP_SECRET: u16 = 46;
 const ID_EDIT_DROPBOX_REDIRECT: u16 = 43;
 const ID_EDIT_DROPBOX_LOCAL: u16 = 44;
 const ID_EDIT_DROPBOX_REMOTE: u16 = 45;
+const ID_EDIT_GDRIVE_CLIENT_ID: u16 = 47;
+const ID_EDIT_GDRIVE_CLIENT_SECRET: u16 = 48;
+const ID_EDIT_GDRIVE_REDIRECT: u16 = 49;
+const ID_EDIT_GDRIVE_LOCAL: u16 = 50;
+const ID_EDIT_GDRIVE_REMOTE: u16 = 51;
 
 const ID_CHECK_ORGANIZE_FOLDERS: u16 = 101;
 const ID_CHECK_ORGANIZE_START: u16 = 102;
@@ -149,6 +154,7 @@ const ID_CHECK_AUTO_UPDATE: u16 = 161;
 const ID_CHECK_WIDGET_ENABLED: u16 = 170;
 const ID_CHECK_SPOTIFY_ENABLED: u16 = 171;
 const ID_CHECK_DROPBOX_ENABLED: u16 = 172;
+const ID_CHECK_GDRIVE_ENABLED: u16 = 174;
 const ID_CHECK_MONITOR_ENABLED: u16 = 173;
 
 const ID_BTN_NEW: u16 = 201;
@@ -185,6 +191,9 @@ const ID_BTN_SPOTIFY_DISCONNECT: u16 = 229;
 const ID_BTN_DROPBOX_CONNECT: u16 = 230;
 const ID_BTN_DROPBOX_DISCONNECT: u16 = 231;
 const ID_BTN_DROPBOX_SYNC: u16 = 232;
+const ID_BTN_GDRIVE_CONNECT: u16 = 236;
+const ID_BTN_GDRIVE_DISCONNECT: u16 = 237;
+const ID_BTN_GDRIVE_SYNC: u16 = 238;
 
 // ---------------------------------------------------------------------------
 // Resultados asíncronos (hilo de trabajo -> hilo de UI del diálogo).
@@ -220,7 +229,7 @@ const PREVIEW_DEBOUNCE_MS: u32 = 200;
 /// (el OAuth completa en segundo plano mientras el dialogo esta abierto).
 const SPOTIFY_STATUS_TIMER_ID: usize = 0x4E7;
 
-const ALL_EDITS: [u16; 46] = [
+const ALL_EDITS: [u16; 51] = [
     ID_EDIT_MAX_AGE, ID_EDIT_MIN_AGE, ID_EDIT_PURGE, ID_EDIT_R_TITLE, ID_EDIT_R_FOLDER,
     ID_EDIT_R_COLOR, ID_EDIT_R_EXTS, ID_EDIT_R_PATTERNS, ID_EDIT_R_GROUP_TITLE, ID_EDIT_A_BG, ID_EDIT_A_HOVER,
     ID_EDIT_A_BORDER, ID_EDIT_A_TITLE, ID_EDIT_A_TEXT, ID_EDIT_A_MUTED, ID_EDIT_A_SHADOW,
@@ -233,6 +242,7 @@ const ALL_EDITS: [u16; 46] = [
     ID_EDIT_AI_EMBED_MODEL, ID_EDIT_R_AI_DESC, ID_EDIT_WIDGET_NAME,
     ID_EDIT_SPOTIFY_CLIENT_ID, ID_EDIT_SPOTIFY_CLIENT_SECRET, ID_EDIT_SPOTIFY_REDIRECT,
     ID_EDIT_DROPBOX_APP_KEY, ID_EDIT_DROPBOX_APP_SECRET, ID_EDIT_DROPBOX_REDIRECT, ID_EDIT_DROPBOX_LOCAL, ID_EDIT_DROPBOX_REMOTE,
+    ID_EDIT_GDRIVE_CLIENT_ID, ID_EDIT_GDRIVE_CLIENT_SECRET, ID_EDIT_GDRIVE_REDIRECT, ID_EDIT_GDRIVE_LOCAL, ID_EDIT_GDRIVE_REMOTE,
     ID_EDIT_A_MAT_OPACITY, ID_EDIT_A_MAT_TINT,
 ];
 
@@ -300,6 +310,7 @@ enum Panel {
     Widgets,
     Spotify,
     Dropbox,
+    GDrive,
     Monitor,
 }
 
@@ -447,6 +458,7 @@ struct Settings {
     /// Estado de Spotify mostrado en su pestana (se refresca por timer).
     spotify_status: String,
     dropbox_status: String,
+    gdrive_status: String,
 }
 
 const HEADER_H: f32 = 48.0;
@@ -2070,6 +2082,70 @@ impl Settings {
         );
     }
 
+    fn panel_gdrive(&mut self, cy: f32) {
+        let (cx, _, cw, _) = self.content_area();
+        let mut y = cy + 10.0;
+        let tr = self.tr;
+
+        y = self.section(y, cx, cw, tr.sec_gdrive);
+        y = self.check(y, cx, cw, ID_CHECK_GDRIVE_ENABLED, tr.chk_gdrive_enabled);
+
+        y += 6.0;
+        let client_id = self.cfg.gdrive.client_id.clone();
+        y = self.field_row(y, (cx, cw), ID_EDIT_GDRIVE_CLIENT_ID, tr.fld_gdrive_client_id, &client_id, false);
+        let secret = self.cfg.gdrive.client_secret.clone();
+        y = self.field_row(y, (cx, cw), ID_EDIT_GDRIVE_CLIENT_SECRET, tr.fld_gdrive_client_secret, &secret, false);
+        let redirect = self.cfg.gdrive.redirect_uri.clone();
+        y = self.field_row(y, (cx, cw), ID_EDIT_GDRIVE_REDIRECT, tr.fld_gdrive_redirect, &redirect, false);
+        let local = self.cfg.gdrive.local_folder.clone();
+        y = self.folder_row(y, cx, cw, ID_EDIT_GDRIVE_LOCAL, tr.fld_gdrive_local, &local);
+        y += 4.0;
+        let remote = self.cfg.gdrive.remote_folder.clone();
+        y = self.field_row(y, (cx, cw), ID_EDIT_GDRIVE_REMOTE, tr.fld_gdrive_remote, &remote, false);
+
+        // Estado de la sesion (se refresca por timer mientras el dialogo esta abierto).
+        y += 4.0;
+        let status_text = self.gdrive_status.clone();
+        let status_color = if status_text.contains(tr.msg_gdrive_ready) {
+            col(C_ACCENT)
+        } else {
+            col(C_TEXT)
+        };
+        self.text(
+            &status_text,
+            Fmt::Body,
+            D2D_RECT_F {
+                left: cx + 16.0,
+                top: y + 4.0,
+                right: cx + cw - 16.0,
+                bottom: y + 28.0,
+            },
+            status_color,
+        );
+        y += 34.0;
+
+        // Botones Conectar / Desconectar / Sincronizar.
+        let status = self.gdrive_app_status();
+        let connected = status == crate::gdrive::Status::Ready;
+        let configured = status != crate::gdrive::Status::Unconfigured;
+        self.icon_button(Rect { x: cx + 16.0, y, w: 230.0, h: 32.0 }, tr.btn_gdrive_connect, ID_BTN_GDRIVE_CONNECT, configured && !connected);
+        self.icon_button(Rect { x: cx + 256.0, y, w: 150.0, h: 32.0 }, tr.btn_gdrive_disconnect, ID_BTN_GDRIVE_DISCONNECT, connected);
+        self.icon_button(Rect { x: cx + 416.0, y, w: 170.0, h: 32.0 }, tr.btn_gdrive_sync, ID_BTN_GDRIVE_SYNC, connected);
+
+        y += 48.0;
+        self.text(
+            tr.msg_gdrive_note,
+            Fmt::Small,
+            D2D_RECT_F {
+                left: cx + 16.0,
+                top: y,
+                right: cx + cw - 16.0,
+                bottom: y + 40.0,
+            },
+            col(C_DIM),
+        );
+    }
+
     fn panel_monitor(&mut self, cy: f32) {
         let (cx, _, cw, _) = self.content_area();
         let mut y = cy + 10.0;
@@ -2089,6 +2165,35 @@ impl Settings {
             },
             col(C_DIM),
         );
+    }
+
+    /// Estado actual de Google Drive (de la app viva; Unconfigured si no hay app).
+    fn gdrive_app_status(&self) -> crate::gdrive::Status {
+        if self.app.is_null() {
+            return crate::gdrive::Status::Unconfigured;
+        }
+        unsafe { (*self.app).gdrive_status_info().0 }
+    }
+
+    /// Refresca el texto de estado de la pestana Google Drive desde la app.
+    fn gdrive_refresh_status(&mut self) {
+        let (status, detail) = if self.app.is_null() {
+            (crate::gdrive::Status::Unconfigured, String::new())
+        } else {
+            unsafe { (*self.app).gdrive_status_info() }
+        };
+        let s = match status {
+            crate::gdrive::Status::Unconfigured => self.tr.msg_gdrive_unconfigured.to_string(),
+            crate::gdrive::Status::LoggedOut => self.tr.msg_gdrive_loggedout.to_string(),
+            crate::gdrive::Status::Ready => {
+                if detail.is_empty() {
+                    self.tr.msg_gdrive_ready.to_string()
+                } else {
+                    format!("{} — {detail}", self.tr.msg_gdrive_ready)
+                }
+            }
+        };
+        self.gdrive_status = s;
     }
 
     /// Estado actual de Dropbox (de la app viva; Unconfigured si no hay app).
@@ -2498,7 +2603,7 @@ impl Settings {
         let y0 = HEADER_H;
         let h = self.size.1 - HEADER_H - BAR_H;
         self.fill_rr(0.0, y0, SIDEBAR_W, h, 0.0, col(C_SIDEBAR));
-        self.draw_rr(Rect { x: SIDEBAR_W - 1.0, y: y0, w: 1.0, h }, 0.0, rgba(C_CARD_BORDER, 0.6), 1.0);            let items: [(Panel, &'static str); 10] = [
+        self.draw_rr(Rect { x: SIDEBAR_W - 1.0, y: y0, w: 1.0, h }, 0.0, rgba(C_CARD_BORDER, 0.6), 1.0);            let items: [(Panel, &'static str); 11] = [
             (Panel::General, self.tr.nav_general),
             (Panel::Rules, self.tr.nav_rules),
             (Panel::Appearance, self.tr.nav_appearance),
@@ -2508,6 +2613,7 @@ impl Settings {
             (Panel::Widgets, "🧩 Widgets"),
             (Panel::Spotify, self.tr.nav_spotify),
             (Panel::Dropbox, self.tr.nav_dropbox),
+            (Panel::GDrive, self.tr.nav_gdrive),
             (Panel::Monitor, self.tr.nav_monitor),
         ];
         let mut y = y0 + 16.0;
@@ -2844,6 +2950,7 @@ impl Settings {
             Panel::Widgets => self.panel_widgets(scy),
             Panel::Spotify => self.panel_spotify(scy),
             Panel::Dropbox => self.panel_dropbox(scy),
+            Panel::GDrive => self.panel_gdrive(scy),
             Panel::Monitor => self.panel_monitor(scy),
         }
         // Limite de desplazamiento = el punto mas bajo del contenido dibujado.
@@ -3141,6 +3248,19 @@ impl Settings {
                     Ctrl::Btn(ID_BTN_DROPBOX_SYNC),
                 ]);
             }
+            Panel::GDrive => {
+                order.extend([
+                    Ctrl::Check(ID_CHECK_GDRIVE_ENABLED),
+                    Ctrl::Field(ID_EDIT_GDRIVE_CLIENT_ID),
+                    Ctrl::Field(ID_EDIT_GDRIVE_CLIENT_SECRET),
+                    Ctrl::Field(ID_EDIT_GDRIVE_REDIRECT),
+                    Ctrl::Field(ID_EDIT_GDRIVE_LOCAL),
+                    Ctrl::Field(ID_EDIT_GDRIVE_REMOTE),
+                    Ctrl::Btn(ID_BTN_GDRIVE_CONNECT),
+                    Ctrl::Btn(ID_BTN_GDRIVE_DISCONNECT),
+                    Ctrl::Btn(ID_BTN_GDRIVE_SYNC),
+                ]);
+            }
             Panel::Monitor => {
                 order.extend([
                     Ctrl::Check(ID_CHECK_MONITOR_ENABLED),
@@ -3269,6 +3389,9 @@ impl Settings {
                     let redirect = self
                         .edit_text(ID_EDIT_SPOTIFY_REDIRECT)
                         .unwrap_or_else(|| self.cfg.spotify.redirect_uri.clone());
+                    self.cfg.spotify.client_id = id.clone();
+                    self.cfg.spotify.client_secret = secret.clone();
+                    self.cfg.spotify.redirect_uri = redirect.clone();
                     unsafe {
                         (*self.app).spotify_configure(&id, &secret, &redirect);
                         (*self.app).spotify_connect();
@@ -3297,6 +3420,9 @@ impl Settings {
                     let redirect = self
                         .edit_text(ID_EDIT_DROPBOX_REDIRECT)
                         .unwrap_or_else(|| self.cfg.dropbox.redirect_uri.clone());
+                    self.cfg.dropbox.app_key = key.clone();
+                    self.cfg.dropbox.app_secret = secret.clone();
+                    self.cfg.dropbox.redirect_uri = redirect.clone();
                     unsafe {
                         (*self.app).dropbox_configure(&key, &secret, &redirect);
                         (*self.app).dropbox_connect();
@@ -3315,6 +3441,43 @@ impl Settings {
             Ctrl::Btn(ID_BTN_DROPBOX_SYNC) => {
                 if !self.app.is_null() {
                     unsafe { (*self.app).dropbox_sync_now(); }
+                }
+                self.invalidate();
+            }
+            Ctrl::Btn(ID_BTN_GDRIVE_CONNECT) => {
+                // Sincroniza el Client ID / Redirect URI editados con la app
+                // antes de abrir el navegador de autorizacion.
+                if !self.app.is_null() {
+                    let id = self
+                        .edit_text(ID_EDIT_GDRIVE_CLIENT_ID)
+                        .unwrap_or_else(|| self.cfg.gdrive.client_id.clone());
+                    let secret = self
+                        .edit_text(ID_EDIT_GDRIVE_CLIENT_SECRET)
+                        .unwrap_or_else(|| self.cfg.gdrive.client_secret.clone());
+                    let redirect = self
+                        .edit_text(ID_EDIT_GDRIVE_REDIRECT)
+                        .unwrap_or_else(|| self.cfg.gdrive.redirect_uri.clone());
+                    self.cfg.gdrive.client_id = id.clone();
+                    self.cfg.gdrive.client_secret = secret.clone();
+                    self.cfg.gdrive.redirect_uri = redirect.clone();
+                    unsafe {
+                        (*self.app).gdrive_configure(&id, &secret, &redirect);
+                        (*self.app).gdrive_connect();
+                    }
+                }
+                self.gdrive_refresh_status();
+                self.preview_apply();
+            }
+            Ctrl::Btn(ID_BTN_GDRIVE_DISCONNECT) => {
+                if !self.app.is_null() {
+                    unsafe { (*self.app).gdrive_sign_out(); }
+                }
+                self.gdrive_refresh_status();
+                self.invalidate();
+            }
+            Ctrl::Btn(ID_BTN_GDRIVE_SYNC) => {
+                if !self.app.is_null() {
+                    unsafe { (*self.app).gdrive_sync_now(); }
                 }
                 self.invalidate();
             }
@@ -4601,6 +4764,29 @@ impl Settings {
             cfg.dropbox.remote_folder = db_remote;
         }
 
+        // Widget de Google Drive: activacion, Client ID, Secret, Redirect URI y carpetas.
+        cfg.gdrive.enabled = self.checked(ID_CHECK_GDRIVE_ENABLED);
+        let gd_id = text(ID_EDIT_GDRIVE_CLIENT_ID).trim().to_string();
+        if !gd_id.is_empty() {
+            cfg.gdrive.client_id = gd_id;
+        }
+        let gd_secret = text(ID_EDIT_GDRIVE_CLIENT_SECRET).trim().to_string();
+        if !gd_secret.is_empty() {
+            cfg.gdrive.client_secret = gd_secret;
+        }
+        let gd_redirect = text(ID_EDIT_GDRIVE_REDIRECT).trim().to_string();
+        if !gd_redirect.is_empty() {
+            cfg.gdrive.redirect_uri = gd_redirect;
+        }
+        let gd_local = text(ID_EDIT_GDRIVE_LOCAL).trim().to_string();
+        if !gd_local.is_empty() {
+            cfg.gdrive.local_folder = gd_local;
+        }
+        let gd_remote = text(ID_EDIT_GDRIVE_REMOTE).trim().to_string();
+        if !gd_remote.is_empty() {
+            cfg.gdrive.remote_folder = gd_remote;
+        }
+
         // Idioma elegido en el selector.
         cfg.language = self.lang.code().into();
 
@@ -4682,6 +4868,8 @@ impl Settings {
             self.tr.fld_root_folder
         } else if id == ID_EDIT_DROPBOX_LOCAL {
             self.tr.fld_dropbox_local
+        } else if id == ID_EDIT_GDRIVE_LOCAL {
+            self.tr.fld_gdrive_local
         } else {
             self.tr.fld_archive_folder
         };
@@ -5085,6 +5273,11 @@ extern "system" fn dlg_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                     let db_before = state.dropbox_status.clone();
                     state.dropbox_refresh_status();
                     if state.dropbox_status != db_before {
+                        state.invalidate();
+                    }
+                    let gd_before = state.gdrive_status.clone();
+                    state.gdrive_refresh_status();
+                    if state.gdrive_status != gd_before {
                         state.invalidate();
                     }
                 }
@@ -5589,6 +5782,7 @@ pub fn open_dialog(current: &Config, app: *mut App) -> Option<Config> {
             busy_timer: false,
             spotify_status: String::new(),
             dropbox_status: String::new(),
+            gdrive_status: String::new(),
         };
 
         // Limpieza de flags stale: si una operacion quedo en curso al cerrar el
@@ -5890,6 +6084,11 @@ fn seed_edits(s: &Settings) {
         (ID_EDIT_DROPBOX_REDIRECT, s.cfg.dropbox.redirect_uri.clone()),
         (ID_EDIT_DROPBOX_LOCAL, s.cfg.dropbox.local_folder.clone()),
         (ID_EDIT_DROPBOX_REMOTE, s.cfg.dropbox.remote_folder.clone()),
+        (ID_EDIT_GDRIVE_CLIENT_ID, s.cfg.gdrive.client_id.clone()),
+        (ID_EDIT_GDRIVE_CLIENT_SECRET, s.cfg.gdrive.client_secret.clone()),
+        (ID_EDIT_GDRIVE_REDIRECT, s.cfg.gdrive.redirect_uri.clone()),
+        (ID_EDIT_GDRIVE_LOCAL, s.cfg.gdrive.local_folder.clone()),
+        (ID_EDIT_GDRIVE_REMOTE, s.cfg.gdrive.remote_folder.clone()),
     ];
     for (id, value) in rows {
         if let Some(edit) = s.edits.get(&id).copied() {

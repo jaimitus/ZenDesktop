@@ -120,6 +120,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::config::{parse_color, wide, Config, FenceLayout, String32};
 use crate::dropbox;
+use crate::gdrive;
 use crate::i18n::Tr;
 use crate::rules::{self, FenceContent};
 use crate::settings;
@@ -173,21 +174,23 @@ const TIMER_WIDGET: usize = 8;
 /// Pasos de interpolacion por animacion (8 pasos a 10ms = 80ms).
 const ANIM_STEPS: u8 = 16;
 
+/// Un poll de Spotify devolvio una nueva instantanea (portada + pista).
+const WM_ZEN_SPOTIFY_NP: u32 = WM_APP + 0x17;
 /// El navegador devolvio el codigo de autorizacion de Spotify (hilo redirect -> UI).
-const WM_ZEN_SPOTIFY_AUTH: u32 = WM_APP + 0x17;
-/// Nueva instantanea de "now playing" lista (hilo poller -> UI).
-const WM_ZEN_SPOTIFY_NP: u32 = WM_APP + 0x18;
+const WM_ZEN_SPOTIFY_AUTH: u32 = WM_APP + 0x18;
 /// Cola de reproduccion lista (hilo de trabajo -> UI).
 const WM_ZEN_SPOTIFY_QUEUE: u32 = WM_APP + 0x19;
 
 /// Codigo de autorizacion capturado por el listener de redireccion local.
 static SPOTIFY_AUTH_CODE: Mutex<Option<String>> = Mutex::new(None);
-/// Ultima instantanea de reproduccion (incluye la portada decodificada).
-static SPOTIFY_SNAPSHOT: Mutex<Option<SpotifySnapshot>> = Mutex::new(None);
+/// Ultima instantanea de reproduccion (incluye la portada decodificada, None = sin reproduccion activa).
+static SPOTIFY_SNAPSHOT: Mutex<Option<Option<SpotifySnapshot>>> = Mutex::new(None);
 /// Evita lanzar varios polls de "now playing" a la vez.
 static SPOTIFY_POLLING: AtomicBool = AtomicBool::new(false);
 /// URL de la ultima portada descargada (evita re-descargar la misma imagen).
 static SPOTIFY_LAST_COVER: Mutex<Option<String>> = Mutex::new(None);
+/// Ultimo error del poll de "now playing" (para mostrarlo en el widget).
+static SPOTIFY_LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
 /// Cola de reproduccion: (context_uri, siguientes pistas).
 static SPOTIFY_QUEUE: Mutex<Option<(String, Vec<spotify::QueueItem>)>> = Mutex::new(None);
 
@@ -221,6 +224,35 @@ static DROPBOX_UPLOADED: Mutex<Option<(usize, usize)>> = Mutex::new(None);
 /// Paths soltados sobre la caja Dropbox durante un drag OLE interno (se
 /// procesan en WM_ZEN_DRAG_DONE, cuando el bucle de DoDragDrop ha terminado).
 static DROPBOX_PENDING_UPLOAD: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// El navegador devolvio el codigo de autorizacion de Google Drive (hilo redirect -> UI).
+const WM_ZEN_GDRIVE_AUTH: u32 = WM_APP + 0x23;
+/// Un listado de carpeta remota llego del hilo de trabajo (para refrescar la
+/// vista de archivos de la caja Google Drive).
+const WM_ZEN_GDRIVE_FILES: u32 = WM_APP + 0x24;
+/// Termino una pasada de sincronizacion local <-> remoto (reporte -> UI).
+const WM_ZEN_GDRIVE_SYNC: u32 = WM_APP + 0x25;
+/// Un archivo remoto se descargo para abrirse (ruta local -> UI).
+const WM_ZEN_GDRIVE_OPEN: u32 = WM_APP + 0x26;
+/// Termino una subida de archivos sueltos dentro de la caja Google Drive.
+const WM_ZEN_GDRIVE_UPLOADED: u32 = WM_APP + 0x27;
+/// Hay ficheros encolados en GDRIVE_PENDING_UPLOAD listos para subir.
+const WM_ZEN_GDRIVE_UPLOAD_PENDING: u32 = WM_APP + 0x28;
+
+/// Codigo de autorizacion capturado por el listener de redireccion local.
+static GDRIVE_AUTH_CODE: Mutex<Option<String>> = Mutex::new(None);
+/// Ultimo listado de la carpeta remota (hilo -> UI).
+static GDRIVE_FILES: Mutex<Option<Vec<gdrive::GDriveEntry>>> = Mutex::new(None);
+/// Ultimo reporte de sincronizacion (hilo -> UI).
+static GDRIVE_SYNC: Mutex<Option<gdrive::SyncReport>> = Mutex::new(None);
+/// Evita lanzar varias syncs a la vez.
+static GDRIVE_SYNCING: AtomicBool = AtomicBool::new(false);
+/// Archivo descargado para abrir: (ruta local, ok).
+static GDRIVE_OPEN: Mutex<Option<(PathBuf, bool)>> = Mutex::new(None);
+/// Ultima subida por drop: (subidos, total).
+static GDRIVE_UPLOADED: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+/// Cola de rutas pendientes de subir dejadas caer sobre la caja Google Drive.
+static GDRIVE_PENDING_UPLOAD: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 /// Identificador del atajo global Ctrl+Alt+Z ("ZE" en ASCII).
 const HOTKEY_ID: i32 = 0x5A45;
 /// Identificador unico del icono de bandeja ("ZD" en ASCII).
@@ -1413,6 +1445,93 @@ fn dropbox_file_icon(name: &str, is_dir: bool) -> (&'static str, D2D1_COLOR_F) {
     }
 }
 
+/// Boton de cerrar sesion (⏻) en la cabecera del widget Google Drive.
+fn gdrive_logout_rect(w: f32, header_dip: f32) -> D2D_RECT_F {
+    let s = 22.0;
+    D2D_RECT_F {
+        left: w - s - 10.0,
+        top: (header_dip - s) * 0.5,
+        right: w - 10.0,
+        bottom: (header_dip - s) * 0.5 + s,
+    }
+}
+
+/// Boton "Subir nivel" (⬆) en la cabecera del widget Google Drive.
+fn gdrive_header_up_rect(w: f32, header_dip: f32) -> D2D_RECT_F {
+    let s = 22.0;
+    D2D_RECT_F {
+        left: w - s * 2.0 - 10.0 - 6.0,
+        top: (header_dip - s) * 0.5,
+        right: w - s - 10.0 - 6.0,
+        bottom: (header_dip - s) * 0.5 + s,
+    }
+}
+
+/// Boton central de iniciar sesion para el widget Google Drive.
+fn gdrive_connect_rect(w: f32, h: f32) -> D2D_RECT_F {
+    let bw = 160.0_f32.min(w - 24.0);
+    let btn_y = (h * 0.5 + 24.0).min(h - 44.0).max(h * 0.5);
+    D2D_RECT_F {
+        left: (w - bw) * 0.5,
+        top: btn_y,
+        right: (w + bw) * 0.5,
+        bottom: btn_y + 32.0,
+    }
+}
+
+/// Boton "Sincronizar" en el pie del widget Google Drive.
+fn gdrive_sync_btn_rect(w: f32, h: f32) -> D2D_RECT_F {
+    let bw = 104.0;
+    D2D_RECT_F {
+        left: w - bw - 10.0,
+        top: h - 34.0,
+        right: w - 10.0,
+        bottom: h - 8.0,
+    }
+}
+
+/// Boton "Subir nivel / Arriba" (⬆) en el pie del widget Google Drive.
+fn gdrive_upload_btn_rect(w: f32, h: f32) -> D2D_RECT_F {
+    let bw = 32.0;
+    let sync_r = gdrive_sync_btn_rect(w, h);
+    D2D_RECT_F {
+        left: sync_r.left - bw - 6.0,
+        top: h - 34.0,
+        right: sync_r.left - 6.0,
+        bottom: h - 8.0,
+    }
+}
+
+/// Icono temático y color según extensión/MIME para archivos de Google Drive.
+fn gdrive_file_icon(name: &str, is_dir: bool, mime: &str) -> (&'static str, D2D1_COLOR_F) {
+    if is_dir {
+        return ("📁", argb_color(0xFFFBBC05)); // Google Amber
+    }
+    if mime.contains("document") || mime.contains("word") {
+        return ("📝", argb_color(0xFF4285F4)); // Google Docs Blue
+    }
+    if mime.contains("spreadsheet") || mime.contains("excel") || mime.contains("sheet") {
+        return ("📊", argb_color(0xFF34A853)); // Google Sheets Green
+    }
+    if mime.contains("presentation") || mime.contains("powerpoint") {
+        return ("📑", argb_color(0xFFEA4335)); // Google Slides Red
+    }
+    let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg" | "ico" => ("🖼", argb_color(0xFF38BDF8)),
+        "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" => ("🎵", argb_color(0xFF10B981)),
+        "mp4" | "mkv" | "avi" | "mov" | "webm" => ("🎬", argb_color(0xFFF43F5E)),
+        "pdf" => ("📕", argb_color(0xFFEF4444)),
+        "doc" | "docx" | "txt" | "md" | "rtf" => ("📝", argb_color(0xFF60A5FA)),
+        "xls" | "xlsx" | "csv" => ("📊", argb_color(0xFF34D399)),
+        "ppt" | "pptx" => ("📙", argb_color(0xFFFB923C)),
+        "zip" | "rar" | "7z" | "tar" | "gz" => ("📦", argb_color(0xFFA78BFA)),
+        "rs" | "js" | "ts" | "py" | "c" | "cpp" | "cs" | "html" | "css" | "json" | "toml" => ("💻", argb_color(0xFF818CF8)),
+        "exe" | "msi" | "bat" | "cmd" | "ps1" => ("⚙", argb_color(0xFF94A3B8)),
+        _ => ("📄", argb_color(0xFF94A3B8)),
+    }
+}
+
 /// Descarga y decodifica la portada (JPEG) a BGRA opaco.
 /// Logo de Spotify (PNG embebido en el binario) decodificado y redimensionado
 /// una sola vez a 128px (BGRA premultiplicado), para el estado vacio del widget.
@@ -1488,10 +1607,21 @@ fn download_cover(url: &str) -> Option<CoverData> {
 /// hilo de trabajo (nunca en el hilo de interfaz). `controller` es el valor
 /// crudo del HWND (los handles no son `Send`).
 fn fetch_spotify_and_post(sp: spotify::Spotify, controller: isize) {
-    let np = sp.now_playing().ok().flatten();
+    let np = match sp.now_playing() {
+        Ok(np) => {
+            *SPOTIFY_LAST_ERROR.lock().unwrap() = None;
+            np
+        }
+        Err(e) => {
+            *SPOTIFY_LAST_ERROR.lock().unwrap() = Some(e);
+            *SPOTIFY_SNAPSHOT.lock().unwrap() = None;
+            let _ = unsafe { PostMessageW(HWND(controller as *mut c_void), WM_ZEN_SPOTIFY_NP, WPARAM(0), LPARAM(0)) };
+            return;
+        }
+    };
     // El endpoint `currently-playing` no incluye el device: el volumen y el
     // nombre del dispositivo se consultan aparte (siempre que haya sesion).
-    let device = sp.active_device();
+    let device = if np.is_some() { sp.active_device() } else { None };
     let snapshot = np.map(|mut n| {
         if let Some((vol, name)) = device {
             n.volume_percent = vol;
@@ -1509,7 +1639,7 @@ fn fetch_spotify_and_post(sp: spotify::Spotify, controller: isize) {
         };
         SpotifySnapshot { cover, np: n }
     });
-    *SPOTIFY_SNAPSHOT.lock().unwrap() = snapshot;
+    *SPOTIFY_SNAPSHOT.lock().unwrap() = Some(snapshot);
     let _ = unsafe { PostMessageW(HWND(controller as *mut c_void), WM_ZEN_SPOTIFY_NP, WPARAM(0), LPARAM(0)) };
 }
 
@@ -1589,7 +1719,7 @@ fn run_dropbox_sync(db: dropbox::Dropbox, local: PathBuf, remote: String, contro
     });
 }
 
-/// Escucha UNA conexion en 127.0.0.1:<puerto de la redirect URI> (la
+/// Escucha conexiones en 127.0.0.1:<puerto de la redirect URI> (la
 /// redireccion del navegador), extrae el codigo y lo entrega a la UI.
 fn start_dropbox_redirect(port: u16, controller: isize) {
     thread::spawn(move || {
@@ -1597,29 +1727,85 @@ fn start_dropbox_redirect(port: u16, controller: isize) {
             Ok(l) => l,
             Err(_) => return,
         };
-        let Ok((mut stream, _)) = listener.accept() else { return };
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-        let mut buf = [0u8; 4096];
-        let Ok(n) = stream.read(&mut buf) else { return };
-        let req = String::from_utf8_lossy(&buf[..n]);
-        let code = parse_code_from_request(&req);
-        let (status, html) = match &code {
-            Some(_) => ("200 OK", "ZenDesktop: ya puedes cerrar esta pestaña."),
-            None => ("400 Bad Request", "No se pudo completar la autorización."),
-        };
-        let body = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
-            html.len()
-        );
-        let _ = stream.write_all(body.as_bytes());
-        if let Some(code) = code {
-            *DROPBOX_AUTH_CODE.lock().unwrap() = Some(code);
-            let _ = unsafe { PostMessageW(HWND(controller as *mut c_void), WM_ZEN_DROPBOX_AUTH, WPARAM(0), LPARAM(0)) };
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut buf = [0u8; 4096];
+            let Ok(n) = stream.read(&mut buf) else { continue };
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let code = parse_code_from_request(&req);
+            if let Some(code) = code {
+                let html = "ZenDesktop: ya puedes cerrar esta pestaña.";
+                let body = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+                    html.len()
+                );
+                let _ = stream.write_all(body.as_bytes());
+                *DROPBOX_AUTH_CODE.lock().unwrap() = Some(code);
+                let _ = unsafe { PostMessageW(HWND(controller as *mut c_void), WM_ZEN_DROPBOX_AUTH, WPARAM(0), LPARAM(0)) };
+                break;
+            } else if req.starts_with("GET /favicon") {
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
         }
     });
 }
 
-/// Escucha UNA conexion en 127.0.0.1:<puerto de la redirect URI> (la
+/// Consulta el listado de la carpeta remota de Google Drive en un hilo y publica el resultado.
+fn fetch_gdrive_files(gd: gdrive::GDrive, folder_id: String, controller: isize) {
+    thread::spawn(move || {
+        let entries = gd.list_folder(&folder_id).ok();
+        *GDRIVE_FILES.lock().unwrap() = entries;
+        let _ = unsafe { PostMessageW(HWND(controller as *mut c_void), WM_ZEN_GDRIVE_FILES, WPARAM(0), LPARAM(0)) };
+    });
+}
+
+/// Ejecuta una pasada de sincronizacion local <-> Google Drive en un hilo.
+fn run_gdrive_sync(gd: gdrive::GDrive, local: PathBuf, remote: String, controller: isize) {
+    if GDRIVE_SYNCING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    thread::spawn(move || {
+        let report = gd.sync_folder(&local, &remote);
+        *GDRIVE_SYNC.lock().unwrap() = Some(report);
+        GDRIVE_SYNCING.store(false, Ordering::SeqCst);
+        let _ = unsafe { PostMessageW(HWND(controller as *mut c_void), WM_ZEN_GDRIVE_SYNC, WPARAM(0), LPARAM(0)) };
+    });
+}
+
+/// Escucha conexiones en 127.0.0.1:<puerto de la redirect URI> (la
+/// redireccion del navegador de Google Drive), extrae el codigo y lo entrega a la UI.
+fn start_gdrive_redirect(port: u16, controller: isize) {
+    thread::spawn(move || {
+        let listener = match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut buf = [0u8; 4096];
+            let Ok(n) = stream.read(&mut buf) else { continue };
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let code = parse_code_from_request(&req);
+            if let Some(code) = code {
+                let html = "ZenDesktop: ya puedes cerrar esta pestaña.";
+                let body = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+                    html.len()
+                );
+                let _ = stream.write_all(body.as_bytes());
+                *GDRIVE_AUTH_CODE.lock().unwrap() = Some(code);
+                let _ = unsafe { PostMessageW(HWND(controller as *mut c_void), WM_ZEN_GDRIVE_AUTH, WPARAM(0), LPARAM(0)) };
+                break;
+            } else if req.starts_with("GET /favicon") {
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        }
+    });
+}
+
+/// Escucha conexiones en 127.0.0.1:<puerto de la redirect URI> (la
 /// redireccion del navegador), extrae el codigo y lo entrega a la UI.
 fn start_spotify_redirect(port: u16, controller: isize) {
     thread::spawn(move || {
@@ -1627,24 +1813,26 @@ fn start_spotify_redirect(port: u16, controller: isize) {
             Ok(l) => l,
             Err(_) => return,
         };
-        let Ok((mut stream, _)) = listener.accept() else { return };
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-        let mut buf = [0u8; 4096];
-        let Ok(n) = stream.read(&mut buf) else { return };
-        let req = String::from_utf8_lossy(&buf[..n]);
-        let code = parse_code_from_request(&req);
-        let (status, html) = match &code {
-            Some(_) => ("200 OK", "ZenDesktop: ya puedes cerrar esta pestaña."),
-            None => ("400 Bad Request", "No se pudo completar la autorización."),
-        };
-        let body = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
-            html.len()
-        );
-        let _ = stream.write_all(body.as_bytes());
-        if let Some(code) = code {
-            *SPOTIFY_AUTH_CODE.lock().unwrap() = Some(code);
-            let _ = unsafe { PostMessageW(HWND(controller as *mut c_void), WM_ZEN_SPOTIFY_AUTH, WPARAM(0), LPARAM(0)) };
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut buf = [0u8; 4096];
+            let Ok(n) = stream.read(&mut buf) else { continue };
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let code = parse_code_from_request(&req);
+            if let Some(code) = code {
+                let html = "ZenDesktop: ya puedes cerrar esta pestaña.";
+                let body = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+                    html.len()
+                );
+                let _ = stream.write_all(body.as_bytes());
+                *SPOTIFY_AUTH_CODE.lock().unwrap() = Some(code);
+                let _ = unsafe { PostMessageW(HWND(controller as *mut c_void), WM_ZEN_SPOTIFY_AUTH, WPARAM(0), LPARAM(0)) };
+                break;
+            } else if req.starts_with("GET /favicon") {
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
         }
     });
 }
@@ -1659,6 +1847,9 @@ enum DragMode {
     /// Arrastre de un archivo remoto de Dropbox: hay que descargarlo a
     /// una ruta local (temp) antes de lanzar el DoDragDrop OLE.
     DropboxDrag { start_x: i32, start_y: i32 },
+    /// Arrastre de un archivo remoto de Google Drive: hay que descargarlo a
+    /// una ruta local (temp) antes de lanzar el DoDragDrop OLE.
+    GDriveDrag { start_x: i32, start_y: i32 },
 }
 
 struct FenceTab {
@@ -1945,8 +2136,28 @@ pub struct App {
     dropbox_path: String,
     /// Indice (dentro de dropbox_files) del item seleccionado con un clic.
     dropbox_selected: Option<usize>,
+    /// Backend del widget de Google Drive (PKCE + sync).
+    gdrive: gdrive::GDrive,
+    /// Ultimo listado de la carpeta remota (para pintar la caja Google Drive).
+    gdrive_files: Vec<gdrive::GDriveEntry>,
+    /// Email de la cuenta de Google Drive conectada.
+    gdrive_email: Option<String>,
+    /// Texto de estado de la ultima sincronizacion de Google Drive.
+    gdrive_sync_note: String,
+    /// Marca de tiempo (ms) del ultimo listado remoto de Google Drive (throttling).
+    gdrive_last_poll: u64,
+    /// Desplazamiento (en filas) de la lista de archivos de Google Drive.
+    gdrive_scroll: i32,
+    /// ID de la carpeta remota en la que se esta navegando ('root' o ID).
+    gdrive_folder_id: String,
+    /// Pila de navegacion de carpetas: (id, nombre).
+    gdrive_folder_stack: Vec<(String, String)>,
+    /// Indice (dentro de gdrive_files) del item seleccionado.
+    gdrive_selected: Option<usize>,
     /// Ultima reproduccion conocida (para pintar el widget nativo).
     spotify_np: Option<spotify::NowPlaying>,
+    /// Ultimo error del poll de Spotify (para mostrarlo en el widget).
+    spotify_err: Option<String>,
     /// Portada decodificada de la ultima reproduccion conocida.
     spotify_cover: Option<CoverData>,
     /// Marca de tiempo (ms) del ultimo poll de "now playing" (para throttling).
@@ -2126,6 +2337,14 @@ impl App {
                 .unwrap_or_else(|| PathBuf::from("dropbox.json"));
             let mut dropbox = dropbox::Dropbox::new(cfg.dropbox.app_key.clone(), dropbox_store);
             dropbox.set_redirect_uri(cfg.dropbox.redirect_uri.clone());
+            // Tokens de Google Drive viven junto a la config (no en config.toml).
+            let gdrive_store = cfg_path
+                .parent()
+                .map(|p| p.join("gdrive.json"))
+                .unwrap_or_else(|| PathBuf::from("gdrive.json"));
+            let mut gdrive = gdrive::GDrive::new(cfg.gdrive.client_id.clone(), gdrive_store);
+            gdrive.set_client_secret(cfg.gdrive.client_secret.clone());
+            gdrive.set_redirect_uri(cfg.gdrive.redirect_uri.clone());
 
             let mut app = Box::new(App {
                 cfg,
@@ -2187,7 +2406,17 @@ impl App {
                 dropbox_scroll: 0,
                 dropbox_path: String::new(),
                 dropbox_selected: None,
+                gdrive,
+                gdrive_files: Vec::new(),
+                gdrive_email: None,
+                gdrive_sync_note: String::new(),
+                gdrive_last_poll: 0,
+                gdrive_scroll: 0,
+                gdrive_folder_id: String::new(),
+                gdrive_folder_stack: Vec::new(),
+                gdrive_selected: None,
                 spotify_np: None,
+                spotify_err: None,
                 spotify_cover: None,
                 spotify_last_poll: 0,
                 spotify_volume_drag: false,
@@ -2238,6 +2467,8 @@ impl App {
             (*ptr).ensure_spotify_fence();
             // La caja del widget de Dropbox se crea al arrancar si esta activado.
             (*ptr).ensure_dropbox_fence();
+            // La caja del widget de Google Drive se crea al arrancar si esta activado.
+            (*ptr).ensure_gdrive_fence();
             // La caja del widget de monitor se crea al arrancar si esta activado.
             (*ptr).ensure_monitor_fence();
             (*ptr).build_fences()?;
@@ -2678,9 +2909,13 @@ impl App {
                 paths.push(PathBuf::from(String::from_utf16_lossy(&buf[..n as usize])));
             }
         }
-        // Widget Dropbox: soltar dentro sube los archivos a la carpeta remota.
+        // Widget Dropbox / Google Drive: soltar dentro sube los archivos a la carpeta remota.
         if self.fences.get(index).and_then(|f| f.layout.widget.clone()).as_deref() == Some("dropbox") {
             self.dropbox_upload_paths(paths);
+            return;
+        }
+        if self.fences.get(index).and_then(|f| f.layout.widget.clone()).as_deref() == Some("gdrive") {
+            self.gdrive_upload_paths(paths);
             return;
         }
         self.accept_drop(index, paths);
@@ -4022,12 +4257,15 @@ impl App {
     /// script Lua. Reutiliza la misma superficie DIB que una caja normal.
     fn render_widget_fence(&mut self, index: usize) -> WinResult<()> {
         let widget_name = self.fences[index].layout.widget.clone().unwrap_or_default();
-        // Los widgets nativos (Spotify / Dropbox) se pintan sin Lua.
+        // Los widgets nativos (Spotify / Dropbox / Google Drive / Monitor) se pintan sin Lua.
         if widget_name == "spotify" {
             return self.render_spotify_fence(index);
         }
         if widget_name == "dropbox" {
             return self.render_dropbox_fence(index);
+        }
+        if widget_name == "gdrive" {
+            return self.render_gdrive_fence(index);
         }
         if widget_name == "monitor" {
             return self.render_monitor_fence(index);
@@ -4308,6 +4546,7 @@ impl App {
     fn widget_tick(&mut self) {
         self.spotify_tick();
         self.dropbox_tick();
+        self.gdrive_tick();
         let indices: Vec<usize> = self
             .fences
             .iter()
@@ -4326,7 +4565,10 @@ impl App {
         self.fences.iter().any(|f| f.layout.widget.as_deref() == Some("spotify"))
     }
 
-    /// Poll de "now playing" con throttle (3s) mientras el widget este visible.
+    /// Poll de "now playing" con throttle (30s) mientras el widget este visible.
+    /// Se usa un intervalo amplio porque los endpoints de reproduccion de la
+    /// Web API cuentan contra la cuota de las apps en modo desarrollo (429
+    /// QUOTA_EXCEEDED); 3s agotaba la cuota en unas horas de uso.
     fn spotify_tick(&mut self) {
         if !self.spotify_present() {
             return;
@@ -4338,7 +4580,7 @@ impl App {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        if now.saturating_sub(self.spotify_last_poll) < 3000 {
+        if now.saturating_sub(self.spotify_last_poll) < 30_000 {
             return;
         }
         self.spotify_last_poll = now;
@@ -4533,11 +4775,22 @@ impl App {
 
     /// Copia la instantanea del poller a la app y repinta.
     fn spotify_apply_snapshot(&mut self) {
-        if let Some(snap) = SPOTIFY_SNAPSHOT.lock().unwrap().take() {
-            self.spotify_np = Some(snap.np);
-            // La portada solo llega cuando cambia (None = conservar la actual).
-            if let Some(c) = snap.cover {
-                self.spotify_cover = Some(c);
+        // Refleja el ultimo error del poll para que el widget lo muestre.
+        self.spotify_err = SPOTIFY_LAST_ERROR.lock().unwrap().clone();
+        if let Some(snap_opt) = SPOTIFY_SNAPSHOT.lock().unwrap().take() {
+            match snap_opt {
+                Some(snap) => {
+                    self.spotify_np = Some(snap.np);
+                    // La portada solo llega cuando cambia (None = conservar la actual).
+                    if let Some(c) = snap.cover {
+                        self.spotify_cover = Some(c);
+                    }
+                }
+                None => {
+                    self.spotify_np = None;
+                    self.spotify_cover = None;
+                    *SPOTIFY_LAST_COVER.lock().unwrap() = None;
+                }
             }
         }
         self.render_all();
@@ -4836,6 +5089,285 @@ impl App {
         }
         self.dropbox_sync_note = note;
         self.render_all();
+    }
+
+    // ---------------------------------------------------------------------
+    // Widget de Google Drive (nativo)
+    // ---------------------------------------------------------------------
+
+    /// true si la caja del widget Google Drive existe en el escritorio.
+    fn gdrive_present(&self) -> bool {
+        self.fences.iter().any(|f| f.layout.widget.as_deref() == Some("gdrive"))
+    }
+
+    /// Asegura la existencia de la caja del widget de Google Drive segun `cfg.gdrive.enabled`.
+    fn ensure_gdrive_fence(&mut self) {
+        let has_box = self
+            .cfg
+            .fences
+            .iter()
+            .any(|f| f.widget.as_deref() == Some("gdrive"));
+        if self.cfg.gdrive.enabled && !has_box {
+            let n = self.cfg.fences.iter().filter(|f| f.widget.is_some()).count() as i32;
+            self.cfg.fences.push(FenceLayout {
+                id: String32::new("widget:gdrive"),
+                x: 180 + n * 32,
+                y: 180 + n * 32,
+                width: 320,
+                height: 280,
+                widget: Some("gdrive".into()),
+                ..Default::default()
+            });
+        } else if !self.cfg.gdrive.enabled {
+            self.cfg.fences.retain(|f| f.widget.as_deref() != Some("gdrive"));
+        }
+    }
+
+    /// ID de la carpeta actual donde se esta listando ('root' o id especifico).
+    fn gdrive_current_folder_id(&self) -> String {
+        if self.gdrive_folder_id.trim().is_empty() {
+            if self.cfg.gdrive.remote_folder.trim().is_empty() {
+                "root".to_string()
+            } else {
+                self.cfg.gdrive.remote_folder.clone()
+            }
+        } else {
+            self.gdrive_folder_id.clone()
+        }
+    }
+
+    /// Nombre de la ruta/migas de pan actual para mostrar en la cabecera.
+    fn gdrive_path_display(&self) -> String {
+        if self.gdrive_folder_stack.is_empty() {
+            "Mi Unidad".to_string()
+        } else {
+            let names: Vec<&str> = self.gdrive_folder_stack.iter().map(|(_, n)| n.as_str()).collect();
+            format!("Mi Unidad / {}", names.join(" / "))
+        }
+    }
+
+    /// Navega dentro de una carpeta y re-lista su contenido.
+    fn gdrive_navigate(&mut self, folder_id: String, folder_name: String) {
+        self.gdrive_folder_stack.push((folder_id.clone(), folder_name));
+        self.gdrive_folder_id = folder_id;
+        self.gdrive_scroll = 0;
+        self.gdrive_selected = None;
+        let gd = self.gdrive.clone();
+        let fid = self.gdrive_current_folder_id();
+        fetch_gdrive_files(gd, fid, self.controller.0 as isize);
+    }
+
+    /// Sube un nivel en la navegacion hacia la carpeta padre o 'root'.
+    fn gdrive_navigate_up(&mut self) {
+        self.gdrive_folder_stack.pop();
+        let target = self.gdrive_folder_stack.last().map(|(id, _)| id.clone()).unwrap_or_else(|| "root".to_string());
+        self.gdrive_folder_id = target;
+        self.gdrive_scroll = 0;
+        self.gdrive_selected = None;
+        let gd = self.gdrive.clone();
+        let fid = self.gdrive_current_folder_id();
+        fetch_gdrive_files(gd, fid, self.controller.0 as isize);
+    }
+
+    /// Abre una entrada de Google Drive: si es carpeta, navega; si es archivo,
+    /// se descarga a temp/local y se abre.
+    fn gdrive_open_entry(&mut self, entry: gdrive::GDriveEntry) {
+        if entry.is_dir {
+            self.gdrive_navigate(entry.id, entry.name);
+            return;
+        }
+        if self.gdrive.status() != gdrive::Status::Ready {
+            return;
+        }
+        let gd = self.gdrive.clone();
+        let local_root = self.cfg.gdrive.local_folder.clone();
+        let controller = self.controller.0 as isize;
+        let file_id = entry.id.clone();
+        let file_name = entry.name.clone();
+        thread::spawn(move || {
+            let dest = if local_root.trim().is_empty() {
+                std::env::temp_dir().join("zendesktop_gdrive").join(&file_name)
+            } else {
+                PathBuf::from(local_root).join(&file_name)
+            };
+            let ok = gd.download(&file_id, &dest).is_ok();
+            *GDRIVE_OPEN.lock().unwrap() = Some((dest, ok));
+            let _ = unsafe { PostMessageW(HWND(controller as *mut c_void), WM_ZEN_GDRIVE_OPEN, WPARAM(0), LPARAM(0)) };
+        });
+    }
+
+    /// Abre el archivo descargado de Google Drive.
+    fn gdrive_apply_open(&mut self) {
+        if let Some((path, ok)) = GDRIVE_OPEN.lock().unwrap().take() {
+            if ok {
+                self.open_item(&path);
+            } else {
+                self.gdrive_sync_note = "⚠ descarga fallida".into();
+            }
+        }
+        self.render_all();
+    }
+
+    /// Descarga temporal para drag OLE.
+    fn gdrive_download_for_drag(&self, entry: &gdrive::GDriveEntry) -> Option<PathBuf> {
+        if self.gdrive.status() != gdrive::Status::Ready {
+            return None;
+        }
+        let dest = std::env::temp_dir().join("zendesktop_gdrive_drag").join(&entry.name);
+        self.gdrive.download(&entry.id, &dest).ok()?;
+        Some(dest)
+    }
+
+    /// Sube archivos a la carpeta actual de Google Drive.
+    fn gdrive_upload_paths(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() || self.gdrive.status() != gdrive::Status::Ready {
+            return;
+        }
+        self.gdrive_sync_note = "↑ …".into();
+        self.render_all();
+        let gd = self.gdrive.clone();
+        let parent_id = self.gdrive_current_folder_id();
+        let controller = self.controller.0 as isize;
+        thread::spawn(move || {
+            let total = paths.len();
+            let mut ok = 0;
+            for p in &paths {
+                if gd.upload(p, &parent_id).is_ok() {
+                    ok += 1;
+                }
+            }
+            *GDRIVE_UPLOADED.lock().unwrap() = Some((ok, total));
+            let _ = unsafe { PostMessageW(HWND(controller as *mut c_void), WM_ZEN_GDRIVE_UPLOADED, WPARAM(0), LPARAM(0)) };
+        });
+    }
+
+    /// Copia el resultado de la subida a la app y refresca la lista.
+    fn gdrive_apply_uploaded(&mut self) {
+        if let Some((ok, total)) = GDRIVE_UPLOADED.lock().unwrap().take() {
+            self.gdrive_sync_note = if ok == total {
+                format!("↑ {ok} subido(s)")
+            } else {
+                format!("↑ {ok}/{total} subido(s)")
+            };
+            if ok > 0 {
+                let gd = self.gdrive.clone();
+                let fid = self.gdrive_current_folder_id();
+                fetch_gdrive_files(gd, fid, self.controller.0 as isize);
+            }
+        }
+        self.render_all();
+    }
+
+    /// Reconsulta el listado de Google Drive con throttle de 5s.
+    fn gdrive_tick(&mut self) {
+        if !self.gdrive_present() {
+            return;
+        }
+        if self.gdrive.status() != gdrive::Status::Ready {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if now.saturating_sub(self.gdrive_last_poll) < 5000 {
+            return;
+        }
+        self.gdrive_last_poll = now;
+        let gd = self.gdrive.clone();
+        let fid = self.gdrive_current_folder_id();
+        fetch_gdrive_files(gd, fid, self.controller.0 as isize);
+    }
+
+    /// Lanza sincronizacion manual local <-> Google Drive.
+    pub(crate) fn gdrive_sync_now(&mut self) {
+        if self.gdrive.status() != gdrive::Status::Ready {
+            return;
+        }
+        self.gdrive_sync_note = "…".into();
+        self.render_all();
+        let gd = self.gdrive.clone();
+        let local = if self.cfg.gdrive.local_folder.trim().is_empty() {
+            self.desktop.join("ZenGoogleDrive")
+        } else {
+            PathBuf::from(&self.cfg.gdrive.local_folder)
+        };
+        let remote = self.gdrive_current_folder_id();
+        run_gdrive_sync(gd, local, remote, self.controller.0 as isize);
+    }
+
+    /// Aplica el resultado del listado remoto recibido del hilo.
+    fn gdrive_apply_files(&mut self) {
+        if let Some(files) = GDRIVE_FILES.lock().unwrap().take() {
+            self.gdrive_files = files;
+            if self.gdrive_sync_note == "…" {
+                self.gdrive_sync_note = self.tr.msg_gdrive_synced.to_string();
+            }
+        }
+        if self.gdrive_selected.is_some_and(|s| s >= self.gdrive_files.len()) {
+            self.gdrive_selected = None;
+        }
+        if self.gdrive_email.is_none() && self.gdrive.status() == gdrive::Status::Ready {
+            let gd = self.gdrive.clone();
+            self.gdrive_email = gd.account_email();
+        }
+        self.render_all();
+    }
+
+    /// Aplica el reporte de sincronizacion recibido del hilo.
+    fn gdrive_apply_sync(&mut self) {
+        let tr = self.tr;
+        let mut note = String::new();
+        if let Some(r) = GDRIVE_SYNC.lock().unwrap().take() {
+            if !r.downloaded.is_empty() || !r.uploaded.is_empty() {
+                let dl = r.downloaded.len();
+                let ul = r.uploaded.len();
+                note = format!("↓ {dl} · ↑ {ul}");
+            } else if !r.errors.is_empty() {
+                note = format!("⚠ {}", r.errors.first().unwrap_or(&String::new()));
+            } else {
+                note = tr.msg_gdrive_synced.into();
+            }
+        }
+        self.gdrive_sync_note = note;
+        self.render_all();
+    }
+
+    /// Configura credenciales de Google Drive.
+    pub(crate) fn gdrive_configure(&mut self, client_id: &str, client_secret: &str, redirect_uri: &str) {
+        self.gdrive.set_client_id(client_id.to_string());
+        self.gdrive.set_client_secret(client_secret.to_string());
+        self.gdrive.set_redirect_uri(redirect_uri.to_string());
+    }
+
+    /// Inicia el flujo OAuth PKCE abriendo el navegador.
+    pub(crate) fn gdrive_connect(&mut self) {
+        let Ok(url) = self.gdrive.authorize_url() else { return };
+        let wurl = wide(&url);
+        unsafe {
+            let _ = ShellExecuteW(None, w!("open"), PCWSTR(wurl.as_ptr()), None, None, SW_SHOWNORMAL);
+        }
+        let port = gdrive::redirect_port(self.gdrive.redirect_uri());
+        start_gdrive_redirect(port, self.controller.0 as isize);
+    }
+
+    /// Cierra sesion en Google Drive.
+    pub(crate) fn gdrive_sign_out(&mut self) {
+        self.gdrive.sign_out();
+        self.gdrive_files.clear();
+        self.gdrive_email = None;
+        self.gdrive_sync_note.clear();
+        self.render_all();
+    }
+
+    /// Estado actual de Google Drive (Status, email o vacio).
+    pub(crate) fn gdrive_status_info(&self) -> (gdrive::Status, String) {
+        let status = self.gdrive.status();
+        let detail = match status {
+            gdrive::Status::Ready => self.gdrive_email.clone().unwrap_or_default(),
+            _ => String::new(),
+        };
+        (status, detail)
     }
 
     /// Dibuja una gráfica tipo sparkline (área translúcida + línea + punto LED)
@@ -5735,6 +6267,435 @@ impl App {
         Ok(())
     }
 
+    fn render_gdrive_fence(&mut self, index: usize) -> WinResult<()> {
+        let theme_ptr: *const Theme = &self.theme;
+        let gfx_ptr: *const Graphics = &self.gfx;
+        let theme = unsafe { &*theme_ptr };
+        let gfx = unsafe { &*gfx_ptr };
+
+        let status = self.gdrive.status();
+        let files = self.gdrive_files.clone();
+        let scroll = self.gdrive_scroll.max(0) as usize;
+        let sync_note = self.gdrive_sync_note.clone();
+        let selected = self.gdrive_selected;
+        let path_display = self.gdrive_path_display();
+        let is_subfolder = !self.gdrive_folder_stack.is_empty();
+
+        let fence = &mut self.fences[index];
+        let width = fence.layout.width.max(80);
+        let visual_height = fence.visible_height(theme).max(28);
+        let scale = fence.scale;
+        let header_dip = fence.header_h(theme);
+        let accent = fence.accent;
+
+        unsafe {
+            let recreate = match &fence.surface {
+                Some(s) => s.width != width || s.height != visual_height,
+                None => true,
+            };
+            if recreate {
+                fence.surface = Some(Surface::new(gfx, width, visual_height)?);
+            }
+            let surface = match fence.surface.as_ref() {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+            let bounds = RECT { left: 0, top: 0, right: width, bottom: visual_height };
+            surface.target.BindDC(surface.dc, &bounds)?;
+            surface.target.BeginDraw();
+            surface.target.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+
+            let w = width as f32 / scale;
+            let h = visual_height as f32 / scale;
+            let radius = theme.radius;
+            let brush = &surface.brush;
+            let has_material = self.cfg.appearance.material != "none";
+
+            // Sombra, fondo y borde de la caja principal
+            if !has_material {
+                brush.SetColor(&theme.shadow);
+                surface.target.FillRoundedRectangle(
+                    &D2D1_ROUNDED_RECT { rect: rect(1.5 * scale, 2.5 * scale, (w - 1.5) * scale, (h - 0.5) * scale), radiusX: radius * scale, radiusY: radius * scale },
+                    brush,
+                );
+            }
+            let bg_fill = material_bg(theme.background, &self.cfg.appearance.material, self.cfg.appearance.material_opacity);
+            brush.SetColor(&bg_fill);
+            let body = if has_material {
+                D2D1_ROUNDED_RECT { rect: rect(0.0, 0.0, width as f32, visual_height as f32), radiusX: radius * scale, radiusY: radius * scale }
+            } else {
+                D2D1_ROUNDED_RECT { rect: rect(0.0, 0.0, (w - 1.0) * scale, (h - 1.5) * scale), radiusX: radius * scale, radiusY: radius * scale }
+            };
+            surface.target.FillRoundedRectangle(&body, brush);
+            brush.SetColor(&if has_material {
+                D2D1_COLOR_F { r: theme.border.r, g: theme.border.g, b: theme.border.b, a: 0.55 }
+            } else {
+                theme.border
+            });
+            surface.target.DrawRoundedRectangle(&body, brush, theme.border_width * scale, None);
+
+            // Cabecera.
+            let header_h = header_dip * scale;
+            let base_h = theme.header * scale;
+            brush.SetColor(&with_alpha(theme.text, 0.035));
+            surface.target.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT { rect: rect(0.0, 0.0, w * scale, header_h), radiusX: radius * scale, radiusY: radius * scale },
+                brush,
+            );
+            let pad = theme.padding * scale;
+            brush.SetColor(&with_alpha(theme.border, 0.30));
+            surface.target.DrawLine(
+                D2D_POINT_2F { x: pad * 0.5, y: header_h },
+                D2D_POINT_2F { x: (w - theme.padding * 0.5) * scale, y: header_h },
+                brush,
+                1.0 * scale,
+                None,
+            );
+
+            // Indicador luminoso Google Drive (Verde/Azul Google)
+            let dot_x = pad + 4.0 * scale;
+            let dot_y = base_h * 0.5;
+            let is_ready = status == gdrive::Status::Ready;
+            let gd_color = argb_color(0xFF34A853);
+
+            brush.SetColor(&with_alpha(if is_ready { gd_color } else { argb_color(0xFF888888) }, 0.28));
+            fill_circle(&surface.target, brush, dot_x, dot_y, 6.0 * scale);
+            brush.SetColor(&if is_ready { gd_color } else { argb_color(0xFF777777) });
+            fill_circle(&surface.target, brush, dot_x, dot_y, 3.2 * scale);
+
+            // Titulo "Google Drive"
+            let title = wide_str("Google Drive");
+            brush.SetColor(&theme.title);
+            surface.target.DrawText(
+                &title,
+                &gfx.title_format,
+                &rect(dot_x + 10.0 * scale, 0.0, (w - pad) * scale, base_h),
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+
+            // Botones en la cabecera (Subir nivel y Cerrar sesion)
+            if is_ready {
+                if is_subfolder {
+                    let up_r = gdrive_header_up_rect(w, header_dip);
+                    let up_rect = rect(up_r.left * scale, up_r.top * scale, up_r.right * scale, up_r.bottom * scale);
+                    let up_rr = D2D1_ROUNDED_RECT { rect: up_rect, radiusX: 6.0 * scale, radiusY: 6.0 * scale };
+                    brush.SetColor(&with_alpha(theme.text, 0.06));
+                    surface.target.FillRoundedRectangle(&up_rr, brush);
+                    brush.SetColor(&with_alpha(theme.text, 0.8));
+                    surface.target.DrawText(&wide_str("⬆"), &gfx.center_meta_format, &up_rect, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+                }
+
+                let lr = gdrive_logout_rect(w, header_dip);
+                let lr_rect = rect(lr.left * scale, lr.top * scale, lr.right * scale, lr.bottom * scale);
+                let lr_rr = D2D1_ROUNDED_RECT { rect: lr_rect, radiusX: 6.0 * scale, radiusY: 6.0 * scale };
+                brush.SetColor(&with_alpha(theme.text, 0.06));
+                surface.target.FillRoundedRectangle(&lr_rr, brush);
+                brush.SetColor(&with_alpha(theme.text, 0.65));
+                surface.target.DrawText(&wide_str("⏻"), &gfx.center_meta_format, &lr_rect, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+            }
+
+            // Cuerpo del widget
+            let content_h = (h - header_dip).max(20.0);
+
+            match status {
+                gdrive::Status::Unconfigured => {
+                    let card_w = (w - 24.0).min(320.0);
+                    let card_h = (content_h - 16.0).clamp(90.0, 160.0);
+                    let card_x = (w - card_w) * 0.5 * scale;
+                    let card_y = header_h + (content_h - card_h) * 0.5 * scale;
+                    let card_rect = rect(card_x, card_y, card_x + card_w * scale, card_y + card_h * scale);
+                    let card_rr = D2D1_ROUNDED_RECT { rect: card_rect, radiusX: 12.0 * scale, radiusY: 12.0 * scale };
+
+                    brush.SetColor(&with_alpha(theme.text, 0.035));
+                    surface.target.FillRoundedRectangle(&card_rr, brush);
+                    brush.SetColor(&with_alpha(theme.border, 0.28));
+                    surface.target.DrawRoundedRectangle(&card_rr, brush, 1.0 * scale, None);
+
+                    brush.SetColor(&theme.title);
+                    surface.target.DrawText(
+                        &wide_str("Google Drive no configurado"),
+                        &gfx.center_meta_format,
+                        &rect(card_x + 8.0 * scale, card_y + 16.0 * scale, card_x + card_w * scale - 8.0 * scale, card_y + 36.0 * scale),
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                    brush.SetColor(&with_alpha(theme.text, 0.55));
+                    surface.target.DrawText(
+                        &wide_str("Añade tu Client ID en Ajustes → Google Drive"),
+                        &gfx.center_meta_format,
+                        &rect(card_x + 8.0 * scale, card_y + 40.0 * scale, card_x + card_w * scale - 8.0 * scale, card_y + 64.0 * scale),
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                }
+                gdrive::Status::LoggedOut => {
+                    let card_w = (w - 24.0).min(340.0);
+                    let card_h = (content_h - 16.0).clamp(110.0, 180.0);
+                    let card_x = (w - card_w) * 0.5 * scale;
+                    let card_y = header_h + (content_h - card_h) * 0.5 * scale;
+                    let card_rect = rect(card_x, card_y, card_x + card_w * scale, card_y + card_h * scale);
+                    let card_rr = D2D1_ROUNDED_RECT { rect: card_rect, radiusX: 12.0 * scale, radiusY: 12.0 * scale };
+
+                    brush.SetColor(&with_alpha(theme.text, 0.035));
+                    surface.target.FillRoundedRectangle(&card_rr, brush);
+                    brush.SetColor(&with_alpha(theme.border, 0.30));
+                    surface.target.DrawRoundedRectangle(&card_rr, brush, 1.0 * scale, None);
+
+                    let cxp = (w * 0.5) * scale;
+                    let cyp = card_y + 34.0 * scale;
+
+                    // Halo Google Blue
+                    brush.SetColor(&argb_color(0x224285F4));
+                    fill_circle(&surface.target, brush, cxp, cyp, 26.0 * scale);
+
+                    // Icono nube
+                    brush.SetColor(&argb_color(0xFF4285F4));
+                    surface.target.DrawText(
+                        &wide_str("☁"),
+                        &gfx.center_meta_format,
+                        &rect(cxp - 20.0 * scale, cyp - 16.0 * scale, cxp + 20.0 * scale, cyp + 16.0 * scale),
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+
+                    brush.SetColor(&theme.title);
+                    surface.target.DrawText(
+                        &wide_str("Conectar con Google Drive"),
+                        &gfx.center_meta_format,
+                        &rect(card_x + 8.0 * scale, card_y + 56.0 * scale, card_x + card_w * scale - 8.0 * scale, card_y + 76.0 * scale),
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+
+                    // Boton de conexion Google Blue
+                    let btn_r = gdrive_connect_rect(w, content_h);
+                    let (cx, cy, cw, ch) = (btn_r.left * scale, header_h + btn_r.top * scale, (btn_r.right - btn_r.left) * scale, (btn_r.bottom - btn_r.top) * scale);
+                    let btn_rect = rect(cx, cy, cx + cw, cy + ch);
+                    let btn_rr = D2D1_ROUNDED_RECT { rect: btn_rect, radiusX: 14.0 * scale, radiusY: 14.0 * scale };
+
+                    brush.SetColor(&with_alpha(theme.shadow, 0.25));
+                    surface.target.FillRoundedRectangle(
+                        &D2D1_ROUNDED_RECT { rect: rect(cx, cy + 1.5 * scale, cx + cw, cy + ch + 1.5 * scale), radiusX: 14.0 * scale, radiusY: 14.0 * scale },
+                        brush,
+                    );
+                    brush.SetColor(&argb_color(0xFF1A73E8));
+                    surface.target.FillRoundedRectangle(&btn_rr, brush);
+                    brush.SetColor(&D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 });
+                    surface.target.DrawText(
+                        &wide_str("Iniciar sesión"),
+                        &gfx.center_meta_format,
+                        &btn_rect,
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                }
+                gdrive::Status::Ready => {
+                    // Subcabecera: ruta actual + contador de archivos
+                    let subheader_y = header_h + 4.0 * scale;
+                    let subheader_h = 24.0 * scale;
+                    let subheader_bottom = subheader_y + subheader_h;
+
+                    // Pastilla con la ruta navegada
+                    brush.SetColor(&theme.title);
+                    surface.target.DrawText(
+                        &wide_str(&path_display),
+                        &gfx.text_format,
+                        &rect(14.0 * scale, subheader_y + 2.0 * scale, (w - 90.0) * scale, subheader_bottom),
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+
+                    // Badge de cantidad de archivos
+                    let count_str = format!("{} elem", files.len());
+                    brush.SetColor(&with_alpha(theme.text, 0.50));
+                    surface.target.DrawText(
+                        &wide_str(&count_str),
+                        &gfx.meta_format,
+                        &rect((w - 90.0) * scale, subheader_y + 2.0 * scale, (w - 12.0) * scale, subheader_bottom),
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+
+                    // Línea divisoria bajo la subcabecera
+                    brush.SetColor(&with_alpha(theme.border, 0.20));
+                    surface.target.DrawLine(
+                        D2D_POINT_2F { x: 10.0 * scale, y: subheader_bottom + 2.0 * scale },
+                        D2D_POINT_2F { x: (w - 10.0) * scale, y: subheader_bottom + 2.0 * scale },
+                        brush,
+                        1.0 * scale,
+                        None,
+                    );
+
+                    // Área de lista de archivos con recorte limpio (PushAxisAlignedClip)
+                    let list_top = subheader_bottom + 4.0 * scale;
+                    let foot_top = (h - 40.0) * scale;
+                    let clip_rect = rect(0.0, list_top, w * scale, foot_top);
+
+                    surface.target.PushAxisAlignedClip(&clip_rect, D2D1_ANTIALIAS_MODE_ALIASED);
+
+                    let row_h = (theme.row * scale).max(28.0 * scale);
+
+                    if files.is_empty() {
+                        brush.SetColor(&with_alpha(theme.text, 0.45));
+                        surface.target.DrawText(
+                            &wide_str("Carpeta vacía"),
+                            &gfx.center_meta_format,
+                            &rect(14.0 * scale, list_top + 20.0 * scale, (w - 14.0) * scale, list_top + 50.0 * scale),
+                            brush,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                    } else {
+                        for (i, file) in files.iter().enumerate() {
+                            let ry = list_top + 2.0 * scale + i as f32 * row_h - scroll as f32 * row_h;
+                            if ry + row_h <= list_top || ry >= foot_top {
+                                continue;
+                            }
+
+                            let r_rect = rect(10.0 * scale, ry + 1.0 * scale, (w - 10.0) * scale, ry + row_h - 2.0 * scale);
+                            let r_rr = D2D1_ROUNDED_RECT { rect: r_rect, radiusX: 6.0 * scale, radiusY: 6.0 * scale };
+
+                            // Fondo de la fila
+                            if selected == Some(i) {
+                                brush.SetColor(&with_alpha(accent, 0.22));
+                                surface.target.FillRoundedRectangle(&r_rr, brush);
+                                brush.SetColor(&with_alpha(accent, 0.50));
+                                surface.target.DrawRoundedRectangle(&r_rr, brush, 1.0 * scale, None);
+                            } else {
+                                brush.SetColor(&with_alpha(theme.text, if i % 2 == 0 { 0.04 } else { 0.015 }));
+                                surface.target.FillRoundedRectangle(&r_rr, brush);
+                                brush.SetColor(&with_alpha(theme.border, 0.16));
+                                surface.target.DrawRoundedRectangle(&r_rr, brush, 1.0 * scale, None);
+                            }
+
+                            // Icono según tipo de archivo de Google Drive
+                            let (icon, _icon_color) = gdrive_file_icon(&file.name, file.is_dir, &file.mime_type);
+                            brush.SetColor(&theme.title);
+                            surface.target.DrawText(
+                                &wide_str(icon),
+                                &gfx.text_format,
+                                &rect(16.0 * scale, ry + 2.0 * scale, 38.0 * scale, ry + row_h - 2.0 * scale),
+                                brush,
+                                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                                DWRITE_MEASURING_MODE_NATURAL,
+                            );
+
+                            // Nombre del archivo o carpeta
+                            let size_w = if file.is_dir || file.size == 0 { 0.0 } else { 68.0 * scale };
+                            let name_rect = rect(40.0 * scale, ry + 2.0 * scale, (w - 16.0) * scale - size_w, ry + row_h - 2.0 * scale);
+                            brush.SetColor(if file.is_dir { &theme.title } else { &theme.text });
+                            surface.target.DrawText(
+                                &wide_str(&file.name),
+                                &gfx.text_format,
+                                &name_rect,
+                                brush,
+                                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                                DWRITE_MEASURING_MODE_NATURAL,
+                            );
+
+                            // Tamaño del archivo a la derecha
+                            if !file.is_dir && file.size > 0 {
+                                let sz_str = rules::human_size(file.size);
+                                brush.SetColor(&with_alpha(theme.text, 0.52));
+                                surface.target.DrawText(
+                                    &wide_str(&sz_str),
+                                    &gfx.meta_format,
+                                    &rect((w - 78.0) * scale, ry + 2.0 * scale, (w - 16.0) * scale, ry + row_h - 2.0 * scale),
+                                    brush,
+                                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                                    DWRITE_MEASURING_MODE_NATURAL,
+                                );
+                            }
+                        }
+                    }
+
+                    surface.target.PopAxisAlignedClip();
+
+                    // Pie fijo: barra translúcida con estado + botones de acción
+                    let foot_rect = rect(0.0, foot_top, w * scale, (h - 1.0) * scale);
+                    brush.SetColor(&bg_fill);
+                    surface.target.FillRectangle(&foot_rect, brush);
+
+                    brush.SetColor(&with_alpha(theme.border, 0.22));
+                    surface.target.DrawLine(
+                        D2D_POINT_2F { x: 8.0 * scale, y: foot_top },
+                        D2D_POINT_2F { x: (w - 8.0) * scale, y: foot_top },
+                        brush,
+                        1.0 * scale,
+                        None,
+                    );
+
+                    // Nota de sincronización a la izquierda
+                    let note_txt = if sync_note.is_empty() { "✓ Sincronizado".to_string() } else { sync_note.clone() };
+                    let note_color = if note_txt.starts_with('✓') {
+                        argb_color(0xFF10B981)
+                    } else if note_txt.starts_with('⚠') {
+                        argb_color(0xFFEF4444)
+                    } else {
+                        with_alpha(theme.text, 0.65)
+                    };
+                    brush.SetColor(&note_color);
+                    surface.target.DrawText(
+                        &wide_str(&note_txt),
+                        &gfx.text_format,
+                        &rect(14.0 * scale, foot_top + 8.0 * scale, (w - 150.0) * scale, (h - 6.0) * scale),
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+
+                    // Boton Subir nivel (⬆)
+                    let up_r = gdrive_upload_btn_rect(w, h);
+                    let up_rect = rect(up_r.left * scale, up_r.top * scale, up_r.right * scale, up_r.bottom * scale);
+                    let up_rr = D2D1_ROUNDED_RECT { rect: up_rect, radiusX: 6.0 * scale, radiusY: 6.0 * scale };
+                    brush.SetColor(&with_alpha(theme.text, 0.06));
+                    surface.target.FillRoundedRectangle(&up_rr, brush);
+                    brush.SetColor(&with_alpha(theme.border, 0.25));
+                    surface.target.DrawRoundedRectangle(&up_rr, brush, 1.0 * scale, None);
+                    brush.SetColor(&theme.text);
+                    surface.target.DrawText(&wide_str("⬆"), &gfx.center_meta_format, &up_rect, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+
+                    // Boton Sincronizar
+                    let sync_r = gdrive_sync_btn_rect(w, h);
+                    let sync_rect = rect(sync_r.left * scale, sync_r.top * scale, sync_r.right * scale, sync_r.bottom * scale);
+                    let sync_rr = D2D1_ROUNDED_RECT { rect: sync_rect, radiusX: 6.0 * scale, radiusY: 6.0 * scale };
+                    brush.SetColor(&argb_color(0xFF1A73E8));
+                    surface.target.FillRoundedRectangle(&sync_rr, brush);
+                    brush.SetColor(&D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 });
+                    surface.target.DrawText(
+                        &wide_str(self.tr.btn_gdrive_sync),
+                        &gfx.center_meta_format,
+                        &sync_rect,
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                }
+            }
+
+            surface.target.EndDraw(None, None)?;
+
+            Self::present_fence_surface(
+                fence.hwnd,
+                surface,
+                POINT { x: fence.layout.x, y: fence.layout.y },
+                SIZE { cx: width, cy: visual_height },
+                (theme.radius * scale) as i32,
+                &self.cfg.appearance.material,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Renderiza la caja widget de Spotify: marco + cabecera + escena nativa
     /// (portada, metadatos, progreso y controles).
     fn render_spotify_fence(&mut self, index: usize) -> WinResult<()> {
@@ -5745,6 +6706,7 @@ impl App {
 
         let status = self.spotify.status();
         let np = self.spotify_np.clone();
+        let spotify_err = self.spotify_err.clone();
         let cover = self
             .spotify_cover
             .as_ref()
@@ -6411,9 +7373,13 @@ impl App {
                             D2D1_DRAW_TEXT_OPTIONS_CLIP,
                             DWRITE_MEASURING_MODE_NATURAL,
                         );
+                        let wait_msg = match &spotify_err {
+                            Some(e) => format!("Sin datos de Spotify: {e}"),
+                            None => "Abre Spotify o reproduce una canción".to_string(),
+                        };
                         brush.SetColor(&with_alpha(theme.text, 0.55));
                         surface.target.DrawText(
-                            &wide_str("Abre Spotify o reproduce una canción"),
+                            &wide_str(wait_msg.as_str()),
                             &gfx.meta_format,
                             &rect(card_x + 8.0 * scale, cyp + 44.0 * scale, card_x + card_w * scale - 8.0 * scale, cyp + 62.0 * scale),
                             brush,
@@ -7549,6 +8515,15 @@ impl App {
         self.dropbox.set_redirect_uri(self.cfg.dropbox.redirect_uri.clone());
         // Caja del widget Dropbox (nativo): se crea/elimina segun `enabled`.
         self.ensure_dropbox_fence();
+        self.gdrive.set_client_id(self.cfg.gdrive.client_id.clone());
+        self.gdrive.set_client_secret(self.cfg.gdrive.client_secret.clone());
+        self.gdrive.set_redirect_uri(self.cfg.gdrive.redirect_uri.clone());
+        if self.gdrive.status() == gdrive::Status::Ready && self.gdrive_email.is_none() {
+            let gd = self.gdrive.clone();
+            self.gdrive_email = gd.account_email();
+        }
+        // Caja del widget Google Drive (nativo): se crea/elimina segun `enabled`.
+        self.ensure_gdrive_fence();
         // Caja del widget de monitor (nativo): se crea/elimina segun `enabled`.
         self.ensure_monitor_fence();
         if let Ok(gfx) = Graphics::new(&self.cfg) {
@@ -8296,6 +9271,11 @@ extern "system" fn controller_proc(
                     if !pending.is_empty() {
                         app.dropbox_upload_paths(pending);
                     }
+                    let pending_gd: Vec<PathBuf> =
+                        std::mem::take(&mut *GDRIVE_PENDING_UPLOAD.lock().unwrap());
+                    if !pending_gd.is_empty() {
+                        app.gdrive_upload_paths(pending_gd);
+                    }
                     if let Some(cfg) = app.deferred_config.take() {
                         app.apply_config(cfg);
                     }
@@ -8365,8 +9345,14 @@ extern "system" fn controller_proc(
                 // El navegador devolvio el codigo: canjearlo por tokens.
                 if let Some(app) = app_from(hwnd) {
                     if let Some(code) = SPOTIFY_AUTH_CODE.lock().unwrap().take() {
-                        if app.spotify.complete_auth(&code).is_ok() {
-                            poll_spotify_now(app.spotify.clone(), app.controller.0 as isize);
+                        match app.spotify.complete_auth(&code) {
+                            Ok(()) => {
+                                poll_spotify_now(app.spotify.clone(), app.controller.0 as isize);
+                                app.show_toast("Spotify: sesión iniciada correctamente", TOAST_DROP);
+                            }
+                            Err(e) => {
+                                app.show_toast(&format!("Spotify: error al autorizar ({e})"), TOAST_ERROR);
+                            }
                         }
                     }
                     app.render_all();
@@ -8390,10 +9376,16 @@ extern "system" fn controller_proc(
                 // El navegador devolvio el codigo: canjearlo por tokens.
                 if let Some(app) = app_from(hwnd) {
                     if let Some(code) = DROPBOX_AUTH_CODE.lock().unwrap().take() {
-                        if app.dropbox.complete_auth(&code).is_ok() {
-                            let db = app.dropbox.clone();
-                            app.dropbox_email = db.account_email();
-                            app.dropbox_sync_now();
+                        match app.dropbox.complete_auth(&code) {
+                            Ok(()) => {
+                                let db = app.dropbox.clone();
+                                app.dropbox_email = db.account_email();
+                                app.dropbox_sync_now();
+                                app.show_toast("Dropbox: sesión iniciada correctamente", TOAST_DROP);
+                            }
+                            Err(e) => {
+                                app.show_toast(&format!("Dropbox: error al autorizar ({e})"), TOAST_ERROR);
+                            }
                         }
                     }
                     app.render_all();
@@ -8434,6 +9426,67 @@ extern "system" fn controller_proc(
                             std::mem::take(&mut *DROPBOX_PENDING_UPLOAD.lock().unwrap());
                         if !pending.is_empty() {
                             app.dropbox_upload_paths(pending);
+                        }
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_ZEN_GDRIVE_AUTH => {
+                if let Some(app) = app_from(hwnd) {
+                    if let Some(code) = GDRIVE_AUTH_CODE.lock().unwrap().take() {
+                        match app.gdrive.complete_auth(&code) {
+                            Ok(()) => {
+                                let gd = app.gdrive.clone();
+                                app.gdrive_email = gd.account_email();
+                                let fid = app.gdrive_current_folder_id();
+                                fetch_gdrive_files(app.gdrive.clone(), fid, app.controller.0 as isize);
+                                app.gdrive_sync_now();
+                                let _ = app.cfg.save(&app.cfg_path);
+                                app.show_toast("Google Drive: sesión iniciada correctamente", TOAST_DROP);
+                            }
+                            Err(e) => {
+                                app.show_toast(&format!("Google Drive: error al autorizar ({e})"), TOAST_ERROR);
+                                let msg = format!("Error de autorización con Google Drive:\n\n{e}\n\nNota: Si tu ID de cliente en Google Cloud es de tipo 'Aplicación web', asegúrate de introducir también el 'Client Secret' (Secreto de cliente).");
+                                let wmsg = wide(&msg);
+                                let _ = MessageBoxW(hwnd, PCWSTR(wmsg.as_ptr()), w!("ZenDesktop - Google Drive"), MB_OK | MB_ICONWARNING);
+                            }
+                        }
+                    }
+                    app.render_all();
+                }
+                LRESULT(0)
+            }
+            WM_ZEN_GDRIVE_FILES => {
+                if let Some(app) = app_from(hwnd) {
+                    app.gdrive_apply_files();
+                }
+                LRESULT(0)
+            }
+            WM_ZEN_GDRIVE_SYNC => {
+                if let Some(app) = app_from(hwnd) {
+                    app.gdrive_apply_sync();
+                }
+                LRESULT(0)
+            }
+            WM_ZEN_GDRIVE_OPEN => {
+                if let Some(app) = app_from(hwnd) {
+                    app.gdrive_apply_open();
+                }
+                LRESULT(0)
+            }
+            WM_ZEN_GDRIVE_UPLOADED => {
+                if let Some(app) = app_from(hwnd) {
+                    app.gdrive_apply_uploaded();
+                }
+                LRESULT(0)
+            }
+            WM_ZEN_GDRIVE_UPLOAD_PENDING => {
+                if let Some(app) = app_from(hwnd) {
+                    if !app.dragging {
+                        let pending: Vec<PathBuf> =
+                            std::mem::take(&mut *GDRIVE_PENDING_UPLOAD.lock().unwrap());
+                        if !pending.is_empty() {
+                            app.gdrive_upload_paths(pending);
                         }
                     }
                 }
@@ -8696,17 +9749,17 @@ unsafe extern "system" fn drop_target_drag_enter(
     pdweffect: *mut DROPEFFECT,
 ) -> windows::core::HRESULT {
     let target = &*(this as *const FenceDropTarget);
-    // Durante un drag saliente (DoDragDrop en curso) solo la caja del widget
-    // Dropbox acepta drops entrantes: los ficheros se encolan y se suben en
+    // Durante un drag saliente (DoDragDrop en curso) solo las cajas widget
+    // Dropbox y Google Drive aceptan drops entrantes: los ficheros se encolan y se suben en
     // WM_ZEN_DRAG_DONE, cuando el bucle OLE ha terminado y es seguro tocar la
     // UI (evita el access violation de procesar el drop a mitad del drag).
     if (*target.app).dragging {
         let hwnd = WindowFromPoint(POINT { x: pt.x, y: pt.y });
-        let is_dropbox = (*target.app)
+        let is_cloud = (*target.app)
             .fences
             .iter()
-            .any(|f| f.hwnd == hwnd && f.layout.widget.as_deref() == Some("dropbox"));
-        if !is_dropbox {
+            .any(|f| f.hwnd == hwnd && (f.layout.widget.as_deref() == Some("dropbox") || f.layout.widget.as_deref() == Some("gdrive")));
+        if !is_cloud {
             if !pdweffect.is_null() { *pdweffect = DROPEFFECT_NONE; }
             return windows::core::HRESULT(0);
         }
@@ -8748,15 +9801,15 @@ unsafe extern "system" fn drop_target_drag_over(
 ) -> windows::core::HRESULT {
     let target = &*(this as *const FenceDropTarget);
     let mut ok = target.accepts_files.get();
-    // Durante un drag interno, solo la caja del widget Dropbox muestra el
+    // Durante un drag interno, solo las cajas widget Dropbox / Google Drive muestran el
     // cursor de soltar (el resto de cajas siguen rechazando, como DragEnter).
     if (*target.app).dragging {
         let hwnd = WindowFromPoint(POINT { x: pt.x, y: pt.y });
-        let is_dropbox = (*target.app)
+        let is_cloud = (*target.app)
             .fences
             .iter()
-            .any(|f| f.hwnd == hwnd && f.layout.widget.as_deref() == Some("dropbox"));
-        if !is_dropbox {
+            .any(|f| f.hwnd == hwnd && (f.layout.widget.as_deref() == Some("dropbox") || f.layout.widget.as_deref() == Some("gdrive")));
+        if !is_cloud {
             ok = false;
         }
     }
@@ -8783,12 +9836,16 @@ unsafe extern "system" fn drop_target_drop(
         .index_of(hwnd)
         .and_then(|i| app.fences.get(i))
         .is_some_and(|f| f.layout.widget.as_deref() == Some("dropbox"));
-    // Soltar dentro de la caja del widget Dropbox sube los ficheros a la
+    let is_gdrive = app
+        .index_of(hwnd)
+        .and_then(|i| app.fences.get(i))
+        .is_some_and(|f| f.layout.widget.as_deref() == Some("gdrive"));
+    // Soltar dentro de la caja Dropbox / Google Drive sube los ficheros a la
     // carpeta remota en la que se esta navegando. El callback OLE nunca toca
     // la UI (render/refresco) porque reentraria en el bucle de DoDragDrop del
     // origen y provocaria access violation: solo encola las rutas y avisa con
     // un mensaje, que se procesa al volver al bucle de mensajes.
-    if is_dropbox && !pdataobj.is_null() {
+    if (is_dropbox || is_gdrive) && !pdataobj.is_null() {
         // Drag interno (de otra caja): las rutas ya las conoce la app, no hace
         // falta re-leer el IDataObject dentro del bucle OLE (esa reentrada COM
         // corrompia el heap). Drag externo (Explorer): se extraen con cuidado.
@@ -8800,8 +9857,13 @@ unsafe extern "system" fn drop_target_drop(
                 .unwrap_or_default()
         };
         if !paths.is_empty() {
-            DROPBOX_PENDING_UPLOAD.lock().unwrap().extend(paths);
-            let _ = PostMessageW(app.controller, WM_ZEN_DROPBOX_UPLOAD_PENDING, WPARAM(0), LPARAM(0));
+            if is_dropbox {
+                DROPBOX_PENDING_UPLOAD.lock().unwrap().extend(paths);
+                let _ = PostMessageW(app.controller, WM_ZEN_DROPBOX_UPLOAD_PENDING, WPARAM(0), LPARAM(0));
+            } else {
+                GDRIVE_PENDING_UPLOAD.lock().unwrap().extend(paths);
+                let _ = PostMessageW(app.controller, WM_ZEN_GDRIVE_UPLOAD_PENDING, WPARAM(0), LPARAM(0));
+            }
             if !pdweffect.is_null() { *pdweffect = DROPEFFECT_MOVE; }
             return windows::core::HRESULT(0);
         }
@@ -9202,6 +10264,84 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                     }
                 }
 
+                // Widget de Google Drive: clic en cabecera, cuerpo y botones.
+                if app.fences[index].layout.widget.as_deref() == Some("gdrive") {
+                    let f = &app.fences[index];
+                    let header_px = (f.header_h(&app.theme) * f.scale) as i32;
+                    let in_grip = x > f.layout.width - GRIP
+                        && y > f.visible_height(&app.theme) - GRIP
+                        && !f.layout.collapsed;
+                    let s = f.scale;
+                    let w_dip = f.layout.width as f32 / s;
+                    let h_dip = f.visible_height(&app.theme) as f32 / s;
+                    let header_dip = f.header_h(&app.theme);
+                    let (dx, dy) = (x as f32 / s, y as f32 / s);
+
+                    // 1. Clics en la cabecera
+                    if dy <= header_dip && app.gdrive.status() == gdrive::Status::Ready {
+                        let lr = gdrive_logout_rect(w_dip, header_dip);
+                        if point_in(&lr, dx, dy) {
+                            app.gdrive_sign_out();
+                            return LRESULT(0);
+                        }
+                        let up_r = gdrive_header_up_rect(w_dip, header_dip);
+                        if point_in(&up_r, dx, dy) && !app.gdrive_folder_stack.is_empty() {
+                            app.gdrive_navigate_up();
+                            let _ = app.render(index);
+                            return LRESULT(0);
+                        }
+                    }
+
+                    if y > header_px && !in_grip {
+                        // 2. Estado desconectado: clic en el botón conectar
+                        if app.gdrive.status() == gdrive::Status::LoggedOut {
+                            let conn_r = gdrive_connect_rect(w_dip, h_dip - header_dip);
+                            if point_in(&conn_r, dx, dy - header_dip) {
+                                app.gdrive_connect();
+                                return LRESULT(0);
+                            }
+                        }
+
+                        // 3. Estado conectado: pie y lista de archivos
+                        if app.gdrive.status() == gdrive::Status::Ready {
+                            // Boton Sincronizar y Subir nivel (pie de la caja)
+                            let sync_r = gdrive_sync_btn_rect(w_dip, h_dip);
+                            if point_in(&sync_r, dx, dy) {
+                                app.gdrive_sync_now();
+                                let _ = app.render(index);
+                                return LRESULT(0);
+                            }
+                            let up_r = gdrive_upload_btn_rect(w_dip, h_dip);
+                            if point_in(&up_r, dx, dy) && !app.gdrive_folder_stack.is_empty() {
+                                app.gdrive_navigate_up();
+                                let _ = app.render(index);
+                                return LRESULT(0);
+                            }
+
+                            // Clic en una fila de la lista de archivos
+                            let row_h_dip = (app.theme.row * s).max(28.0 * s) / s;
+                            let list_top_dip = header_dip + 32.0;
+                            let list_bottom_dip = h_dip - 40.0;
+                            if dy > list_top_dip && dy < list_bottom_dip {
+                                let idx = ((dy - list_top_dip) / row_h_dip).floor() as usize;
+                                let item = app.gdrive_scroll.max(0) as usize + idx;
+                                if item < app.gdrive_files.len() {
+                                    app.gdrive_selected = Some(item);
+                                    let file = &app.gdrive_files[item];
+                                    if !file.is_dir {
+                                        app.fences[index].drag = DragMode::GDriveDrag { start_x: x, start_y: y };
+                                        let _ = SetCapture(hwnd);
+                                    }
+                                    let _ = app.render(index);
+                                    return LRESULT(0);
+                                }
+                            }
+                        }
+                        let _ = app.render(index);
+                        return LRESULT(0);
+                    }
+                }
+
                 // Widget Lua generico (no Spotify): clic en el CUERPO -> la
                 // funcion `click(x, y, w, h)` del script (coordenadas DIP
                 // relativas al cuerpo, bajo la cabecera). Los clics en la
@@ -9546,6 +10686,41 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                     }
                 }
 
+                // Arrastre de un archivo remoto de Google Drive
+                if let DragMode::GDriveDrag { start_x, start_y } = app.fences[index].drag.clone() {
+                    if (wparam.0 & 0x0001) != 0 {
+                        let dx = (x - start_x).abs();
+                        let dy = (y - start_y).abs();
+                        if dx > 4 || dy > 4 {
+                            let _ = ReleaseCapture();
+                            app.fences[index].drag = DragMode::None;
+                            let paths: Vec<PathBuf> = app
+                                .gdrive_selected
+                                .and_then(|i| app.gdrive_files.get(i))
+                                .filter(|e| !e.is_dir)
+                                .and_then(|e| app.gdrive_download_for_drag(e))
+                                .into_iter()
+                                .collect();
+                            if !paths.is_empty() {
+                                app.last_drag_paths = paths.clone();
+                                app.dragging = true;
+                                start_ole_drag(&paths);
+                                if PostMessageW(
+                                    app.controller,
+                                    WM_ZEN_DRAG_DONE,
+                                    WPARAM(0),
+                                    LPARAM(0),
+                                ).is_err() {
+                                    app.dragging = false;
+                                }
+                            }
+                            return LRESULT(0);
+                        }
+                    } else {
+                        app.fences[index].drag = DragMode::None;
+                    }
+                }
+
                 let mode = app.fences[index].drag.clone();
 
                 if let DragMode::ItemDrag { item_idx: _, start_x, start_y } = mode {
@@ -9789,10 +10964,15 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                     }
                     return LRESULT(0);
                 }
-                // Arrastre de un archivo de Dropbox: soltar sin superar el
+                // Arrastre de un archivo de Dropbox / Google Drive: soltar sin superar el
                 // umbral simplemente cancela (la descarga solo se lanza al
                 // mover, no al soltar).
                 if let DragMode::DropboxDrag { .. } = app.fences[index].drag {
+                    let _ = ReleaseCapture();
+                    app.fences[index].drag = DragMode::None;
+                    return LRESULT(0);
+                }
+                if let DragMode::GDriveDrag { .. } = app.fences[index].drag {
                     let _ = ReleaseCapture();
                     app.fences[index].drag = DragMode::None;
                     return LRESULT(0);
@@ -9840,6 +11020,8 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 let (x, y) = point_of(lparam);
                 // Widget Dropbox: doble clic en una fila -> abrir archivo
                 // (descarga y lanza) o entrar en una carpeta.
+                // Widget Dropbox: doble clic en una fila -> abrir archivo
+                // (descarga y lanza) o entrar en una carpeta.
                 if app.fences[index].layout.widget.as_deref() == Some("dropbox") {
                     let f = &app.fences[index];
                     let header_px = (f.header_h(&app.theme) * f.scale) as i32;
@@ -9859,6 +11041,31 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                             if item < app.dropbox_files.len() {
                                 let entry = app.dropbox_files[item].clone();
                                 app.dropbox_open_entry(entry);
+                                return LRESULT(0);
+                            }
+                        }
+                    }
+                }
+                // Widget Google Drive: doble clic en una fila -> abrir archivo o entrar en carpeta.
+                if app.fences[index].layout.widget.as_deref() == Some("gdrive") {
+                    let f = &app.fences[index];
+                    let header_px = (f.header_h(&app.theme) * f.scale) as i32;
+                    let in_grip = x > f.layout.width - GRIP
+                        && y > f.visible_height(&app.theme) - GRIP
+                        && !f.layout.collapsed;
+                    if y > header_px && !in_grip && app.gdrive.status() == gdrive::Status::Ready {
+                        let s = f.scale;
+                        let header_dip = f.header_h(&app.theme);
+                        let dy = y as f32 / s;
+                        let row_h_dip = (app.theme.row * s).max(28.0 * s) / s;
+                        let list_top_dip = header_dip + 32.0;
+                        let h_dip = f.visible_height(&app.theme) as f32 / s;
+                        if dy > list_top_dip && dy < h_dip - 40.0 {
+                            let idx = ((dy - list_top_dip) / row_h_dip).floor() as usize;
+                            let item = app.gdrive_scroll.max(0) as usize + idx;
+                            if item < app.gdrive_files.len() {
+                                let entry = app.gdrive_files[item].clone();
+                                app.gdrive_open_entry(entry);
                                 return LRESULT(0);
                             }
                         }
@@ -9905,6 +11112,22 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                     let next = (app.dropbox_scroll - delta * 3).clamp(0, max);
                     if next != app.dropbox_scroll {
                         app.dropbox_scroll = next;
+                        let _ = app.render(index);
+                    }
+                    return LRESULT(0);
+                }
+                // Widget Google Drive: la rueda desplaza la lista de archivos.
+                if app.fences[index].layout.widget.as_deref() == Some("gdrive") {
+                    let f = &app.fences[index];
+                    let s = f.scale;
+                    let row_h = (app.theme.row * s).max(28.0 * s);
+                    let content_h = (f.visible_height(&app.theme) as f32 - f.header_h(&app.theme) * s - 72.0 * s)
+                        .max(0.0);
+                    let visible = (content_h / row_h).floor().max(1.0) as usize;
+                    let max = (app.gdrive_files.len().saturating_sub(visible)) as i32;
+                    let next = (app.gdrive_scroll - delta * 3).clamp(0, max);
+                    if next != app.gdrive_scroll {
+                        app.gdrive_scroll = next;
                         let _ = app.render(index);
                     }
                     return LRESULT(0);

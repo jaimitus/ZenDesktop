@@ -125,6 +125,9 @@ pub struct Config {
     pub spotify: SpotifyConfig,
     /// Configuracion del widget de Dropbox (OAuth PKCE + sync de carpeta).
     pub dropbox: DropboxConfig,
+    /// Configuracion del widget de Google Drive (OAuth PKCE + sync).
+    #[serde(default)]
+    pub gdrive: GDriveConfig,
     /// Configuracion del widget de monitor del sistema (CPU/RAM/bateria).
     #[serde(default)]
     pub monitor: MonitorConfig,
@@ -217,6 +220,38 @@ impl Default for DropboxConfig {
             redirect_uri: DROPBOX_REDIRECT_URI.into(),
             local_folder: String::new(),
             remote_folder: "/ZenDesktop".into(),
+        }
+    }
+}
+
+pub const GDRIVE_REDIRECT_URI: &str = "http://127.0.0.1:8898/callback";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GDriveConfig {
+    /// true => la caja widget de Google Drive se crea en el escritorio.
+    pub enabled: bool,
+    /// Client ID de la aplicacion de Google Cloud Console.
+    pub client_id: String,
+    /// Client Secret de la aplicacion de Google Cloud Console.
+    pub client_secret: String,
+    /// Redirect URI registrada en Google Cloud Console.
+    pub redirect_uri: String,
+    /// Carpeta local que se sincroniza con Google Drive.
+    pub local_folder: String,
+    /// Carpeta remota (nombre o ID, 'root' = Mi Unidad).
+    pub remote_folder: String,
+}
+
+impl Default for GDriveConfig {
+    fn default() -> Self {
+        GDriveConfig {
+            enabled: false,
+            client_id: String::new(),
+            client_secret: String::new(),
+            redirect_uri: GDRIVE_REDIRECT_URI.into(),
+            local_folder: String::new(),
+            remote_folder: "root".into(),
         }
     }
 }
@@ -663,6 +698,7 @@ impl Default for Config {
             widgets_disabled: Vec::new(),
             spotify: SpotifyConfig::default(),
             dropbox: DropboxConfig::default(),
+            gdrive: GDriveConfig::default(),
             monitor: MonitorConfig::default(),
         }
     }
@@ -905,6 +941,16 @@ impl Config {
             self.dropbox.redirect_uri = DROPBOX_REDIRECT_URI.into();
         }
         self.dropbox.remote_folder = self.dropbox.remote_folder.trim().to_string();
+
+        self.gdrive.client_id = self.gdrive.client_id.trim().to_string();
+        self.gdrive.client_secret = self.gdrive.client_secret.trim().to_string();
+        if self.gdrive.redirect_uri.trim().is_empty() {
+            self.gdrive.redirect_uri = GDRIVE_REDIRECT_URI.into();
+        }
+        self.gdrive.remote_folder = self.gdrive.remote_folder.trim().to_string();
+        if self.gdrive.remote_folder.is_empty() {
+            self.gdrive.remote_folder = "root".into();
+        }
 
         // Material de fondo: valores desconocidos (config editada a mano)
         // caen al modo sin material; opacidad y tinte se acotan.
