@@ -7,6 +7,27 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.21] - 2026-08-14
+
+### Added
+- **🖼️ Real thumbnails in grid mode** — image files show a real thumbnail
+  (WIC-based, shared LRU cache) inside grid cells instead of a generic icon,
+  for a much nicer browsing experience with photo folders.
+- **📊 Per-fence statistics tooltip** — hovering a fence title shows a
+  multi-line tooltip with the item count, total size and file-type breakdown.
+- **📊 System Monitor widget** — a first-class widget box (CPU / RAM /
+  battery bars, refreshed every second) managed from its own Settings tab
+  (enable/disable, update interval), just like the Spotify and Dropbox
+  widgets.
+- **🤖 AI-suggested rules** — a "Suggest desktop rules" button in Settings →
+  Rules asks your local Ollama model for a rule proposal and lets you review
+  it with checkboxes before adding only the rules you tick (additive — never
+  replaces your existing rules).
+- **🔄 Automatic config backup** — config is backed up silently before each
+  save (throttled to 1/hour, keeping the 12 most recent copies) with a
+  readable timestamp in the filename, plus an "Open backups folder" button in
+  Settings → General.
+
 ## [1.0.20] - 2026-08-14
 
 ### Added

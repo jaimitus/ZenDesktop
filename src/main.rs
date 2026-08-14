@@ -23,6 +23,7 @@ mod dropbox;
 mod i18n;
 mod rules;
 mod settings;
+mod monitor;
 mod spotify;
 mod ui;
 mod updater;

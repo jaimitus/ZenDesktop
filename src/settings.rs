@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -59,7 +60,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    SHBrowseForFolderW, SHGetPathFromIDListW, SHParseDisplayName, BIF_NEWDIALOGSTYLE,
+    SHBrowseForFolderW, SHGetPathFromIDListW, SHParseDisplayName, ShellExecuteW, BIF_NEWDIALOGSTYLE,
     BIF_RETURNONLYFSDIRS, BROWSEINFOW,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -148,6 +149,7 @@ const ID_CHECK_AUTO_UPDATE: u16 = 161;
 const ID_CHECK_WIDGET_ENABLED: u16 = 170;
 const ID_CHECK_SPOTIFY_ENABLED: u16 = 171;
 const ID_CHECK_DROPBOX_ENABLED: u16 = 172;
+const ID_CHECK_MONITOR_ENABLED: u16 = 173;
 
 const ID_BTN_NEW: u16 = 201;
 const ID_BTN_DEL: u16 = 202;
@@ -164,11 +166,14 @@ const ID_BTN_CHECK_UPDATES: u16 = 213;
 const ID_BTN_DOWNLOAD_UPDATE: u16 = 214;
 const ID_BTN_EXPORT_CFG: u16 = 215;
 const ID_BTN_IMPORT_CFG: u16 = 216;
+const ID_BTN_OPEN_BACKUPS: u16 = 233;
 const ID_BTN_TEMPLATE_SAVE: u16 = 217;
 const ID_BTN_TEMPLATE_APPLY: u16 = 218;
 const ID_BTN_TEMPLATE_DEL: u16 = 219;
 const ID_BTN_TEMPLATE_DEFAULT: u16 = 220;
 const ID_BTN_R_AI_GEN: u16 = 221;
+const ID_BTN_AI_SUGGEST: u16 = 234;
+const ID_BTN_AI_APPLY_SUGG: u16 = 235;
 const ID_BTN_WIDGET_NEW: u16 = 222;
 const ID_BTN_WIDGET_DEL: u16 = 223;
 const ID_BTN_WIDGET_SAVE: u16 = 224;
@@ -192,10 +197,12 @@ const WM_AI_MODELS_DONE: u32 = WM_APP + 0x42;
 const WM_AI_CLUSTER_DONE: u32 = WM_APP + 0x43;
 const WM_UPDATE_DONE: u32 = WM_APP + 0x44;
 const WM_AI_RULE_DONE: u32 = WM_APP + 0x45;
+const WM_AI_SUGGEST_DONE: u32 = WM_APP + 0x46;
 
 static AI_PING_RESULT: Mutex<Option<bool>> = Mutex::new(None);
 static AI_MODELS_RESULT: Mutex<Option<Vec<String>>> = Mutex::new(None);
 static AI_CLUSTER_RESULT: Mutex<Option<Vec<crate::ai::AiSuggestedRule>>> = Mutex::new(None);
+static AI_SUGGEST_RESULT: Mutex<Option<Vec<crate::ai::AiSuggestedRule>>> = Mutex::new(None);
 static AI_RULE_RESULT: Mutex<Option<crate::ai::AiRuleDraft>> = Mutex::new(None);
 static UPDATE_RESULT: Mutex<Option<crate::updater::UpdateStatus>> = Mutex::new(None);
 
@@ -293,6 +300,7 @@ enum Panel {
     Widgets,
     Spotify,
     Dropbox,
+    Monitor,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -305,6 +313,7 @@ enum Ctrl {
     RuleSort(usize),
     RuleView(usize, &'static str),
     RuleIcon(usize),
+    AiSugg(usize),
     Btn(u16),
     Folder(u16),
     Close,
@@ -402,6 +411,10 @@ struct Settings {
     rules_scroll: usize,
     /// Orden por regla (indice en cfg.rules -> sort_mode).
     rules_sort: std::collections::HashMap<usize, Option<String>>,
+
+    // Sugerencias de reglas con IA (analisis del escritorio, aditivo).
+    ai_suggestions: Vec<crate::ai::AiSuggestedRule>,
+    ai_suggest_sel: Vec<bool>,
 
     // Widgets (Lua)
     widgets_dir: PathBuf,
@@ -656,6 +669,46 @@ impl Settings {
                 bottom: y + h,
             },
         );
+    }
+
+    /// Fila de sugerencia de regla IA: toggle (checkbox) + titulo + extensiones.
+    fn ai_suggest_row(&mut self, y: f32, cx: f32, cw: f32, idx: usize, sug: &crate::ai::AiSuggestedRule, on: bool) -> f32 {
+        let x = cx + 16.0;
+        let w = cw - 32.0;
+        let h = 30.0;
+        let over = self.hover == Some(Ctrl::AiSugg(idx));
+        let bg = if over { col(C_HOVER) } else { col("#00000000") };
+        self.fill_rr(x, y, w, h, 6.0, bg);
+        // Toggle compacto.
+        let sw_w = 30.0;
+        let sw_h = 16.0;
+        let by = y + (h - sw_h) * 0.5;
+        let track_bg = if on { col(C_ACCENT) } else { col(C_FIELD) };
+        self.fill_rr(x + 6.0, by, sw_w, sw_h, sw_h * 0.5, track_bg);
+        self.draw_rr(
+            Rect { x: x + 6.0, y: by, w: sw_w, h: sw_h },
+            sw_h * 0.5,
+            if on { col(C_ACCENT) } else { rgba(C_FIELD_BORDER, 0.8) },
+            1.0,
+        );
+        let dot_size = 10.0;
+        let dot_x = if on { x + 6.0 + sw_w - dot_size - 3.0 } else { x + 6.0 + 3.0 };
+        let dot_y = by + (sw_h - dot_size) * 0.5;
+        self.fill_rr(dot_x, dot_y, dot_size, dot_size, dot_size * 0.5, if on { col(C_ON_ACCENT) } else { col(C_MUTED) });
+        // Titulo + extensiones.
+        let title_rect = D2D_RECT_F { left: x + 6.0 + sw_w + 10.0, top: y, right: x + w, bottom: y + h };
+        self.text(&sug.title, Fmt::Body, title_rect, col(C_TEXT));
+        if !sug.extensions.is_empty() {
+            let exts = sug.extensions.join(" · ");
+            self.text(
+                &format!("  —  {}", exts),
+                Fmt::Small,
+                D2D_RECT_F { left: x + 6.0 + sw_w + 10.0 + 140.0, top: y, right: x + w, bottom: y + h },
+                col(C_MUTED),
+            );
+        }
+        self.add_region(Ctrl::AiSugg(idx), D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h });
+        y + h + 4.0
     }
 
     fn field_row(&mut self, y: f32, content: (f32, f32), id: u16, label: &str, value: &str, swatch: bool) -> f32 {
@@ -1139,6 +1192,7 @@ impl Settings {
         let bx0 = cx + 16.0;
         self.icon_button(Rect { x: bx0, y, w: 220.0, h: 32.0 }, self.tr.btn_export_cfg, ID_BTN_EXPORT_CFG, true);
         self.icon_button(Rect { x: bx0 + 230.0, y, w: 220.0, h: 32.0 }, self.tr.btn_import_cfg, ID_BTN_IMPORT_CFG, true);
+        self.icon_button(Rect { x: bx0 + 460.0, y, w: 220.0, h: 32.0 }, self.tr.btn_open_backups, ID_BTN_OPEN_BACKUPS, true);
         y += 42.0;
         y = self.section(y, cx, cw, self.tr.sec_templates);
         // Nombre de la plantilla a guardar/aplicar/borrar.
@@ -1491,10 +1545,33 @@ impl Settings {
             ID_BTN_R_AI_GEN,
             self.rules_selected.is_some(),
         );
+        // Analizar el escritorio y PROBAR reglas nuevas (aditivo).
+        self.icon_button(
+            Rect { x: cx + 226.0, y, w: 210.0, h: 28.0 },
+            self.tr.btn_ai_suggest,
+            ID_BTN_AI_SUGGEST,
+            true,
+        );
         if AI_BUSY.load(Ordering::SeqCst) {
-            self.spinner(cx + 226.0, y + 14.0, 8.0, self.spinner_phase);
+            self.spinner(cx + 446.0, y + 14.0, 8.0, self.spinner_phase);
         }
         y += 38.0;
+        // Lista de sugerencias con checkboxes para anadir solo las marcadas.
+        if !self.ai_suggestions.is_empty() {
+            y = self.section(y, cx, cw, self.tr.sec_ai_suggest);
+            for i in 0..self.ai_suggestions.len() {
+                let sel = self.ai_suggest_sel.get(i).copied().unwrap_or(false);
+                let sug = self.ai_suggestions[i].clone();
+                y = self.ai_suggest_row(y, cx, cw, i, &sug, sel);
+            }
+            self.icon_button(
+                Rect { x: cx + 16.0, y, w: 230.0, h: 30.0 },
+                self.tr.btn_ai_apply_sugg,
+                ID_BTN_AI_APPLY_SUGG,
+                self.ai_suggest_sel.iter().any(|s| *s),
+            );
+            y += 40.0;
+        }
         // Titulo del grupo: solo se muestra si la regla seleccionada esta
         // agrupada (el campo nativo se oculta/limpieza solo al no renderizarse).
         let group_title = self
@@ -1993,6 +2070,27 @@ impl Settings {
         );
     }
 
+    fn panel_monitor(&mut self, cy: f32) {
+        let (cx, _, cw, _) = self.content_area();
+        let mut y = cy + 10.0;
+        let tr = self.tr;
+
+        y = self.section(y, cx, cw, tr.sec_monitor);
+        y = self.check(y, cx, cw, ID_CHECK_MONITOR_ENABLED, tr.chk_monitor_enabled);
+        y += 12.0;
+        self.text(
+            tr.msg_monitor_note,
+            Fmt::Small,
+            D2D_RECT_F {
+                left: cx + 16.0,
+                top: y,
+                right: cx + cw - 16.0,
+                bottom: y + 60.0,
+            },
+            col(C_DIM),
+        );
+    }
+
     /// Estado actual de Dropbox (de la app viva; Unconfigured si no hay app).
     fn dropbox_app_status(&self) -> crate::dropbox::Status {
         if self.app.is_null() {
@@ -2400,8 +2498,7 @@ impl Settings {
         let y0 = HEADER_H;
         let h = self.size.1 - HEADER_H - BAR_H;
         self.fill_rr(0.0, y0, SIDEBAR_W, h, 0.0, col(C_SIDEBAR));
-        self.draw_rr(Rect { x: SIDEBAR_W - 1.0, y: y0, w: 1.0, h }, 0.0, rgba(C_CARD_BORDER, 0.6), 1.0);
-        let items: [(Panel, &'static str); 9] = [
+        self.draw_rr(Rect { x: SIDEBAR_W - 1.0, y: y0, w: 1.0, h }, 0.0, rgba(C_CARD_BORDER, 0.6), 1.0);            let items: [(Panel, &'static str); 10] = [
             (Panel::General, self.tr.nav_general),
             (Panel::Rules, self.tr.nav_rules),
             (Panel::Appearance, self.tr.nav_appearance),
@@ -2411,6 +2508,7 @@ impl Settings {
             (Panel::Widgets, "🧩 Widgets"),
             (Panel::Spotify, self.tr.nav_spotify),
             (Panel::Dropbox, self.tr.nav_dropbox),
+            (Panel::Monitor, self.tr.nav_monitor),
         ];
         let mut y = y0 + 16.0;
         for (panel, label) in items {
@@ -2746,6 +2844,7 @@ impl Settings {
             Panel::Widgets => self.panel_widgets(scy),
             Panel::Spotify => self.panel_spotify(scy),
             Panel::Dropbox => self.panel_dropbox(scy),
+            Panel::Monitor => self.panel_monitor(scy),
         }
         // Limite de desplazamiento = el punto mas bajo del contenido dibujado.
         let max_bottom = self.regions[panel_start..]
@@ -2908,6 +3007,7 @@ impl Settings {
             Ctrl::Nav(Panel::Widgets),
             Ctrl::Nav(Panel::Spotify),
             Ctrl::Nav(Panel::Dropbox),
+            Ctrl::Nav(Panel::Monitor),
         ];
         match self.panel {
             Panel::General => {
@@ -2928,6 +3028,7 @@ impl Settings {
                     Ctrl::Field(ID_EDIT_PURGE),
                     Ctrl::Btn(ID_BTN_EXPORT_CFG),
                     Ctrl::Btn(ID_BTN_IMPORT_CFG),
+                    Ctrl::Btn(ID_BTN_OPEN_BACKUPS),
                     Ctrl::Field(ID_EDIT_TEMPLATE_NAME),
                     Ctrl::Btn(ID_BTN_TEMPLATE_SAVE),
                     Ctrl::Btn(ID_BTN_TEMPLATE_APPLY),
@@ -2949,6 +3050,9 @@ impl Settings {
                     Ctrl::Check(ID_CHECK_R_FOLDERS),
                     Ctrl::Field(ID_EDIT_R_AI_DESC),
                     Ctrl::Btn(ID_BTN_R_AI_GEN),
+                    Ctrl::Btn(ID_BTN_AI_SUGGEST),
+                    Ctrl::AiSugg(0),
+                    Ctrl::Btn(ID_BTN_AI_APPLY_SUGG),
                     Ctrl::Field(ID_EDIT_R_TITLE),
                     Ctrl::Field(ID_EDIT_R_GROUP_TITLE),
                     Ctrl::Field(ID_EDIT_R_FOLDER),
@@ -3037,6 +3141,11 @@ impl Settings {
                     Ctrl::Btn(ID_BTN_DROPBOX_SYNC),
                 ]);
             }
+            Panel::Monitor => {
+                order.extend([
+                    Ctrl::Check(ID_CHECK_MONITOR_ENABLED),
+                ]);
+            }
         }
         order.push(Ctrl::Btn(ID_BTN_OK));
         order.push(Ctrl::Btn(ID_BTN_CANCEL));
@@ -3122,10 +3231,19 @@ impl Settings {
             Ctrl::Btn(ID_BTN_AI_DETECT_MODELS) => self.detect_models(),
             Ctrl::Btn(ID_BTN_AI_REORGANIZE) => self.reorganize_with_ai(),
             Ctrl::Btn(ID_BTN_R_AI_GEN) => self.generate_rule_with_ai(),
+            Ctrl::Btn(ID_BTN_AI_SUGGEST) => self.suggest_rules_with_ai(),
+            Ctrl::Btn(ID_BTN_AI_APPLY_SUGG) => self.apply_ai_suggestions(),
+            Ctrl::AiSugg(i) => {
+                if i < self.ai_suggest_sel.len() {
+                    self.ai_suggest_sel[i] = !self.ai_suggest_sel[i];
+                    self.invalidate();
+                }
+            }
             Ctrl::Btn(ID_BTN_CHECK_UPDATES) => self.check_for_updates(),
             Ctrl::Btn(ID_BTN_DOWNLOAD_UPDATE) => self.download_update(),
             Ctrl::Btn(ID_BTN_EXPORT_CFG) => self.export_config(),
             Ctrl::Btn(ID_BTN_IMPORT_CFG) => self.import_config(),
+            Ctrl::Btn(ID_BTN_OPEN_BACKUPS) => self.open_backups_folder(),
             Ctrl::Btn(ID_BTN_TEMPLATE_SAVE) => self.template_save(),
             Ctrl::Btn(ID_BTN_TEMPLATE_APPLY) => self.template_apply(),
             Ctrl::Btn(ID_BTN_TEMPLATE_DEL) => self.template_delete(),
@@ -3601,6 +3719,133 @@ impl Settings {
         self.invalidate();
     }
 
+    /// Analiza el escritorio con Ollama (clustering + nombres) y propone reglas
+    /// de organizacion NUEVAS, sin tocar las existentes: el usuario marca las
+    /// que quiera en una lista con checkboxes y las anade con un boton.
+    fn suggest_rules_with_ai(&mut self) {
+        if self.app.is_null() {
+            return;
+        }
+        if AI_BUSY.swap(true, Ordering::SeqCst) {
+            return; // Ya hay una operacion de IA en curso.
+        }
+        let app = unsafe { &mut *self.app };
+        let host_url = self.edit_text(ID_EDIT_AI_URL).unwrap_or_else(|| self.cfg.ai.ollama_url.clone());
+        let host_clean = host_url.replace("http://", "").replace("https://", "");
+        let parts: Vec<&str> = host_clean.split(':').collect();
+        let host = parts.first().copied().unwrap_or("127.0.0.1").trim();
+        let port = parts.get(1).and_then(|p| p.parse::<u16>().ok()).unwrap_or(11434);
+        let client_host = host.to_string();
+        let client_port = port;
+        let client_model = self.edit_text(ID_EDIT_AI_MODEL).unwrap_or_else(|| self.cfg.ai.model.clone());
+        let embed_model = self.edit_text(ID_EDIT_AI_EMBED_MODEL).unwrap_or_else(|| self.cfg.ai.embed_model.clone());
+        let language = self.cfg.language.clone();
+        let hwnd = self.hwnd.0 as usize;
+
+        let desktop_path = app.desktop.clone();
+        let mut filenames = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&desktop_path) {
+            for entry in entries.flatten() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    if !name.starts_with('.') && name != "desktop.ini" {
+                        filenames.push(name);
+                    }
+                }
+            }
+        }
+        if filenames.is_empty() {
+            AI_BUSY.store(false, Ordering::SeqCst);
+            unsafe {
+                let body = crate::config::wide("ℹ️ Tu escritorio ya está limpio o no contiene archivos sueltos para sugerir reglas.");
+                let title = crate::config::wide("ZenDesktop :: IA");
+                MessageBoxW(self.hwnd, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
+            }
+            return;
+        }
+
+        let _ = std::thread::spawn(move || {
+            let hwnd = HWND(hwnd as *mut c_void);
+            let client = crate::ai::AiClient {
+                host: client_host,
+                port: client_port,
+                model: client_model,
+            };
+            let suggestions = client.auto_cluster_desktop(&filenames, &embed_model, &language);
+            if let Ok(mut slot) = AI_SUGGEST_RESULT.lock() {
+                *slot = Some(suggestions);
+            }
+            let _ = unsafe { PostMessageW(hwnd, WM_AI_SUGGEST_DONE, WPARAM(0), LPARAM(0)) };
+        });
+    }
+
+    fn on_ai_suggest_done(&mut self) {
+        AI_BUSY.store(false, Ordering::SeqCst);
+        let Some(suggestions) = AI_SUGGEST_RESULT.lock().ok().and_then(|mut s| s.take()) else { return };
+        if suggestions.is_empty() {
+            self.ai_suggestions.clear();
+            self.ai_suggest_sel.clear();
+            self.invalidate();
+            unsafe {
+                let body = crate::config::wide("🔴 No se pudo obtener propuestas de Ollama. Verifica que el modelo esté activo.");
+                let title = crate::config::wide("ZenDesktop :: Error IA");
+                MessageBoxW(self.hwnd, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONWARNING);
+            }
+            return;
+        }
+        // Nueva propuesta: todas marcadas por defecto (el usuario desmarca).
+        self.ai_suggestions = suggestions;
+        self.ai_suggest_sel = vec![true; self.ai_suggestions.len()];
+        self.invalidate();
+    }
+
+    /// Anade las sugerencias marcadas como reglas nuevas (aditivo: conserva
+    /// las reglas existentes) y refresca la lista.
+    fn apply_ai_suggestions(&mut self) {
+        let count = self.ai_suggestions.len();
+        let mut added = 0usize;
+        let base = self.cfg.rules.len();
+        for (i, sug) in self.ai_suggestions.iter().enumerate() {
+            if i >= self.ai_suggest_sel.len() || !self.ai_suggest_sel[i] {
+                continue;
+            }
+            self.cfg.rules.push(Rule {
+                id: format!("ai-sugg-{}", base + added),
+                title: sug.title.clone(),
+                enabled: true,
+                extensions: sug.extensions.clone(),
+                name_patterns: sug.name_patterns.clone(),
+                folder: sug.folder.clone(),
+                move_files: true,
+                include_folders: true,
+                color: if sug.color.starts_with('#') { sug.color.clone() } else { "#38BDF8".into() },
+                view_mode: "auto".into(),
+                icon_size: None,
+                min_size_bytes: None,
+                max_size_bytes: None,
+                newer_than_days: None,
+                older_than_days: None,
+                regex: None,
+                pinned: Vec::new(),
+            });
+            added += 1;
+        }
+        if added == 0 {
+            return;
+        }
+        // Seleccionar la primera regla nueva y refrescar el editor.
+        self.rules_selected = Some(base);
+        self.refresh_rule_fields();
+        self.ai_suggestions.clear();
+        self.ai_suggest_sel.clear();
+        self.invalidate();
+        unsafe {
+            let msg = format!("✨ Se han añadido {added} reglas nuevas (de {count} propuestas). Revísalas y pulsa Guardar para aplicarlas.");
+            let body = crate::config::wide(&msg);
+            let title = crate::config::wide("ZenDesktop :: Sugerencias IA");
+            MessageBoxW(self.hwnd, PCWSTR(body.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
+        }
+    }
+
     fn check_for_updates(&self) {
         if UPDATE_BUSY.swap(true, Ordering::SeqCst) {
             return; // Ya hay una comprobacion en curso.
@@ -3805,6 +4050,18 @@ impl Settings {
                     MessageBoxW(self.hwnd, PCWSTR(body.as_ptr()), w!("ZenDesktop"), MB_OK | MB_ICONINFORMATION);
                 }
             }
+        }
+    }
+
+    /// Abre con el explorador la carpeta de backups automaticos del config.
+    fn open_backups_folder(&self) {
+        let dir = crate::config::Config::resolve_path()
+            .map(|p| crate::config::Config::backups_dir_for(&p))
+            .unwrap_or_else(|_| PathBuf::from("backups"));
+        let _ = fs::create_dir_all(&dir);
+        let wdir = crate::config::wide(&dir.to_string_lossy());
+        unsafe {
+            let _ = ShellExecuteW(None, w!("open"), PCWSTR(wdir.as_ptr()), None, None, windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL);
         }
     }
 
@@ -4322,6 +4579,7 @@ impl Settings {
 
         // Widget de Dropbox: activacion, App Key, Redirect URI y carpetas.
         cfg.dropbox.enabled = self.checked(ID_CHECK_DROPBOX_ENABLED);
+        cfg.monitor.enabled = self.checked(ID_CHECK_MONITOR_ENABLED);
         let db_key = text(ID_EDIT_DROPBOX_APP_KEY).trim().to_string();
         if !db_key.is_empty() {
             cfg.dropbox.app_key = db_key;
@@ -4852,6 +5110,11 @@ extern "system" fn dlg_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                 state.on_ai_rule_done();
                 LRESULT(0)
             }
+            WM_AI_SUGGEST_DONE => {
+                let state = &mut *state_from(hwnd);
+                state.on_ai_suggest_done();
+                LRESULT(0)
+            }
             WM_UPDATE_DONE => {
                 let state = &mut *state_from(hwnd);
                 state.on_update_done();
@@ -5199,6 +5462,7 @@ fn initial_checks(cfg: &Config) -> HashMap<u16, bool> {
     m.insert(ID_CHECK_A_GRID, cfg.appearance.grid_mode);
     m.insert(ID_CHECK_AI_ENABLE, cfg.ai.enabled);
     m.insert(ID_CHECK_SPOTIFY_ENABLED, cfg.spotify.enabled);
+    m.insert(ID_CHECK_MONITOR_ENABLED, cfg.monitor.enabled);
     m
 }
 
@@ -5304,6 +5568,8 @@ pub fn open_dialog(current: &Config, app: *mut App) -> Option<Config> {
             rules_selected: if current.rules.is_empty() { None } else { Some(0) },
             rules_scroll: 0,
             rules_sort: std::collections::HashMap::new(),
+            ai_suggestions: Vec::new(),
+            ai_suggest_sel: Vec::new(),
             widgets_dir,
             widgets_list,
             widgets_selected,

@@ -798,14 +798,16 @@ impl Drop for SurfaceDib {
     }
 }
 
-/// Miniatura cargada (WIC decode -> raw BGRA pixels).
+/// Miniatura cargada (WIC decode -> raw BGRA premultiplicado).
+#[derive(Clone)]
 struct ThumbEntry {
     pixels: Vec<u8>,
     w: i32,
     h: i32,
 }
 
-/// Cache LRU de miniaturas (hasta 32 entradas).
+/// Cache LRU de miniaturas compartida (hover + modo cuadricula).
+const THUMB_CACHE_CAP: usize = 128;
 struct ThumbCache {
     entries: Vec<(PathBuf, ThumbEntry)>,
 }
@@ -813,18 +815,44 @@ struct ThumbCache {
 impl ThumbCache {
     fn new() -> Self { ThumbCache { entries: Vec::new() } }
 
-    fn get(&self, path: &Path) -> Option<&ThumbEntry> {
-        self.entries.iter().find(|(p, _)| p == path).map(|(_, t)| t)
+    /// Busca y marca como usada (mueve al final = mas reciente).
+    fn get(&mut self, path: &Path) -> Option<&ThumbEntry> {
+        if let Some(pos) = self.entries.iter().position(|(p, _)| p == path) {
+            let entry = self.entries.remove(pos);
+            self.entries.push(entry);
+            self.entries.last().map(|(_, t)| t)
+        } else {
+            None
+        }
     }
 
     fn insert(&mut self, path: PathBuf, entry: ThumbEntry) {
         self.entries.retain(|(p, _)| p != &path);
         self.entries.push((path, entry));
-        if self.entries.len() > 32 {
+        while self.entries.len() > THUMB_CACHE_CAP {
             self.entries.remove(0);
         }
     }
 
+}
+
+/// Miniatura desde la cache global (compartida entre el hover y la cuadricula):
+/// carga con WIC solo si falta. Devuelve una copia lista para pintar.
+unsafe fn thumb_cached(path: &Path) -> Option<ThumbEntry> {
+    static mut CACHE: Option<ThumbCache> = None;
+    // SAFETY: la cache solo se toca desde el hilo de UI (single-threaded).
+    let cache = unsafe {
+        let ptr: *mut Option<ThumbCache> = &raw mut CACHE;
+        if (*ptr).is_none() {
+            *ptr = Some(ThumbCache::new());
+        }
+        (*ptr).as_mut().unwrap()
+    };
+    if cache.get(path).is_none() {
+        let entry = load_thumbnail(path)?;
+        cache.insert(path.to_path_buf(), entry);
+    }
+    cache.get(path).cloned()
 }
 
 /// Carga una miniatura desde disco usando WIC (maximo MAX_DIM px).
@@ -1307,6 +1335,84 @@ fn spotify_queue_row_rect(idx: usize, scroll: i32, w: f32, content_h: f32) -> Op
     Some(D2D_RECT_F { left: pad, top: y, right: w - pad, bottom })
 }
 
+/// Boton de cerrar sesion (⏻) en la cabecera del widget Dropbox.
+fn dropbox_logout_rect(w: f32, header_dip: f32) -> D2D_RECT_F {
+    let s = 22.0;
+    D2D_RECT_F {
+        left: w - s - 10.0,
+        top: (header_dip - s) * 0.5,
+        right: w - 10.0,
+        bottom: (header_dip - s) * 0.5 + s,
+    }
+}
+
+/// Boton "Subir nivel" (⬆) en la cabecera del widget Dropbox.
+fn dropbox_header_up_rect(w: f32, header_dip: f32) -> D2D_RECT_F {
+    let s = 22.0;
+    D2D_RECT_F {
+        left: w - s * 2.0 - 10.0 - 6.0,
+        top: (header_dip - s) * 0.5,
+        right: w - s - 10.0 - 6.0,
+        bottom: (header_dip - s) * 0.5 + s,
+    }
+}
+
+/// Boton central de iniciar sesion para el widget Dropbox.
+fn dropbox_connect_rect(w: f32, h: f32) -> D2D_RECT_F {
+    let bw = 160.0_f32.min(w - 24.0);
+    let btn_y = (h * 0.5 + 24.0).min(h - 44.0).max(h * 0.5);
+    D2D_RECT_F {
+        left: (w - bw) * 0.5,
+        top: btn_y,
+        right: (w + bw) * 0.5,
+        bottom: btn_y + 32.0,
+    }
+}
+
+/// Boton "Sincronizar" en el pie del widget Dropbox.
+fn dropbox_sync_btn_rect(w: f32, h: f32) -> D2D_RECT_F {
+    let bw = 104.0;
+    D2D_RECT_F {
+        left: w - bw - 10.0,
+        top: h - 34.0,
+        right: w - 10.0,
+        bottom: h - 8.0,
+    }
+}
+
+/// Boton "Subir nivel / Arriba" (⬆) en el pie del widget Dropbox.
+fn dropbox_upload_btn_rect(w: f32, h: f32) -> D2D_RECT_F {
+    let bw = 32.0;
+    let sync_r = dropbox_sync_btn_rect(w, h);
+    D2D_RECT_F {
+        left: sync_r.left - bw - 6.0,
+        top: h - 34.0,
+        right: sync_r.left - 6.0,
+        bottom: h - 8.0,
+    }
+}
+
+/// Icono temático y color según extensión para archivos de Dropbox.
+fn dropbox_file_icon(name: &str, is_dir: bool) -> (&'static str, D2D1_COLOR_F) {
+    if is_dir {
+        return ("📁", argb_color(0xFFFBBF24)); // Amber folder
+    }
+    let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg" | "ico" => ("🖼", argb_color(0xFF38BDF8)),
+        "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" => ("🎵", argb_color(0xFF10B981)),
+        "mp4" | "mkv" | "avi" | "mov" | "webm" => ("🎬", argb_color(0xFFF43F5E)),
+        "pdf" => ("📕", argb_color(0xFFEF4444)),
+        "doc" | "docx" | "txt" | "md" | "rtf" => ("📝", argb_color(0xFF60A5FA)),
+        "xls" | "xlsx" | "csv" => ("📊", argb_color(0xFF34D399)),
+        "ppt" | "pptx" => ("📙", argb_color(0xFFFB923C)),
+        "zip" | "rar" | "7z" | "tar" | "gz" => ("📦", argb_color(0xFFA78BFA)),
+        "rs" | "js" | "ts" | "py" | "c" | "cpp" | "cs" | "html" | "css" | "json" | "toml" => ("💻", argb_color(0xFF818CF8)),
+        "exe" | "msi" | "bat" | "cmd" | "ps1" => ("⚙", argb_color(0xFF94A3B8)),
+        _ => ("📄", argb_color(0xFF94A3B8)),
+    }
+}
+
 /// Descarga y decodifica la portada (JPEG) a BGRA opaco.
 /// Logo de Spotify (PNG embebido en el binario) decodificado y redimensionado
 /// una sola vez a 128px (BGRA premultiplicado), para el estado vacio del widget.
@@ -1579,6 +1685,9 @@ struct Fence {
     hover: i32,
     hover_lock: bool,
     hover_pin: bool,
+    /// Raton sobre la zona de titulo de la cabecera (no sobre un icono):
+    /// muestra el tooltip con estadisticas de la caja.
+    hover_title: bool,
     pub is_mouse_over: bool,
     rubberband: Option<(f32, f32, f32, f32)>,
     drag: DragMode,
@@ -1968,6 +2077,16 @@ unsafe fn build_shell_menu_for_paths(paths: &[PathBuf]) -> Result<(IContextMenu,
     Ok((menu, hmenu, pidls[0]))
 }
 
+/// Elemento de sensor individual para el widget Monitor del Sistema
+struct MonitorCardItem<'a> {
+    icon: &'a str,
+    label: &'a str,
+    percent: f32,
+    detail: String,
+    history: &'a [f32],
+    color: D2D1_COLOR_F,
+}
+
 impl App {
     /// Crea la ventana controladora, las cajas y todos los recursos graficos.
     pub fn launch(
@@ -2119,6 +2238,8 @@ impl App {
             (*ptr).ensure_spotify_fence();
             // La caja del widget de Dropbox se crea al arrancar si esta activado.
             (*ptr).ensure_dropbox_fence();
+            // La caja del widget de monitor se crea al arrancar si esta activado.
+            (*ptr).ensure_monitor_fence();
             (*ptr).build_fences()?;
             // Plantilla por defecto: se aplica al arrancar solo si la
             // disposicion de monitores coincide con la guardada (p.ej. dock ya
@@ -2372,7 +2493,8 @@ impl App {
                 hover: -1,
                 hover_lock: false,
                 hover_pin: false,
-            is_mouse_over: false,
+                hover_title: false,
+                is_mouse_over: false,
                 rubberband: None,
                 drag: DragMode::None,
                 anchor: POINT::default(),
@@ -2485,6 +2607,7 @@ impl App {
                 hover: -1,
                 hover_lock: false,
                 hover_pin: false,
+                hover_title: false,
                 is_mouse_over: false,
                 rubberband: None,
                 drag: DragMode::None,
@@ -3367,10 +3490,46 @@ impl App {
                                 }
                             }
                             if theme.show_icons {
-                                if let Some(icon) = (*icons).get(&item.path, &item.ext, item.is_dir, if scale >= 1.5 { IconClass::Jumbo } else { IconClass::Large }) {
-                                    let ix = cx + (cell - icon_size) * 0.5;
-                                    let iy = cy_val + cell_pad + (cell * 0.70 - cell_pad - icon_size) * 0.5;
-                                    icon_jobs.push((ix as i32, iy as i32, icon_size.round() as i32, icon));
+                                // Miniaturas reales para imagenes (modo cuadricula):
+                                // se pinta la miniatura WIC en la celda en vez del
+                                // icono generico del shell.
+                                let ix = cx + (cell - icon_size) * 0.5;
+                                let iy = cy_val + cell_pad + (cell * 0.70 - cell_pad - icon_size) * 0.5;
+                                let mut drew_thumb = false;
+                                if self.cfg.appearance.show_thumbnails
+                                    && rules::is_image(&item.ext)
+                                    && item.path.is_file()
+                                {
+                                    if let Some(entry) = thumb_cached(&item.path) {
+                                        let (tw, th) = (entry.w.max(1) as f32, entry.h.max(1) as f32);
+                                        let fit = icon_size / tw.max(th);
+                                        let dw = (tw * fit).max(1.0);
+                                        let dh = (th * fit).max(1.0);
+                                        let dest = rect(
+                                            ix + (icon_size - dw) * 0.5,
+                                            iy + (icon_size - dh) * 0.5,
+                                            ix + (icon_size - dw) * 0.5 + dw,
+                                            iy + (icon_size - dh) * 0.5 + dh,
+                                        );
+                                        if let Ok(bitmap) = surface.target.CreateBitmap(
+                                            D2D_SIZE_U { width: entry.w as u32, height: entry.h as u32 },
+                                            Some(entry.pixels.as_ptr() as *const c_void),
+                                            (entry.w as u32) * 4,
+                                            &D2D1_BITMAP_PROPERTIES {
+                                                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                                                dpiX: 96.0,
+                                                dpiY: 96.0,
+                                            },
+                                        ) {
+                                            surface.target.DrawBitmap(&bitmap, Some(&dest), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                                            drew_thumb = true;
+                                        }
+                                    }
+                                }
+                                if !drew_thumb {
+                                    if let Some(icon) = (*icons).get(&item.path, &item.ext, item.is_dir, if scale >= 1.5 { IconClass::Jumbo } else { IconClass::Large }) {
+                                        icon_jobs.push((ix as i32, iy as i32, icon_size.round() as i32, icon));
+                                    }
                                 }
                             }
                             brush.SetColor(&theme.text);
@@ -3869,6 +4028,9 @@ impl App {
         }
         if widget_name == "dropbox" {
             return self.render_dropbox_fence(index);
+        }
+        if widget_name == "monitor" {
+            return self.render_monitor_fence(index);
         }
         let theme_ptr: *const Theme = &self.theme;
         let gfx_ptr: *const Graphics = &self.gfx;
@@ -4415,6 +4577,31 @@ impl App {
         }
     }
 
+    /// Asegura la existencia de la caja del widget de monitor del sistema segun
+    /// `cfg.monitor.enabled`: activado -> crea `[[fences]] widget = "monitor"`
+    /// si falta; desactivado -> la elimina.
+    fn ensure_monitor_fence(&mut self) {
+        let has_box = self
+            .cfg
+            .fences
+            .iter()
+            .any(|f| f.widget.as_deref() == Some("monitor"));
+        if self.cfg.monitor.enabled && !has_box {
+            let n = self.cfg.fences.iter().filter(|f| f.widget.is_some()).count() as i32;
+            self.cfg.fences.push(FenceLayout {
+                id: String32::new("widget:monitor"),
+                x: 200 + n * 32,
+                y: 200 + n * 32,
+                width: 280,
+                height: 210,
+                widget: Some("monitor".into()),
+                ..Default::default()
+            });
+        } else if !self.cfg.monitor.enabled {
+            self.cfg.fences.retain(|f| f.widget.as_deref() != Some("monitor"));
+        }
+    }
+
     /// Aplica App Key / App Secret / Redirect URI editados en la configuracion
     /// al cliente Dropbox vivo (lo llama el dialogo antes de conectar/guardar).
     pub(crate) fn dropbox_configure(&mut self, key: &str, secret: &str, redirect: &str) {
@@ -4651,8 +4838,472 @@ impl App {
         self.render_all();
     }
 
-    /// Renderiza la caja widget de Dropbox: marco + cabecera + lista de
-    /// archivos de la carpeta remota + boton de sincronizacion.
+    /// Dibuja una gráfica tipo sparkline (área translúcida + línea + punto LED)
+    unsafe fn draw_monitor_sparkline(
+        target: &ID2D1DCRenderTarget,
+        brush: &ID2D1SolidColorBrush,
+        history: &[f32],
+        r: &D2D_RECT_F,
+        color: D2D1_COLOR_F,
+        scale: f32,
+    ) {
+        if history.len() < 2 {
+            return;
+        }
+        let w = (r.right - r.left).max(8.0);
+        let h = (r.bottom - r.top).max(6.0);
+        let n = history.len();
+        let step_x = w / (n - 1) as f32;
+
+        // 1. Área translúcida bajo la curva
+        brush.SetColor(&with_alpha(color, 0.12));
+        let mut prev_x = r.left;
+        let mut prev_y = r.bottom - (history[0].clamp(0.0, 100.0) / 100.0) * h;
+
+        for (i, &v) in history.iter().enumerate().skip(1) {
+            let x = r.left + i as f32 * step_x;
+            let y = r.bottom - (v.clamp(0.0, 100.0) / 100.0) * h;
+            let strip = D2D_RECT_F {
+                left: prev_x,
+                top: prev_y.min(y).min(r.bottom - 1.0),
+                right: x,
+                bottom: r.bottom,
+            };
+            unsafe { target.FillRectangle(&strip, brush) };
+            prev_x = x;
+            prev_y = y;
+        }
+
+        // 2. Trazo de línea iluminada
+        brush.SetColor(&with_alpha(color, 0.88));
+        prev_x = r.left;
+        prev_y = r.bottom - (history[0].clamp(0.0, 100.0) / 100.0) * h;
+        for (i, &v) in history.iter().enumerate().skip(1) {
+            let x = r.left + i as f32 * step_x;
+            let y = r.bottom - (v.clamp(0.0, 100.0) / 100.0) * h;
+            unsafe {
+                target.DrawLine(
+                    D2D_POINT_2F { x: prev_x, y: prev_y },
+                    D2D_POINT_2F { x, y },
+                    brush,
+                    1.5 * scale,
+                    None,
+                );
+            }
+            prev_x = x;
+            prev_y = y;
+        }
+
+        // 3. Punto LED en la última muestra
+        brush.SetColor(&argb_color(0x55FFFFFF));
+        fill_circle(target, brush, prev_x, prev_y, 3.2 * scale);
+        brush.SetColor(&color);
+        fill_circle(target, brush, prev_x, prev_y, 1.8 * scale);
+    }
+
+    /// Renderiza la caja del widget de monitor del sistema con tarjetas modernas,
+    /// métricas de CPU, RAM, GPU (VRAM) y batería, con gráficas sparkline en vivo.
+    fn render_monitor_fence(&mut self, index: usize) -> WinResult<()> {
+        let theme_ptr: *const Theme = &self.theme;
+        let gfx_ptr: *const Graphics = &self.gfx;
+        let theme = unsafe { &*theme_ptr };
+        let gfx = unsafe { &*gfx_ptr };
+        let stats = crate::monitor::sample();
+
+        let fence = &mut self.fences[index];
+        let width = fence.layout.width.max(80);
+        let visual_height = fence.visible_height(theme).max(28);
+        let scale = fence.scale;
+
+        unsafe {
+            let recreate = match &fence.surface {
+                Some(s) => s.width != width || s.height != visual_height,
+                None => true,
+            };
+            if recreate {
+                fence.surface = Some(Surface::new(gfx, width, visual_height)?);
+            }
+            let surface = match fence.surface.as_ref() {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+            let bounds = RECT {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: visual_height,
+            };
+            surface.target.BindDC(surface.dc, &bounds)?;
+            surface.target.BeginDraw();
+            surface.target.Clear(Some(&D2D1_COLOR_F {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            }));
+
+            let w = width as f32 / scale;
+            let h = visual_height as f32 / scale;
+            let radius = theme.radius;
+            let brush = &surface.brush;
+            let has_material = self.cfg.appearance.material != "none";
+
+            // Sombra, fondo y borde del contenedor principal.
+            if !has_material {
+                brush.SetColor(&theme.shadow);
+                surface.target.FillRoundedRectangle(
+                    &D2D1_ROUNDED_RECT {
+                        rect: rect(1.5 * scale, 2.5 * scale, (w - 1.5) * scale, (h - 0.5) * scale),
+                        radiusX: radius * scale,
+                        radiusY: radius * scale,
+                    },
+                    brush,
+                );
+            }
+            let bg_fill = material_bg(theme.background, &self.cfg.appearance.material, self.cfg.appearance.material_opacity);
+            brush.SetColor(&bg_fill);
+            let body = if has_material {
+                D2D1_ROUNDED_RECT {
+                    rect: rect(0.0, 0.0, width as f32, visual_height as f32),
+                    radiusX: radius * scale,
+                    radiusY: radius * scale,
+                }
+            } else {
+                D2D1_ROUNDED_RECT {
+                    rect: rect(0.0, 0.0, (w - 1.0) * scale, (h - 1.5) * scale),
+                    radiusX: radius * scale,
+                    radiusY: radius * scale,
+                }
+            };
+            surface.target.FillRoundedRectangle(&body, brush);
+            brush.SetColor(&if has_material {
+                D2D1_COLOR_F { r: theme.border.r, g: theme.border.g, b: theme.border.b, a: 0.55 }
+            } else {
+                theme.border
+            });
+            surface.target.DrawRoundedRectangle(&body, brush, theme.border_width * scale, None);
+
+            // Cabecera: fondo + divisoria + titulo + indicador LED.
+            let header_h = fence.header_h(theme) * scale;
+            let base_h = theme.header * scale;
+            brush.SetColor(&with_alpha(theme.text, 0.035));
+            surface.target.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: rect(0.0, 0.0, w * scale, header_h),
+                    radiusX: radius * scale,
+                    radiusY: radius * scale,
+                },
+                brush,
+            );
+            let pad = theme.padding * scale;
+            brush.SetColor(&with_alpha(theme.border, 0.30));
+            surface.target.DrawLine(
+                D2D_POINT_2F { x: pad * 0.5, y: header_h },
+                D2D_POINT_2F { x: (w - theme.padding * 0.5) * scale, y: header_h },
+                brush,
+                1.0 * scale,
+                None,
+            );
+
+            // Indicador luminoso Cyan en cabecera
+            let dot_x = pad + 4.0 * scale;
+            let dot_y = base_h * 0.5;
+            let led_color = argb_color(0xFF00E5FF);
+            brush.SetColor(&with_alpha(led_color, 0.28));
+            fill_circle(&surface.target, brush, dot_x, dot_y, 6.0 * scale);
+            brush.SetColor(&led_color);
+            fill_circle(&surface.target, brush, dot_x, dot_y, 3.0 * scale);
+
+            // Titulo "Monitor del sistema"
+            let title = wide_str(self.tr.nav_monitor);
+            brush.SetColor(&theme.title);
+            surface.target.DrawText(
+                &title,
+                &gfx.title_format,
+                &rect(dot_x + 10.0 * scale, 0.0, (w - pad) * scale, base_h),
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+
+            // Pastilla con resumen en la cabecera si hay espacio
+            if w >= 220.0 {
+                let badge_w = 92.0 * scale;
+                let badge_h = 18.0 * scale;
+                let bx2 = (w - 12.0) * scale;
+                let bx1 = bx2 - badge_w;
+                let by1 = (base_h - badge_h) * 0.5;
+                let by2 = by1 + badge_h;
+                let badge_rr = D2D1_ROUNDED_RECT {
+                    rect: rect(bx1, by1, bx2, by2),
+                    radiusX: 9.0 * scale,
+                    radiusY: 9.0 * scale,
+                };
+                brush.SetColor(&with_alpha(theme.text, 0.05));
+                surface.target.FillRoundedRectangle(&badge_rr, brush);
+                brush.SetColor(&with_alpha(theme.border, 0.25));
+                surface.target.DrawRoundedRectangle(&badge_rr, brush, 1.0 * scale, None);
+
+                let badge_txt = if stats.has_gpu { "CPU·RAM·GPU" } else { "CPU·RAM" };
+                brush.SetColor(&with_alpha(theme.text, 0.70));
+                surface.target.DrawText(
+                    &wide_str(badge_txt),
+                    &gfx.center_meta_format,
+                    &rect(bx1, by1, bx2, by2),
+                    brush,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
+
+            let mut items: Vec<MonitorCardItem> = Vec::new();
+
+            // 1. CPU
+            items.push(MonitorCardItem {
+                icon: "⚡",
+                label: "CPU",
+                percent: stats.cpu_percent,
+                detail: format!("{:.0}% uso", stats.cpu_percent),
+                history: &stats.cpu_history,
+                color: argb_color(0xFF10B981), // Emerald
+            });
+
+            // 2. RAM
+            items.push(MonitorCardItem {
+                icon: "🧠",
+                label: "RAM",
+                percent: stats.ram_percent,
+                detail: format!("{:.1}/{:.1} GB", stats.ram_used_gb, stats.ram_total_gb),
+                history: &stats.ram_history,
+                color: argb_color(0xFF38BDF8), // Sky blue
+            });
+
+            // 3. GPU
+            if stats.has_gpu {
+                let detail = if stats.gpu_vram_total_gb > 0.1 {
+                    format!("{:.1}/{:.1} GB", stats.gpu_vram_used_gb, stats.gpu_vram_total_gb)
+                } else if !stats.gpu_name.is_empty() {
+                    let s = stats.gpu_name
+                        .replace("NVIDIA GeForce ", "")
+                        .replace("AMD Radeon ", "")
+                        .replace("Intel(R) ", "");
+                    if s.len() > 14 { format!("{}...", &s[..12]) } else { s }
+                } else {
+                    "GPU activa".to_string()
+                };
+
+                items.push(MonitorCardItem {
+                    icon: "🎮",
+                    label: "GPU",
+                    percent: stats.gpu_vram_percent,
+                    detail,
+                    history: &stats.gpu_history,
+                    color: argb_color(0xFFA855F7), // Purple / Violet
+                });
+            }
+
+            // 4. Batería (si no es sobremesa)
+            if !stats.no_battery {
+                let bat_pct = stats.battery_percent.min(100) as f32;
+                let detail = if stats.on_battery {
+                    "En batería".to_string()
+                } else if bat_pct >= 100.0 {
+                    "Completa".to_string()
+                } else {
+                    "Cargando".to_string()
+                };
+                let bat_color = if bat_pct <= 20.0 {
+                    argb_color(0xFFEF4444)
+                } else if stats.on_battery {
+                    argb_color(0xFFF59E0B)
+                } else {
+                    argb_color(0xFF22C55E)
+                };
+                items.push(MonitorCardItem {
+                    icon: "🔋",
+                    label: "BAT",
+                    percent: bat_pct,
+                    detail,
+                    history: &[],
+                    color: bat_color,
+                });
+            }
+
+            // Disposición de tarjetas
+            let pad_edge = 10.0 * scale;
+            let content_y = header_h + 8.0 * scale;
+            let avail_w = (width as f32 - pad_edge * 2.0).max(40.0);
+            let content_h = (visual_height as f32 - content_y - 8.0 * scale).max(20.0);
+            let n = items.len();
+
+            let is_grid = w >= 340.0 && n >= 3;
+
+            if is_grid {
+                let cols = 2;
+                let rows = n.div_ceil(2);
+                let gap_x = 8.0 * scale;
+                let gap_y = 6.0 * scale;
+                let card_w = (avail_w - gap_x) * 0.5;
+                let card_h = ((content_h - gap_y * (rows as f32 - 1.0)) / rows as f32).clamp(38.0 * scale, 80.0 * scale);
+
+                for (i, item) in items.iter().enumerate() {
+                    let col = i % cols;
+                    let row = i / cols;
+                    let cx = pad_edge + col as f32 * (card_w + gap_x);
+                    let cy = content_y + row as f32 * (card_h + gap_y);
+                    let card_rect = rect(cx, cy, cx + card_w, cy + card_h);
+                    
+                    Self::draw_monitor_card(&surface.target, brush, gfx, theme, item, &card_rect, scale);
+                }
+            } else {
+                let gap = 6.0 * scale;
+                let card_w = avail_w;
+                let card_h = ((content_h - gap * (n as f32 - 1.0)) / n as f32).clamp(36.0 * scale, 70.0 * scale);
+
+                for (i, item) in items.iter().enumerate() {
+                    let cy = content_y + i as f32 * (card_h + gap);
+                    let card_rect = rect(pad_edge, cy, pad_edge + card_w, cy + card_h);
+                    
+                    Self::draw_monitor_card(&surface.target, brush, gfx, theme, item, &card_rect, scale);
+                }
+            }
+
+            surface.target.EndDraw(None, None)?;
+
+            let mut win_rect = RECT::default();
+            let _ = GetWindowRect(fence.hwnd, &mut win_rect);
+            let cur_h = win_rect.bottom - win_rect.top;
+            let target_h = if fence.anim_step > 0 { cur_h } else { visual_height };
+            Self::present_fence_surface(
+                fence.hwnd,
+                surface,
+                POINT { x: fence.layout.x, y: fence.layout.y },
+                SIZE { cx: width, cy: target_h },
+                (theme.radius * scale) as i32,
+                &self.cfg.appearance.material,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Renderiza una tarjeta individual de sensor (CPU/RAM/GPU/BAT) con diseño glass y gráfica.
+    unsafe fn draw_monitor_card(
+        target: &ID2D1DCRenderTarget,
+        brush: &ID2D1SolidColorBrush,
+        gfx: &Graphics,
+        theme: &Theme,
+        item: &MonitorCardItem,
+        r: &D2D_RECT_F,
+        scale: f32,
+    ) {
+        let card_rr = D2D1_ROUNDED_RECT {
+            rect: *r,
+            radiusX: 7.0 * scale,
+            radiusY: 7.0 * scale,
+        };
+
+        // Fondo translúcido de la tarjeta + borde sutil
+        brush.SetColor(&with_alpha(theme.text, 0.038));
+        unsafe { target.FillRoundedRectangle(&card_rr, brush) };
+        brush.SetColor(&with_alpha(theme.border, 0.22));
+        unsafe { target.DrawRoundedRectangle(&card_rr, brush, 1.0 * scale, None) };
+
+        let cw = r.right - r.left;
+        let ch = r.bottom - r.top;
+        let pad_x = 8.0 * scale;
+        let pad_y = 5.0 * scale;
+
+        // Indicador LED y Etiqueta
+        let icon_label = format!("{} {}", item.icon, item.label);
+        brush.SetColor(&item.color);
+        let top_y = r.top + pad_y;
+        unsafe {
+            target.DrawText(
+                &wide_str(&icon_label),
+                &gfx.text_format,
+                &rect(r.left + pad_x, top_y, r.left + cw * 0.55, top_y + 16.0 * scale),
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+
+        // Porcentaje en grande / negrita a la derecha del label
+        let pct_str = format!("{:.0}%", item.percent);
+        brush.SetColor(&theme.title);
+        unsafe {
+            target.DrawText(
+                &wide_str(&pct_str),
+                &gfx.title_format,
+                &rect(r.left + pad_x, top_y + 14.0 * scale, r.left + cw * 0.55, top_y + 32.0 * scale),
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+
+        // Subtexto / Detalle debajo si hay espacio vertical
+        if ch >= 46.0 * scale {
+            brush.SetColor(&with_alpha(theme.text, 0.52));
+            unsafe {
+                target.DrawText(
+                    &wide_str(&item.detail),
+                    &gfx.text_format,
+                    &rect(r.left + pad_x, top_y + 31.0 * scale, r.left + cw * 0.58, r.bottom - 5.0 * scale),
+                    brush,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
+        }
+
+        // Sparkline a la derecha (si hay historial)
+        if !item.history.is_empty() {
+            let spark_w = (cw * 0.44).min(110.0 * scale).max(36.0 * scale);
+            let spark_rect = D2D_RECT_F {
+                left: r.right - pad_x - spark_w,
+                top: r.top + pad_y + 2.0 * scale,
+                right: r.right - pad_x,
+                bottom: r.bottom - pad_y - 4.0 * scale,
+            };
+            Self::draw_monitor_sparkline(target, brush, item.history, &spark_rect, item.color, scale);
+        }
+
+        // Mini barra de progreso inferior de carga
+        let bar_h = 2.5 * scale;
+        let bar_bottom = r.bottom - 2.0 * scale;
+        let bar_left = r.left + 4.0 * scale;
+        let bar_right = r.right - 4.0 * scale;
+        let bar_w = bar_right - bar_left;
+
+        brush.SetColor(&with_alpha(theme.text, 0.08));
+        let track_rr = D2D1_ROUNDED_RECT {
+            rect: rect(bar_left, bar_bottom - bar_h, bar_right, bar_bottom),
+            radiusX: bar_h * 0.5,
+            radiusY: bar_h * 0.5,
+        };
+        unsafe { target.FillRoundedRectangle(&track_rr, brush) };
+
+        let ratio = (item.percent / 100.0).clamp(0.0, 1.0);
+        if ratio > 0.0 {
+            let fill_color = if item.percent > 88.0 {
+                argb_color(0xFFEF4444) // Alerta rojo
+            } else if item.percent > 75.0 {
+                argb_color(0xFFF59E0B) // Advertencia ámbar
+            } else {
+                item.color
+            };
+            brush.SetColor(&fill_color);
+            let fill_w = (bar_w * ratio).max(bar_h);
+            let fill_rr = D2D1_ROUNDED_RECT {
+                rect: rect(bar_left, bar_bottom - bar_h, bar_left + fill_w, bar_bottom),
+                radiusX: bar_h * 0.5,
+                radiusY: bar_h * 0.5,
+            };
+            unsafe { target.FillRoundedRectangle(&fill_rr, brush) };
+        }
+    }
+
     fn render_dropbox_fence(&mut self, index: usize) -> WinResult<()> {
         let theme_ptr: *const Theme = &self.theme;
         let gfx_ptr: *const Graphics = &self.gfx;
@@ -4664,19 +5315,7 @@ impl App {
         let scroll = self.dropbox_scroll.max(0) as usize;
         let sync_note = self.dropbox_sync_note.clone();
         let selected = self.dropbox_selected;
-        let status_line = match status {
-            dropbox::Status::Unconfigured => self.tr.msg_dropbox_unconfigured.to_string(),
-            dropbox::Status::LoggedOut => self.tr.msg_dropbox_loggedout.to_string(),
-            dropbox::Status::Ready => {
-                // Breadcrumb de la ruta navegada (mas util que el email aqui).
-                let path = self.dropbox_list_path();
-                if path == "/" {
-                    "📁 Dropbox".to_string()
-                } else {
-                    path
-                }
-            }
-        };
+        let path = self.dropbox_list_path();
 
         let fence = &mut self.fences[index];
         let width = fence.layout.width.max(80);
@@ -4706,10 +5345,9 @@ impl App {
             let h = visual_height as f32 / scale;
             let radius = theme.radius;
             let brush = &surface.brush;
-
             let has_material = self.cfg.appearance.material != "none";
 
-            // Sombra, fondo y borde.
+            // Sombra, fondo y borde de la caja principal
             if !has_material {
                 brush.SetColor(&theme.shadow);
                 surface.target.FillRoundedRectangle(
@@ -4726,138 +5364,362 @@ impl App {
             };
             surface.target.FillRoundedRectangle(&body, brush);
             brush.SetColor(&if has_material {
-                // Literal fresco: con los colores del tema no se puede SUBIR el
-                // alpha via with_alpha (el alpha efectivo queda en el minimo),
-                // asi que se construye un color nuevo con el RGB del tema.
                 D2D1_COLOR_F { r: theme.border.r, g: theme.border.g, b: theme.border.b, a: 0.55 }
             } else {
                 theme.border
             });
-            surface.target.DrawRoundedRectangle(
-                &body,
-                brush,
-                theme.border_width * scale,
-                None,
-            );
+            surface.target.DrawRoundedRectangle(&body, brush, theme.border_width * scale, None);
 
             // Cabecera.
             let header_h = header_dip * scale;
+            let base_h = theme.header * scale;
             brush.SetColor(&with_alpha(theme.text, 0.035));
             surface.target.FillRoundedRectangle(
                 &D2D1_ROUNDED_RECT { rect: rect(0.0, 0.0, w * scale, header_h), radiusX: radius * scale, radiusY: radius * scale },
                 brush,
             );
-            let pill_h = 14.0 * scale;
-            let pill_w = 3.5 * scale;
-            let pill_y = (theme.header * scale - pill_h) * 0.5;
-            brush.SetColor(&with_alpha(accent, 0.25));
-            surface.target.FillRoundedRectangle(
-                &D2D1_ROUNDED_RECT { rect: rect(8.0 * scale, pill_y, 8.0 * scale + pill_w, pill_y + pill_h), radiusX: pill_w * 0.5, radiusY: pill_w * 0.5 },
+            let pad = theme.padding * scale;
+            brush.SetColor(&with_alpha(theme.border, 0.30));
+            surface.target.DrawLine(
+                D2D_POINT_2F { x: pad * 0.5, y: header_h },
+                D2D_POINT_2F { x: (w - theme.padding * 0.5) * scale, y: header_h },
                 brush,
+                1.0 * scale,
+                None,
             );
+
+            // Indicador luminoso azul Dropbox
+            let dot_x = pad + 4.0 * scale;
+            let dot_y = base_h * 0.5;
+            let is_ready = status == dropbox::Status::Ready;
+            let db_blue = argb_color(0xFF007EE5);
+
+            brush.SetColor(&with_alpha(if is_ready { db_blue } else { argb_color(0xFF888888) }, 0.28));
+            fill_circle(&surface.target, brush, dot_x, dot_y, 6.0 * scale);
+            brush.SetColor(&if is_ready { db_blue } else { argb_color(0xFF777777) });
+            fill_circle(&surface.target, brush, dot_x, dot_y, 3.2 * scale);
+
+            // Titulo "Dropbox"
+            let title = wide_str("Dropbox");
             brush.SetColor(&theme.title);
             surface.target.DrawText(
-                &wide_str("📁 Dropbox"),
+                &title,
                 &gfx.title_format,
-                &rect(18.0 * scale, 0.0, w * scale, header_h),
+                &rect(dot_x + 10.0 * scale, 0.0, (w - pad) * scale, base_h),
                 brush,
                 D2D1_DRAW_TEXT_OPTIONS_CLIP,
                 DWRITE_MEASURING_MODE_NATURAL,
             );
 
-            // Cuerpo: estado, lista de archivos y pie con boton de sync.
-            let content_top = header_dip * scale;
-            let content_h = (h - header_dip).max(0.0);
-            brush.SetColor(&theme.muted);
-            surface.target.DrawText(
-                &wide_str(&status_line),
-                &gfx.meta_format,
-                &rect(12.0 * scale, content_top + 6.0 * scale, (w - 12.0) * scale, content_top + 26.0 * scale),
-                brush,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
+            // Botones en la cabecera (Subir nivel si no estamos en la raiz y Cerrar sesion)
+            if is_ready {
+                if path != "/" {
+                    let up_r = dropbox_header_up_rect(w, header_dip);
+                    let up_rect = rect(up_r.left * scale, up_r.top * scale, up_r.right * scale, up_r.bottom * scale);
+                    let up_rr = D2D1_ROUNDED_RECT { rect: up_rect, radiusX: 6.0 * scale, radiusY: 6.0 * scale };
+                    brush.SetColor(&with_alpha(theme.text, 0.06));
+                    surface.target.FillRoundedRectangle(&up_rr, brush);
+                    brush.SetColor(&with_alpha(theme.text, 0.8));
+                    surface.target.DrawText(&wide_str("⬆"), &gfx.center_meta_format, &up_rect, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+                }
 
-            let row_h = (theme.row * scale).max(22.0 * scale);
-            let list_top = content_top + 30.0 * scale;
-            let rows_visible = ((content_h - 30.0 * scale - 44.0 * scale) / row_h).floor().max(0.0) as usize;
-            for (i, file) in files.iter().skip(scroll).take(rows_visible).enumerate() {
-                let ry = list_top + i as f32 * row_h;
-                if selected == Some(scroll + i) {
-                    brush.SetColor(&with_alpha(accent, 0.20));
-                    surface.target.FillRoundedRectangle(
-                        &D2D1_ROUNDED_RECT { rect: rect(6.0 * scale, ry + 1.0 * scale, (w - 6.0) * scale, ry + row_h - 1.0 * scale), radiusX: 6.0 * scale, radiusY: 6.0 * scale },
+                let lr = dropbox_logout_rect(w, header_dip);
+                let lr_rect = rect(lr.left * scale, lr.top * scale, lr.right * scale, lr.bottom * scale);
+                let lr_rr = D2D1_ROUNDED_RECT { rect: lr_rect, radiusX: 6.0 * scale, radiusY: 6.0 * scale };
+                brush.SetColor(&with_alpha(theme.text, 0.06));
+                surface.target.FillRoundedRectangle(&lr_rr, brush);
+                brush.SetColor(&with_alpha(theme.text, 0.65));
+                surface.target.DrawText(&wide_str("⏻"), &gfx.center_meta_format, &lr_rect, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+            }
+
+            // Cuerpo del widget
+            let content_h = (h - header_dip).max(20.0);
+
+            match status {
+                dropbox::Status::Unconfigured => {
+                    // Tarjeta central: no configurado
+                    let card_w = (w - 24.0).min(320.0);
+                    let card_h = (content_h - 16.0).clamp(90.0, 160.0);
+                    let card_x = (w - card_w) * 0.5 * scale;
+                    let card_y = header_h + (content_h - card_h) * 0.5 * scale;
+                    let card_rect = rect(card_x, card_y, card_x + card_w * scale, card_y + card_h * scale);
+                    let card_rr = D2D1_ROUNDED_RECT { rect: card_rect, radiusX: 12.0 * scale, radiusY: 12.0 * scale };
+
+                    brush.SetColor(&with_alpha(theme.text, 0.035));
+                    surface.target.FillRoundedRectangle(&card_rr, brush);
+                    brush.SetColor(&with_alpha(theme.border, 0.28));
+                    surface.target.DrawRoundedRectangle(&card_rr, brush, 1.0 * scale, None);
+
+                    brush.SetColor(&theme.title);
+                    surface.target.DrawText(
+                        &wide_str("Dropbox no configurado"),
+                        &gfx.center_meta_format,
+                        &rect(card_x + 8.0 * scale, card_y + 16.0 * scale, card_x + card_w * scale - 8.0 * scale, card_y + 36.0 * scale),
                         brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                    brush.SetColor(&with_alpha(theme.text, 0.55));
+                    surface.target.DrawText(
+                        &wide_str("Añade tu App Key en Ajustes → Widgets"),
+                        &gfx.center_meta_format,
+                        &rect(card_x + 8.0 * scale, card_y + 40.0 * scale, card_x + card_w * scale - 8.0 * scale, card_y + 64.0 * scale),
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
                     );
                 }
-                if file.is_dir {
-                    brush.SetColor(&theme.muted);
-                } else {
-                    brush.SetColor(&theme.text);
-                }
-                let icon = if file.is_dir { "📁 " } else { "📄 " };
-                let name = format!("{icon}{}", file.name);
-                surface.target.DrawText(
-                    &wide_str(&name),
-                    &gfx.text_format,
-                    &rect(14.0 * scale, ry, (w - 60.0) * scale, ry + row_h),
-                    brush,
-                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
-                if !file.is_dir && file.size > 0 {
-                    let sz = rules::human_size(file.size);
-                    brush.SetColor(&theme.muted);
+                dropbox::Status::LoggedOut => {
+                    // Tarjeta central: iniciar sesión
+                    let card_w = (w - 24.0).min(340.0);
+                    let card_h = (content_h - 16.0).clamp(110.0, 180.0);
+                    let card_x = (w - card_w) * 0.5 * scale;
+                    let card_y = header_h + (content_h - card_h) * 0.5 * scale;
+                    let card_rect = rect(card_x, card_y, card_x + card_w * scale, card_y + card_h * scale);
+                    let card_rr = D2D1_ROUNDED_RECT { rect: card_rect, radiusX: 12.0 * scale, radiusY: 12.0 * scale };
+
+                    brush.SetColor(&with_alpha(theme.text, 0.035));
+                    surface.target.FillRoundedRectangle(&card_rr, brush);
+                    brush.SetColor(&with_alpha(theme.border, 0.30));
+                    surface.target.DrawRoundedRectangle(&card_rr, brush, 1.0 * scale, None);
+
+                    let cxp = (w * 0.5) * scale;
+                    let cyp = card_y + 34.0 * scale;
+
+                    // Halo azul
+                    brush.SetColor(&argb_color(0x22007EE5));
+                    fill_circle(&surface.target, brush, cxp, cyp, 26.0 * scale);
+
+                    // Icono nube
+                    brush.SetColor(&argb_color(0xFF007EE5));
                     surface.target.DrawText(
-                        &wide_str(&sz),
+                        &wide_str("☁"),
+                        &gfx.center_meta_format,
+                        &rect(cxp - 20.0 * scale, cyp - 16.0 * scale, cxp + 20.0 * scale, cyp + 16.0 * scale),
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+
+                    brush.SetColor(&theme.title);
+                    surface.target.DrawText(
+                        &wide_str("Conectar con Dropbox"),
+                        &gfx.center_meta_format,
+                        &rect(card_x + 8.0 * scale, card_y + 56.0 * scale, card_x + card_w * scale - 8.0 * scale, card_y + 76.0 * scale),
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+
+                    // Boton de conexion
+                    let btn_r = dropbox_connect_rect(w, content_h);
+                    let (cx, cy, cw, ch) = (btn_r.left * scale, header_h + btn_r.top * scale, (btn_r.right - btn_r.left) * scale, (btn_r.bottom - btn_r.top) * scale);
+                    let btn_rect = rect(cx, cy, cx + cw, cy + ch);
+                    let btn_rr = D2D1_ROUNDED_RECT { rect: btn_rect, radiusX: 14.0 * scale, radiusY: 14.0 * scale };
+
+                    brush.SetColor(&with_alpha(theme.shadow, 0.25));
+                    surface.target.FillRoundedRectangle(
+                        &D2D1_ROUNDED_RECT { rect: rect(cx, cy + 1.5 * scale, cx + cw, cy + ch + 1.5 * scale), radiusX: 14.0 * scale, radiusY: 14.0 * scale },
+                        brush,
+                    );
+                    brush.SetColor(&argb_color(0xFF0061FE));
+                    surface.target.FillRoundedRectangle(&btn_rr, brush);
+                    brush.SetColor(&D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 });
+                    surface.target.DrawText(
+                        &wide_str("Iniciar sesión"),
+                        &gfx.center_meta_format,
+                        &btn_rect,
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                }
+                dropbox::Status::Ready => {
+                    // Subcabecera: ruta actual + contador de archivos
+                    let subheader_y = header_h + 4.0 * scale;
+                    let subheader_h = 24.0 * scale;
+                    let subheader_bottom = subheader_y + subheader_h;
+
+                    // Pastilla con la ruta navegada
+                    let path_display = if path == "/" { "📁 /" } else { &path };
+                    brush.SetColor(&theme.title);
+                    surface.target.DrawText(
+                        &wide_str(path_display),
+                        &gfx.text_format,
+                        &rect(14.0 * scale, subheader_y + 2.0 * scale, (w - 90.0) * scale, subheader_bottom),
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+
+                    // Badge de cantidad de archivos
+                    let count_str = format!("{} elem", files.len());
+                    brush.SetColor(&with_alpha(theme.text, 0.50));
+                    surface.target.DrawText(
+                        &wide_str(&count_str),
                         &gfx.meta_format,
-                        &rect((w - 60.0) * scale, ry, (w - 12.0) * scale, ry + row_h),
+                        &rect((w - 90.0) * scale, subheader_y + 2.0 * scale, (w - 12.0) * scale, subheader_bottom),
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+
+                    // Línea divisoria bajo la subcabecera
+                    brush.SetColor(&with_alpha(theme.border, 0.20));
+                    surface.target.DrawLine(
+                        D2D_POINT_2F { x: 10.0 * scale, y: subheader_bottom + 2.0 * scale },
+                        D2D_POINT_2F { x: (w - 10.0) * scale, y: subheader_bottom + 2.0 * scale },
+                        brush,
+                        1.0 * scale,
+                        None,
+                    );
+
+                    // Área de lista de archivos con recorte limpio (PushAxisAlignedClip)
+                    let list_top = subheader_bottom + 4.0 * scale;
+                    let foot_top = (h - 40.0) * scale;
+                    let clip_rect = rect(0.0, list_top, w * scale, foot_top);
+
+                    surface.target.PushAxisAlignedClip(&clip_rect, D2D1_ANTIALIAS_MODE_ALIASED);
+
+                    let row_h = (theme.row * scale).max(28.0 * scale);
+
+                    if files.is_empty() {
+                        brush.SetColor(&with_alpha(theme.text, 0.45));
+                        surface.target.DrawText(
+                            &wide_str("Carpeta vacía"),
+                            &gfx.center_meta_format,
+                            &rect(14.0 * scale, list_top + 20.0 * scale, (w - 14.0) * scale, list_top + 50.0 * scale),
+                            brush,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                    } else {
+                        for (i, file) in files.iter().enumerate() {
+                            let ry = list_top + 2.0 * scale + i as f32 * row_h - scroll as f32 * row_h;
+                            if ry + row_h <= list_top || ry >= foot_top {
+                                continue;
+                            }
+
+                            let r_rect = rect(10.0 * scale, ry + 1.0 * scale, (w - 10.0) * scale, ry + row_h - 2.0 * scale);
+                            let r_rr = D2D1_ROUNDED_RECT { rect: r_rect, radiusX: 6.0 * scale, radiusY: 6.0 * scale };
+
+                            // Fondo de la fila
+                            if selected == Some(i) {
+                                brush.SetColor(&with_alpha(accent, 0.22));
+                                surface.target.FillRoundedRectangle(&r_rr, brush);
+                                brush.SetColor(&with_alpha(accent, 0.50));
+                                surface.target.DrawRoundedRectangle(&r_rr, brush, 1.0 * scale, None);
+                            } else {
+                                brush.SetColor(&with_alpha(theme.text, if i % 2 == 0 { 0.04 } else { 0.015 }));
+                                surface.target.FillRoundedRectangle(&r_rr, brush);
+                                brush.SetColor(&with_alpha(theme.border, 0.16));
+                                surface.target.DrawRoundedRectangle(&r_rr, brush, 1.0 * scale, None);
+                            }
+
+                            // Icono según tipo de archivo
+                            let (icon, _icon_color) = dropbox_file_icon(&file.name, file.is_dir);
+                            brush.SetColor(&theme.title);
+                            surface.target.DrawText(
+                                &wide_str(icon),
+                                &gfx.text_format,
+                                &rect(16.0 * scale, ry + 2.0 * scale, 38.0 * scale, ry + row_h - 2.0 * scale),
+                                brush,
+                                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                                DWRITE_MEASURING_MODE_NATURAL,
+                            );
+
+                            // Nombre del archivo o carpeta
+                            let size_w = if file.is_dir || file.size == 0 { 0.0 } else { 68.0 * scale };
+                            let name_rect = rect(40.0 * scale, ry + 2.0 * scale, (w - 16.0) * scale - size_w, ry + row_h - 2.0 * scale);
+                            brush.SetColor(if file.is_dir { &theme.title } else { &theme.text });
+                            surface.target.DrawText(
+                                &wide_str(&file.name),
+                                &gfx.text_format,
+                                &name_rect,
+                                brush,
+                                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                                DWRITE_MEASURING_MODE_NATURAL,
+                            );
+
+                            // Tamaño del archivo a la derecha
+                            if !file.is_dir && file.size > 0 {
+                                let sz_str = rules::human_size(file.size);
+                                brush.SetColor(&with_alpha(theme.text, 0.52));
+                                surface.target.DrawText(
+                                    &wide_str(&sz_str),
+                                    &gfx.meta_format,
+                                    &rect((w - 78.0) * scale, ry + 2.0 * scale, (w - 16.0) * scale, ry + row_h - 2.0 * scale),
+                                    brush,
+                                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                                    DWRITE_MEASURING_MODE_NATURAL,
+                                );
+                            }
+                        }
+                    }
+
+                    surface.target.PopAxisAlignedClip();
+
+                    // Pie fijo: barra translúcida con estado + botones de acción
+                    let foot_rect = rect(0.0, foot_top, w * scale, (h - 1.0) * scale);
+                    brush.SetColor(&bg_fill);
+                    surface.target.FillRectangle(&foot_rect, brush);
+
+                    brush.SetColor(&with_alpha(theme.border, 0.22));
+                    surface.target.DrawLine(
+                        D2D_POINT_2F { x: 8.0 * scale, y: foot_top },
+                        D2D_POINT_2F { x: (w - 8.0) * scale, y: foot_top },
+                        brush,
+                        1.0 * scale,
+                        None,
+                    );
+
+                    // Nota de sincronización a la izquierda
+                    let note_txt = if sync_note.is_empty() { "✓ Sincronizado".to_string() } else { sync_note.clone() };
+                    let note_color = if note_txt.starts_with('✓') {
+                        argb_color(0xFF10B981)
+                    } else if note_txt.starts_with('⚠') {
+                        argb_color(0xFFEF4444)
+                    } else {
+                        with_alpha(theme.text, 0.65)
+                    };
+                    brush.SetColor(&note_color);
+                    surface.target.DrawText(
+                        &wide_str(&note_txt),
+                        &gfx.text_format,
+                        &rect(14.0 * scale, foot_top + 8.0 * scale, (w - 150.0) * scale, (h - 6.0) * scale),
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+
+                    // Boton Subir nivel (⬆)
+                    let up_r = dropbox_upload_btn_rect(w, h);
+                    let up_rect = rect(up_r.left * scale, up_r.top * scale, up_r.right * scale, up_r.bottom * scale);
+                    let up_rr = D2D1_ROUNDED_RECT { rect: up_rect, radiusX: 6.0 * scale, radiusY: 6.0 * scale };
+                    brush.SetColor(&with_alpha(theme.text, 0.06));
+                    surface.target.FillRoundedRectangle(&up_rr, brush);
+                    brush.SetColor(&with_alpha(theme.border, 0.25));
+                    surface.target.DrawRoundedRectangle(&up_rr, brush, 1.0 * scale, None);
+                    brush.SetColor(&theme.text);
+                    surface.target.DrawText(&wide_str("⬆"), &gfx.center_meta_format, &up_rect, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+
+                    // Boton Sincronizar
+                    let sync_r = dropbox_sync_btn_rect(w, h);
+                    let sync_rect = rect(sync_r.left * scale, sync_r.top * scale, sync_r.right * scale, sync_r.bottom * scale);
+                    let sync_rr = D2D1_ROUNDED_RECT { rect: sync_rect, radiusX: 6.0 * scale, radiusY: 6.0 * scale };
+                    brush.SetColor(&argb_color(0xFF0061FE));
+                    surface.target.FillRoundedRectangle(&sync_rr, brush);
+                    brush.SetColor(&D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 });
+                    surface.target.DrawText(
+                        &wide_str(self.tr.btn_dropbox_sync),
+                        &gfx.center_meta_format,
+                        &sync_rect,
                         brush,
                         D2D1_DRAW_TEXT_OPTIONS_CLIP,
                         DWRITE_MEASURING_MODE_NATURAL,
                     );
                 }
             }
-
-            // Pie: nota de sync + boton Subir + boton Sincronizar.
-            let foot_y = (h - 40.0) * scale;
-            brush.SetColor(&theme.muted);
-            surface.target.DrawText(
-                &wide_str(&sync_note),
-                &gfx.meta_format,
-                &rect(14.0 * scale, foot_y, (w - 190.0) * scale, (h - 8.0) * scale),
-                brush,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
-            let up_btn = D2D1_ROUNDED_RECT { rect: rect((w - 152.0) * scale, foot_y + 2.0 * scale, (w - 108.0) * scale, (h - 8.0) * scale), radiusX: 6.0 * scale, radiusY: 6.0 * scale };
-            if status == dropbox::Status::Ready {
-                brush.SetColor(&with_alpha(accent, 0.14));
-                surface.target.FillRoundedRectangle(&up_btn, brush);
-            }
-            brush.SetColor(&theme.text);
-            surface.target.DrawText(
-                &wide_str("⬆"),
-                &gfx.center_meta_format,
-                &up_btn.rect,
-                brush,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
-            let btn = D2D1_ROUNDED_RECT { rect: rect((w - 104.0) * scale, foot_y + 2.0 * scale, (w - 12.0) * scale, (h - 8.0) * scale), radiusX: 6.0 * scale, radiusY: 6.0 * scale };
-            if status == dropbox::Status::Ready {
-                brush.SetColor(&with_alpha(accent, 0.18));
-                surface.target.FillRoundedRectangle(&btn, brush);
-            }
-            brush.SetColor(&theme.text);
-            surface.target.DrawText(
-                &wide_str(self.tr.btn_dropbox_sync),
-                &gfx.meta_format,
-                &btn.rect,
-                brush,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
 
             surface.target.EndDraw(None, None)?;
 
@@ -5613,27 +6475,13 @@ impl App {
             self.hide_thumb();
             return;
         }
-        // Asegurar que la entrada este en la cache (solo carga si no existe).
-        static mut CACHE: Option<ThumbCache> = None;
-        // SAFETY: CACHE solo se accede desde el hilo de UI (single-threaded).
-        let cache = unsafe {
-            let ptr: *mut Option<ThumbCache> = &raw mut CACHE;
-            if (*ptr).is_none() {
-                *ptr = Some(ThumbCache::new());
-            }
-            (*ptr).as_mut().unwrap()
+        // Asegurar que la entrada este en la cache compartida (solo carga si no
+        // existe). thumb_cached devuelve una copia: se pinta una sola vez.
+        let Some(entry) = thumb_cached(path) else {
+            self.hide_thumb();
+            return;
         };
-        if cache.get(path).is_none() {
-            if let Some(entry) = load_thumbnail(path) {
-                cache.insert(path.to_path_buf(), entry);
-            } else {
-                self.hide_thumb();
-                return;
-            }
-        }
-        // Clonar los pixeles SOLO cuando vamos a pintar (no en cada WM_MOUSEMOVE).
-        let entry = cache.get(path).unwrap();
-        let pixels = entry.pixels.clone();
+        let pixels = entry.pixels;
         let (tw, th) = (entry.w, entry.h);
         // Posicionar junto al cursor (offset 12px a la derecha).
         let mut cursor = POINT::default();
@@ -6185,17 +7033,27 @@ impl App {
         );
         let measure_dc = CreateCompatibleDC(None);
         let old_font_m = SelectObject(measure_dc, HGDIOBJ(font.0));
-        let wide_text: Vec<u16> = text.encode_utf16().collect();
-        let mut text_sz = SIZE::default();
-        let _ = GetTextExtentPoint32W(measure_dc, &wide_text, &mut text_sz);
+        // Texto multilinea (p. ej. estadisticas de la caja): se mide cada
+        // linea por separado y la pildora crece con el numero de lineas.
+        let mut max_line_w: i32 = 0;
+        let mut line_h: i32 = 0;
+        let mut line_count: i32 = 0;
+        for line in text.split('\n') {
+            let wide_text: Vec<u16> = line.encode_utf16().collect();
+            let mut text_sz = SIZE::default();
+            let _ = GetTextExtentPoint32W(measure_dc, &wide_text, &mut text_sz);
+            max_line_w = max_line_w.max(text_sz.cx);
+            line_h = line_h.max(text_sz.cy);
+            line_count += 1;
+        }
         SelectObject(measure_dc, old_font_m);
         let _ = DeleteDC(measure_dc);
         let _ = DeleteObject(HGDIOBJ(font.0));
 
         let pad_x: i32 = 10;
         let pad_y: i32 = 4;
-        let tw = (text_sz.cx + pad_x * 2).max(24);
-        let th = (text_sz.cy + pad_y * 2).max(22);
+        let tw = (max_line_w + pad_x * 2).max(24);
+        let th = (line_h * line_count + pad_y * 2).max(22);
 
         let need_new = match &self.tooltip_surface {
             Some(s) => s.width != tw || s.height != th,
@@ -6257,7 +7115,8 @@ impl App {
                 let _ = SetTextColor(surface.dc, text_color);
                 let mut text_buf: Vec<u16> = text.encode_utf16().collect();
                 let mut rc = RECT { left: pad_x, top: 0, right: tw - pad_x, bottom: th };
-                let _ = DrawTextW(surface.dc, &mut text_buf, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                // Sin DT_SINGLELINE: los '\n' del texto forman varias lineas.
+                let _ = DrawTextW(surface.dc, &mut text_buf, &mut rc, DT_CENTER | DT_VCENTER);
                 SelectObject(surface.dc, old_font);
                 let _ = DeleteObject(HGDIOBJ(text_font.0));
             }
@@ -6288,32 +7147,92 @@ impl App {
     }
 
     /// Sincroniza el tooltip con el estado hover actual de la caja `index`:
-    /// muestra la etiqueta del candado o de la chincheta, o lo oculta.
+    /// etiqueta del candado o de la chincheta, o estadisticas de la caja si el
+    /// raton esta sobre el titulo. Durante un drag nunca se muestra.
     unsafe fn sync_tooltip(&mut self, index: usize) {
         if index >= self.fences.len() {
             return;
         }
-        let (hover_lock, hover_pin) = (self.fences[index].hover_lock, self.fences[index].hover_pin);
-        if !hover_lock && !hover_pin {
+        // Con la cabecera capturada por un drag, el tooltip estorbaria.
+        if self.fences[index].drag != DragMode::None {
             self.hide_tooltip();
             return;
         }
-        let label = if hover_lock {
-            if self.fences[index].layout.locked { self.tr.menu_unlock } else { self.tr.menu_lock }
+        let (hover_lock, hover_pin, hover_title) = (
+            self.fences[index].hover_lock,
+            self.fences[index].hover_pin,
+            self.fences[index].hover_title,
+        );
+        if !hover_lock && !hover_pin && !hover_title {
+            self.hide_tooltip();
+            return;
+        }
+        let (label, anchor_right, anchor_bottom) = if hover_lock || hover_pin {
+            let label = if hover_lock {
+                if self.fences[index].layout.locked { self.tr.menu_unlock } else { self.tr.menu_lock }
+            } else {
+                if self.fences[index].layout.pinned { self.tr.menu_unpin } else { self.tr.menu_pin }
+            }
+            .to_string();
+            let scale = self.fences[index].scale;
+            let w_dip = self.fences[index].layout.width as f32 / scale;
+            let item_cnt = self.fences[index].tab_mut().content.items.len();
+            let icon_rect = if hover_lock {
+                lock_rect(w_dip, &self.theme, self.theme.show_counter, item_cnt)
+            } else {
+                pin_rect(w_dip, &self.theme, self.theme.show_counter, item_cnt)
+            };
+            (label, self.fences[index].layout.x + (icon_rect.right * scale) as i32, self.fences[index].layout.y)
         } else {
-            if self.fences[index].layout.pinned { self.tr.menu_unpin } else { self.tr.menu_pin }
+            // Estadisticas de la caja, ancladas al borde derecho de la cabecera.
+            let scale = self.fences[index].scale;
+            let w_dip = self.fences[index].layout.width as f32 / scale;
+            let text = self.fence_stats_text(index);
+            (text, self.fences[index].layout.x + (w_dip * scale) as i32, self.fences[index].layout.y)
         };
-        let scale = self.fences[index].scale;
-        let w_dip = self.fences[index].layout.width as f32 / scale;
-        let item_cnt = self.fences[index].tab_mut().content.items.len();
-        let icon_rect = if hover_lock {
-            lock_rect(w_dip, &self.theme, self.theme.show_counter, item_cnt)
+        self.show_tooltip(&label, anchor_right, anchor_bottom);
+    }
+
+    /// Construye el texto multilinea con las estadisticas de la caja `index`:
+    /// numero de items, tamano total y los 3 tipos mas frecuentes.
+    fn fence_stats_text(&mut self, index: usize) -> String {
+        let items = &self.fences[index].tab().content.items;
+        let total = items.len();
+        let mut size: u64 = 0;
+        let mut by_ext: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for item in items {
+            size += item.size;
+            let ext = if item.is_dir {
+                "📁"
+            } else if item.ext.is_empty() {
+                "file"
+            } else {
+                item.ext.as_str()
+            };
+            *by_ext.entry(ext).or_insert(0) += 1;
+        }
+        let mut sorted: Vec<(&str, usize)> = by_ext.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let mut out = format!("{total} {}", self.tr.stat_items);
+        // tamano total legible (KB / MB / GB).
+        let size_txt = if size >= 1 << 30 {
+            format!("{:.1} GB", size as f64 / (1u64 << 30) as f64)
+        } else if size >= 1 << 20 {
+            format!("{:.1} MB", size as f64 / (1u64 << 20) as f64)
+        } else if size >= 1 << 10 {
+            format!("{:.0} KB", size as f64 / (1u64 << 10) as f64)
         } else {
-            pin_rect(w_dip, &self.theme, self.theme.show_counter, item_cnt)
+            format!("{size} B")
         };
-        let anchor_right = self.fences[index].layout.x + (icon_rect.right * scale) as i32;
-        let anchor_bottom = self.fences[index].layout.y;
-        self.show_tooltip(label, anchor_right, anchor_bottom);
+        out.push_str(" · ");
+        out.push_str(&size_txt);
+        for (ext, count) in sorted.iter().take(3) {
+            out.push('\n');
+            out.push_str(ext);
+            out.push_str("  ");
+            out.push_str(&count.to_string());
+        }
+        out
     }
 
     /// Tick del fade: incrementa (fade-in) o decrementa (fade-out) el alfa
@@ -6630,6 +7549,8 @@ impl App {
         self.dropbox.set_redirect_uri(self.cfg.dropbox.redirect_uri.clone());
         // Caja del widget Dropbox (nativo): se crea/elimina segun `enabled`.
         self.ensure_dropbox_fence();
+        // Caja del widget de monitor (nativo): se crea/elimina segun `enabled`.
+        self.ensure_monitor_fence();
         if let Ok(gfx) = Graphics::new(&self.cfg) {
             self.gfx = gfx;
         }
@@ -8199,43 +9120,64 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                     }
                 }
 
-                // Widget de Dropbox: clic en el cuerpo -> boton de sync y
-                // scroll con la rueda. La cabecera y el grip caen al flujo
-                // normal (mover / redimensionar).
+                // Widget de Dropbox: clic en cabecera, cuerpo y botones.
                 if app.fences[index].layout.widget.as_deref() == Some("dropbox") {
                     let f = &app.fences[index];
                     let header_px = (f.header_h(&app.theme) * f.scale) as i32;
                     let in_grip = x > f.layout.width - GRIP
                         && y > f.visible_height(&app.theme) - GRIP
                         && !f.layout.collapsed;
+                    let s = f.scale;
+                    let w_dip = f.layout.width as f32 / s;
+                    let h_dip = f.visible_height(&app.theme) as f32 / s;
+                    let header_dip = f.header_h(&app.theme);
+                    let (dx, dy) = (x as f32 / s, y as f32 / s);
+
+                    // 1. Clics en la cabecera
+                    if dy <= header_dip && app.dropbox.status() == dropbox::Status::Ready {
+                        let lr = dropbox_logout_rect(w_dip, header_dip);
+                        if point_in(&lr, dx, dy) {
+                            app.dropbox_sign_out();
+                            return LRESULT(0);
+                        }
+                        let up_r = dropbox_header_up_rect(w_dip, header_dip);
+                        if point_in(&up_r, dx, dy) && app.dropbox_list_path() != "/" {
+                            app.dropbox_navigate_up();
+                            let _ = app.render(index);
+                            return LRESULT(0);
+                        }
+                    }
+
                     if y > header_px && !in_grip {
-                        let s = f.scale;
-                        let w_dip = f.layout.width as f32 / s;
-                        let h_dip = f.visible_height(&app.theme) as f32 / s;
-                        let header_dip = f.header_h(&app.theme);
-                        let (dx, dy) = (x as f32 / s, y as f32 / s);
-                        // Boton Subir (⬆) y Sincronizar (pie de la caja).
-                        if dy > h_dip - 40.0 {
-                            if dx > w_dip - 104.0 {
-                                if app.dropbox.status() == dropbox::Status::Ready {
-                                    app.dropbox_sync_now();
-                                }
+                        // 2. Estado desconectado: clic en el botón conectar
+                        if app.dropbox.status() == dropbox::Status::LoggedOut {
+                            let conn_r = dropbox_connect_rect(w_dip, h_dip - header_dip);
+                            if point_in(&conn_r, dx, dy - header_dip) {
+                                app.dropbox_connect();
+                                return LRESULT(0);
+                            }
+                        }
+
+                        // 3. Estado conectado: pie y lista de archivos
+                        if app.dropbox.status() == dropbox::Status::Ready {
+                            // Boton Sincronizar y Subir nivel (pie de la caja)
+                            let sync_r = dropbox_sync_btn_rect(w_dip, h_dip);
+                            if point_in(&sync_r, dx, dy) {
+                                app.dropbox_sync_now();
                                 let _ = app.render(index);
                                 return LRESULT(0);
                             }
-                            if dx > w_dip - 152.0 && dx <= w_dip - 108.0 {
+                            let up_r = dropbox_upload_btn_rect(w_dip, h_dip);
+                            if point_in(&up_r, dx, dy) {
                                 app.dropbox_navigate_up();
                                 let _ = app.render(index);
                                 return LRESULT(0);
                             }
-                        }
-                        // Clic en una fila: seleccionar y preparar el arrastre
-                        // (al superar el umbral se descarga y se lanza el drag
-                        // OLE; el doble clic navega/abre via WM_LBUTTONDBLCLK).
-                        if app.dropbox.status() == dropbox::Status::Ready {
-                            let row_h_dip = app.theme.row.max(22.0);
-                            let list_top_dip = header_dip + 30.0;
-                            let list_bottom_dip = h_dip - 44.0;
+
+                            // Clic en una fila de la lista de archivos
+                            let row_h_dip = (app.theme.row * s).max(28.0 * s) / s;
+                            let list_top_dip = header_dip + 32.0;
+                            let list_bottom_dip = h_dip - 40.0;
                             if dy > list_top_dip && dy < list_bottom_dip {
                                 let idx = ((dy - list_top_dip) / row_h_dip).floor() as usize;
                                 let item = app.dropbox_scroll.max(0) as usize + idx;
@@ -8509,9 +9451,10 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 }
                 // Al salir de la caja, limpiamos el hover de candado/chincheta
                 // y ocultamos su tooltip.
-                if app.fences[index].hover_lock || app.fences[index].hover_pin {
+                if app.fences[index].hover_lock || app.fences[index].hover_pin || app.fences[index].hover_title {
                     app.fences[index].hover_lock = false;
                     app.fences[index].hover_pin = false;
+                    app.fences[index].hover_title = false;
                     needs_update = true;
                 }
                 app.hide_tooltip();
@@ -8657,6 +9600,14 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 if in_pin != app.fences[index].hover_pin {
                     app.fences[index].hover_pin = in_pin;
                     let _ = app.render(index);
+                }
+
+                // Hover sobre el titulo de la cabecera (resto de la zona):
+                // muestra el tooltip con estadisticas de la caja. Sin repintar
+                // (no hay resaltado visual, solo tooltip).
+                let in_title = y <= theme_header && !in_lock && !in_pin;
+                if in_title != app.fences[index].hover_title {
+                    app.fences[index].hover_title = in_title;
                 }
 
                 // Tooltip de cabecera: mostrarlo/ocultarlo segun el hover.
@@ -8895,10 +9846,10 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                         let s = f.scale;
                         let header_dip = f.header_h(&app.theme);
                         let dy = y as f32 / s;
-                        let row_h_dip = app.theme.row.max(22.0);
-                        let list_top_dip = header_dip + 30.0;
+                        let row_h_dip = (app.theme.row * s).max(28.0 * s) / s;
+                        let list_top_dip = header_dip + 32.0;
                         let h_dip = f.visible_height(&app.theme) as f32 / s;
-                        if dy > list_top_dip && dy < h_dip - 44.0 {
+                        if dy > list_top_dip && dy < h_dip - 40.0 {
                             let idx = ((dy - list_top_dip) / row_h_dip).floor() as usize;
                             let item = app.dropbox_scroll.max(0) as usize + idx;
                             if item < app.dropbox_files.len() {
@@ -8942,8 +9893,8 @@ extern "system" fn fence_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: 
                 if app.fences[index].layout.widget.as_deref() == Some("dropbox") {
                     let f = &app.fences[index];
                     let s = f.scale;
-                    let row_h = (app.theme.row * s).max(22.0 * s);
-                    let content_h = (f.visible_height(&app.theme) as f32 - f.header_h(&app.theme) * s - 74.0 * s)
+                    let row_h = (app.theme.row * s).max(28.0 * s);
+                    let content_h = (f.visible_height(&app.theme) as f32 - f.header_h(&app.theme) * s - 72.0 * s)
                         .max(0.0);
                     let visible = (content_h / row_h).floor().max(1.0) as usize;
                     let max = (app.dropbox_files.len().saturating_sub(visible)) as i32;

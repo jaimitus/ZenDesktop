@@ -21,6 +21,7 @@ use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
     KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
 };
+use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::Shell::{
     SHGetKnownFolderPath, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_PublicDesktop,
     KF_FLAG_DEFAULT,
@@ -124,6 +125,9 @@ pub struct Config {
     pub spotify: SpotifyConfig,
     /// Configuracion del widget de Dropbox (OAuth PKCE + sync de carpeta).
     pub dropbox: DropboxConfig,
+    /// Configuracion del widget de monitor del sistema (CPU/RAM/bateria).
+    #[serde(default)]
+    pub monitor: MonitorConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,6 +219,14 @@ impl Default for DropboxConfig {
             remote_folder: "/ZenDesktop".into(),
         }
     }
+}
+
+/// Widget de monitor del sistema (CPU / RAM / bateria en una caja).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MonitorConfig {
+    /// true => la caja widget de monitor se crea en el escritorio.
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -651,6 +663,7 @@ impl Default for Config {
             widgets_disabled: Vec::new(),
             spotify: SpotifyConfig::default(),
             dropbox: DropboxConfig::default(),
+            monitor: MonitorConfig::default(),
         }
     }
 }
@@ -804,6 +817,8 @@ impl Config {
 
     /// Escritura atomica: <config>.tmp -> rename. Nunca deja el archivo a medias.
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        // Backup automatico del archivo vigente antes de sobrescribirlo.
+        backup_before_save(path);
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
         }
@@ -823,9 +838,17 @@ impl Config {
         Ok(())
     }
 
+    /// Ruta de la carpeta de backups automaticos del config (junto al archivo).
+    /// La usa el dialogo de Configuracion para abrirla con el explorador.
+    pub fn backups_dir_for(path: &Path) -> PathBuf {
+        path.parent()
+            .map(|d| d.join("backups"))
+            .unwrap_or_else(|| PathBuf::from("backups"))
+    }
+
     /// Portable primero; si el directorio del ejecutable no admite escritura
     /// (Archivos de programa, unidad de red de solo lectura) cae a %APPDATA%.
-    fn resolve_path() -> Result<PathBuf, ConfigError> {
+    pub fn resolve_path() -> Result<PathBuf, ConfigError> {
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 let candidate = dir.join(CONFIG_FILE);
@@ -1039,6 +1062,67 @@ impl Config {
             || self.general.keep_shortcuts != other.general.keep_shortcuts
             || self.rules != other.rules
             || self.ephemeral != other.ephemeral
+    }
+}
+
+/// Backup automatico del config vigente antes de sobrescribirlo, en
+/// `<dir>/backups/config-YYYYMMDD-HHMMSS.toml`. Throttle: 1 backup por hora
+/// como maximo (los guards de posicion de cajas guardan muy a menudo) y
+/// retencion de las 12 copias mas recientes. Silencioso: cualquier fallo
+/// deja el guardado principal intacto.
+fn backup_before_save(path: &Path) {
+    if path.parent().is_none() {
+        return;
+    }
+    if !path.is_file() {
+        return; // primera creacion: no hay nada que respaldar
+    }
+    let Ok(existing) = fs::read(path) else { return };
+    let backups_dir = Config::backups_dir_for(path);
+    if fs::create_dir_all(&backups_dir).is_err() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Recolectar backups existentes (mtime como marca de tiempo) y ver si el
+    // mas reciente es de hace menos de una hora (throttle).
+    let mut files: Vec<(u64, PathBuf)> = Vec::new();
+    let mut newest = 0u64;
+    if let Ok(entries) = fs::read_dir(&backups_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(mt) = meta.modified() {
+                    if let Ok(secs) = mt.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()) {
+                        newest = newest.max(secs);
+                        files.push((secs, p));
+                    }
+                }
+            }
+        }
+    }
+    if now.saturating_sub(newest) < 3600 {
+        return;
+    }
+    // Nombre con fecha legible (GetLocalTime).
+    let stamp = unsafe {
+        let st = GetLocalTime();
+        format!(
+            "{:04}{:02}{:02}-{:02}{:02}{:02}",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+        )
+    };
+    let backup = backups_dir.join(format!("config-{stamp}.toml"));
+    if fs::write(&backup, &existing).is_err() {
+        return;
+    }
+    files.push((now, backup));
+    // Conservar solo las 12 mas recientes.
+    files.sort_by_key(|f| std::cmp::Reverse(f.0));
+    for (_, old) in files.into_iter().skip(12) {
+        let _ = fs::remove_file(old);
     }
 }
 
