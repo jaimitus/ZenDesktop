@@ -7,6 +7,20 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.26] - 2026-08-15
+
+### Fixed
+- **Settings persistence in the installed build** — `Config::resolve_path()`
+  used the `config.toml` sitting next to the exe even when that folder was
+  read-only (e.g. `Program Files` after an elevated first run). The app then
+  read a stale config where `sendto_menu` was off and every save silently
+  failed. The portable location is now only used when the exe folder is
+  actually writable; otherwise the config falls back to `%APPDATA%`.
+  This also makes "Send to ZenDesktop" from the Explorer context menu work
+  correctly in the installed EXE.
+
+---
+
 ## [1.0.25] - 2026-08-15
 
 ### Added

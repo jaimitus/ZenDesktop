@@ -892,9 +892,12 @@ impl Config {
     pub fn resolve_path() -> Result<PathBuf, ConfigError> {
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
-                let candidate = dir.join(CONFIG_FILE);
-                if candidate.is_file() || dir_is_writable(dir) {
-                    return Ok(candidate);
+                // Solo se usa la ubicacion portable si el directorio es escribible.
+                // Si un config.toml quedo junto al exe tras una ejecucion elevada
+                // (p. ej. "Program Files" recien instalado), no debe usarse: es de
+                // solo lectura para el usuario normal y romperia el guardado.
+                if dir_is_writable(dir) {
+                    return Ok(dir.join(CONFIG_FILE));
                 }
             }
         }
