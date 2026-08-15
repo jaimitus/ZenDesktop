@@ -1097,8 +1097,7 @@ mod tests {
 
     #[test]
     fn advanced_rule_filters() {
-        let mut cfg = Config::default();
-        cfg.rules = vec![Rule {
+        let rule = Rule {
             id: "facturas".into(),
             title: "Facturas".into(),
             enabled: true,
@@ -1116,7 +1115,11 @@ mod tests {
             older_than_days: None,
             regex: Some(r"^factura-.*\.pdf$".into()),
             pinned: Vec::new(),
-        }];
+        };
+        let cfg = Config {
+            rules: vec![rule],
+            ..Default::default()
+        };
         // regex ok + tamano ok -> casa
         assert!(classify(&cfg, "factura-2024.pdf", "pdf", false, Some(2 * 1024 * 1024), None).is_some());
         // regex no casa

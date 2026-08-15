@@ -94,6 +94,7 @@ use windows::Win32::System::Ole::{
     DoDragDrop, RegisterDragDrop, ReleaseStgMedium, RevokeDragDrop, CF_HDROP, DROPEFFECT,
     DROPEFFECT_COPY, DROPEFFECT_MOVE, DROPEFFECT_NONE, IDropSource, IDropTarget,
 };
+use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
@@ -238,6 +239,10 @@ const WM_ZEN_GDRIVE_OPEN: u32 = WM_APP + 0x26;
 const WM_ZEN_GDRIVE_UPLOADED: u32 = WM_APP + 0x27;
 /// Hay ficheros encolados en GDRIVE_PENDING_UPLOAD listos para subir.
 const WM_ZEN_GDRIVE_UPLOAD_PENDING: u32 = WM_APP + 0x28;
+/// Peticion "Enviar a ZenDesktop" pendiente (app recien arrancada) -> UI.
+pub const WM_ZEN_SENDTO: u32 = WM_APP + 0x29;
+/// Identificador del payload WM_COPYDATA del menu contextual de Explorer.
+pub const SENDTO_COPYDATA_MAGIC: usize = 0x5A4453;
 
 /// Codigo de autorizacion capturado por el listener de redireccion local.
 static GDRIVE_AUTH_CODE: Mutex<Option<String>> = Mutex::new(None);
@@ -2997,6 +3002,48 @@ impl App {
             }
         }
         moved
+    }
+
+    /// Mueve rutas a la carpeta fisica de la caja `fence_id` (peticion del menu
+    /// contextual de Explorer). Devuelve cuantos ficheros se movieron.
+    unsafe fn send_to_fence(&mut self, fence_id: &str, paths: Vec<PathBuf>) -> usize {
+        let Some(rule) = self.cfg.rules.iter().find(|r| r.id == fence_id) else {
+            return 0;
+        };
+        if !rule.enabled || !rule.move_files {
+            return 0;
+        }
+        let dir = self.cfg.root_dir().join(&rule.folder);
+        let mut moved = 0usize;
+        for src in paths {
+            if let Ok(Some(dest)) = rules::move_into_any_tracked(&src, &dir) {
+                self.undo_stack.push(UndoOp { from: src, to: dest });
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            self.skip_next_organize = true;
+            let title = rule.title.clone();
+            let msg = format!("{} {} → {}", moved, self.tr.toast_dropped, title);
+            self.show_toast(&msg, TOAST_DROP);
+            self.refresh_contents();
+            rules::notify_shell();
+            let _ = SetTimer(self.controller, TIMER_PERSIST, 800, None);
+        }
+        moved
+    }
+
+    /// Parsea el payload `fence_id\npath1\npath2...` de WM_COPYDATA y despacha.
+    unsafe fn handle_sendto_text(&mut self, text: &str) {
+        let mut parts = text.split('\n');
+        let Some(fence_id) = parts.next() else { return };
+        let paths: Vec<PathBuf> = parts
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        if !paths.is_empty() {
+            self.send_to_fence(fence_id, paths);
+        }
     }
 
     /// Extrae la lista de rutas de un IDataObject (CF_HDROP, OLE drag & drop).
@@ -8603,6 +8650,9 @@ impl App {
         if cfg.general.start_with_windows != self.cfg.general.start_with_windows {
             let _ = crate::config::apply_autostart(cfg.general.start_with_windows);
         }
+        // Menu contextual de Explorer: re-sincronizar siempre (cubre el toggle
+        // y tambien cajas nuevas/renombradas/borradas).
+        let _ = crate::config::apply_sendto_menu(&cfg, cfg.general.sendto_menu, self.tr.menu_sendto);
         // Los scripts Lua pueden haberse editado desde la pestana Widgets:
         // recargar antes de reconstruir las cajas para usar el codigo nuevo.
         self.reload_widgets();
@@ -9304,6 +9354,26 @@ extern "system" fn controller_proc(
                 if wparam.0 as i32 == HOTKEY_ID {
                     if let Some(app) = app_from(hwnd) {
                         app.toggle_zen();
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_COPYDATA => {
+                let cds = lparam.0 as *const COPYDATASTRUCT;
+                if !cds.is_null() && (*cds).dwData == SENDTO_COPYDATA_MAGIC {
+                    let units = ((*cds).cbData / 2) as usize;
+                    let data = (*cds).lpData as *const u16;
+                    let text = String::from_utf16_lossy(std::slice::from_raw_parts(data, units));
+                    if let Some(app) = app_from(hwnd) {
+                        app.handle_sendto_text(&text);
+                    }
+                }
+                LRESULT(1)
+            }
+            WM_ZEN_SENDTO => {
+                if let Some((fence_id, paths)) = crate::take_pending_sendto() {
+                    if let Some(app) = app_from(hwnd) {
+                        app.send_to_fence(&fence_id, paths);
                     }
                 }
                 LRESULT(0)
@@ -11673,6 +11743,9 @@ const _: () = assert!(std::mem::size_of::<FenceLayout>() <= 192);
 // Probe end-to-end (cargo test --release -- --ignored fence_e2e_probe)
 // ---------------------------------------------------------------------------
 
+include!("dropsource.rs");
+include!("draghelper.rs");
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11983,12 +12056,12 @@ mod tests {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
             let file = std::env::temp_dir().join("zendesktop_menu_probe.txt");
             std::fs::write(&file, b"x").unwrap();
-            let pair = build_shell_menu_for_paths(&[file.clone()]);
+            let pair = build_shell_menu_for_paths(std::slice::from_ref(&file));
             match pair {
                 Ok((_menu, hmenu, pidl)) => {
                     let count = GetMenuItemCount(hmenu);
                     let _ = DestroyMenu(hmenu);
-                    let _ = CoTaskMemFree(Some(pidl as *const c_void));
+                    CoTaskMemFree(Some(pidl as *const c_void));
                     assert!(count > 0, "el menu nativo debe traer items, trajo {count}");
                     println!("SHELL MENU UNIT OK: {count} items");
                 }
@@ -12238,11 +12311,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
-
-
-
-include!("dropsource.rs");
-
-
-
-include!("draghelper_test.rs");

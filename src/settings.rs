@@ -137,6 +137,7 @@ const ID_CHECK_ORGANIZE_START: u16 = 102;
 const ID_CHECK_PUBLIC: u16 = 103;
 const ID_CHECK_SHORTCUTS: u16 = 104;
 const ID_CHECK_STARTUP: u16 = 105;
+const ID_CHECK_SENDTO: u16 = 106;
 const ID_CHECK_ZEN_DBL: u16 = 111;
 const ID_CHECK_ZEN_HOTKEY: u16 = 112;
 const ID_CHECK_ZEN_HIDE: u16 = 113;
@@ -1158,6 +1159,7 @@ impl Settings {
             (ID_CHECK_PUBLIC, self.tr.chk_public),
             (ID_CHECK_SHORTCUTS, self.tr.chk_shortcuts),
             (ID_CHECK_STARTUP, self.tr.chk_startup),
+            (ID_CHECK_SENDTO, self.tr.chk_sendto),
         ] {
             y = self.check(y, cx, cw, id, label);
         }
@@ -3124,6 +3126,7 @@ impl Settings {
                     Ctrl::Check(ID_CHECK_PUBLIC),
                     Ctrl::Check(ID_CHECK_SHORTCUTS),
                     Ctrl::Check(ID_CHECK_STARTUP),
+                    Ctrl::Check(ID_CHECK_SENDTO),
                     Ctrl::Field(ID_EDIT_STARTUP_DELAY),
                     Ctrl::Check(ID_CHECK_ZEN_DBL),
                     Ctrl::Check(ID_CHECK_ZEN_HOTKEY),
@@ -4584,6 +4587,7 @@ impl Settings {
         cfg.general.watch_public_desktop = self.checked(ID_CHECK_PUBLIC);
         cfg.general.keep_shortcuts = self.checked(ID_CHECK_SHORTCUTS);
         cfg.general.start_with_windows = self.checked(ID_CHECK_STARTUP);
+        cfg.general.sendto_menu = self.checked(ID_CHECK_SENDTO);
         cfg.general.startup_delay_seconds = match text(ID_EDIT_STARTUP_DELAY).trim().parse::<u32>() {
             Ok(v) => v,
             Err(_) => {
@@ -5643,6 +5647,7 @@ fn initial_checks(cfg: &Config) -> HashMap<u16, bool> {
     m.insert(ID_CHECK_PUBLIC, cfg.general.watch_public_desktop);
     m.insert(ID_CHECK_SHORTCUTS, cfg.general.keep_shortcuts);
     m.insert(ID_CHECK_STARTUP, cfg.general.start_with_windows);
+    m.insert(ID_CHECK_SENDTO, cfg.general.sendto_menu);
     m.insert(ID_CHECK_AUTO_UPDATE, cfg.general.auto_check_updates);
     m.insert(ID_CHECK_ZEN_DBL, cfg.general.zen_double_click);
     m.insert(ID_CHECK_ZEN_HOTKEY, cfg.general.zen_hotkey);
@@ -6194,12 +6199,12 @@ mod tests {
             };
             assert_eq!(
                 nchit(80.0, HEADER_H + 33.0),
-                HTCLIENT as u32,
+                HTCLIENT,
                 "clic sobre un control debe ser HTCLIENT"
             );
             assert_eq!(
                 nchit(300.0, 615.0),
-                HTCAPTION as u32,
+                HTCAPTION,
                 "clic en zona vacia debe arrastrar (HTCAPTION)"
             );
 
@@ -6242,8 +6247,8 @@ mod tests {
                     file.extend_from_slice(&0u16.to_le_bytes());
                     file.extend_from_slice(&54u32.to_le_bytes());
                     file.extend_from_slice(&40u32.to_le_bytes());
-                    file.extend_from_slice(&(w as i32).to_le_bytes());
-                    file.extend_from_slice(&(h as i32).to_le_bytes());
+                    file.extend_from_slice(&w.to_le_bytes());
+                    file.extend_from_slice(&h.to_le_bytes());
                     file.extend_from_slice(&1u16.to_le_bytes());
                     file.extend_from_slice(&32u16.to_le_bytes());
                     file.extend_from_slice(&0u32.to_le_bytes());
@@ -6308,7 +6313,7 @@ mod tests {
             // queda visible tras el scroll maximo, en ~(363, 605) DIPs).
             click_sidebar(hwnd, 0, dpi);
             std::thread::sleep(std::time::Duration::from_millis(300));
-            let wheel_down = WPARAM((((-120i32) as u16 as usize) << 16) as usize);
+            let wheel_down = WPARAM(((-120i32) as u16 as usize) << 16);
             for _ in 0..4 {
                 let _ = PostMessageW(hwnd, WM_MOUSEWHEEL, wheel_down, LPARAM(0));
                 std::thread::sleep(std::time::Duration::from_millis(60));

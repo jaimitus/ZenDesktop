@@ -34,21 +34,23 @@ mod widgets;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, WPARAM,
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, WPARAM,
     WAIT_ABANDONED, WAIT_OBJECT_0,
 };
+use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
 use windows::Win32::System::Threading::{CreateMutexW, OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, FindWindowW, GetMessageW, MessageBoxW, PostMessageW, TranslateMessage,
-    MB_ICONERROR, MB_OK, MSG, WM_CLOSE,
+    DispatchMessageW, FindWindowW, GetMessageW, MessageBoxW, PostMessageW, SendMessageW,
+    TranslateMessage, MB_ICONERROR, MB_OK, MSG, WM_CLOSE, WM_COPYDATA,
 };
 
 use crate::config::Config;
@@ -78,6 +80,9 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         return apply_update_helper(&staged, &target, old_pid);
     }
 
+    // Peticion "Enviar a ZenDesktop" desde el menu contextual de Explorer.
+    let sendto = parse_sendto_args();
+
     // ---------------------------------------------------------------- 1. Unicidad
     let mutex = unsafe { CreateMutexW(None, true, w!("Local\\ZenDesktop.SingleInstance.v1"))? };
     let already_running = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
@@ -101,7 +106,11 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 }
             }
         } else {
-            // Ya hay una instancia viva: salir en silencio, sin molestar al usuario.
+            // Ya hay una instancia viva: si venimos del menu contextual,
+            // reenviar la peticion y salir en silencio.
+            if let Some((fence_id, paths)) = &sendto {
+                forward_sendto(fence_id, paths);
+            }
             unsafe {
                 let _ = CloseHandle(mutex);
             }
@@ -129,7 +138,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
     }
 
-    let result = bootstrap();
+    let result = bootstrap(sendto);
 
     unsafe {
         OleUninitialize();
@@ -138,7 +147,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     result
 }
 
-fn bootstrap() -> Result<ExitCode, Box<dyn std::error::Error>> {
+fn bootstrap(sendto: Option<SendToRequest>) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // ------------------------------------------------------------ 4. Configuracion
     let (mut cfg, cfg_path) = Config::load_or_create()?;
 
@@ -163,6 +172,10 @@ fn bootstrap() -> Result<ExitCode, Box<dyn std::error::Error>> {
         // Un fallo aqui (politicas de grupo) no debe impedir el arranque.
         let _ = config::apply_autostart(true);
     }
+
+    // Menu contextual de Explorer: se re-sincroniza siempre (limpia entradas
+    // de cajas borradas y vuelve a registrar las vigentes).
+    let _ = config::apply_sendto_menu(&cfg, cfg.general.sendto_menu, Tr::get(cfg.lang()).menu_sendto);
 
     let desktop = config::desktop_dir()?;
     let mut extra_desktops = Vec::new();
@@ -190,6 +203,15 @@ fn bootstrap() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let lang = cfg.lang();
     let auto_check_updates = cfg.general.auto_check_updates;
     let handle = App::launch(cfg, cfg_path, desktop, extra_desktops)?;
+
+    // "Enviar a ZenDesktop" con la app cerrada: ejecutar la peticion ya con
+    // la interfaz lista (mueve, refresca y avisa con toast).
+    if let Some((fence_id, paths)) = sendto {
+        set_pending_sendto(fence_id, paths);
+        unsafe {
+            let _ = PostMessageW(handle.controller(), ui::WM_ZEN_SENDTO, WPARAM(0), LPARAM(0));
+        }
+    }
 
     // Aviso "What's New" via toast (ya con la interfaz lista y el toast creado).
     if whats_new_pending {
@@ -275,15 +297,6 @@ fn fatal(text: &str) {
             MB_OK | MB_ICONERROR,
         );
     }
-}
-
-/// Comprobacion en tiempo de compilacion: el objetivo del vigilante tiene que
-/// poder cruzar el limite de hilos (contiene un HWND marcado como `Send`).
-#[allow(dead_code)]
-fn assert_thread_contract() {
-    fn require_send<T: Send>() {}
-    require_send::<WindowTarget>();
-    let _: HANDLE = HANDLE::default();
 }
 
 /// True si esta ejecucion es el "relevo" de una actualizacion: se lanzo con
@@ -380,4 +393,68 @@ fn apply_update_helper(staged: &Path, target: &Path, old_pid: u32) -> Result<Exi
     let _ = std::fs::remove_file(staged);
     let _ = std::process::Command::new(target).spawn();
     Ok(ExitCode::SUCCESS)
+}
+
+/// Extrae `--send-to <fence_id> <paths...>` del menu contextual de Explorer.
+fn parse_sendto_args() -> Option<SendToRequest> {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--send-to" {
+            let fence_id = args.next()?;
+            let paths = args.map(PathBuf::from).collect();
+            return Some((fence_id, paths));
+        }
+    }
+    None
+}
+
+/// Reenvia una peticion "Enviar a ZenDesktop" a la instancia que ya corre,
+/// via WM_COPYDATA (la forma limpia de pasar datos a otro proceso).
+fn forward_sendto(fence_id: &str, paths: &[PathBuf]) {
+    unsafe {
+        let controller = match FindWindowW(w!("ZenDesktop.Controller"), None) {
+            Ok(h) if !h.is_invalid() => h,
+            _ => return,
+        };
+        let text = format!(
+            "{}\n{}",
+            fence_id,
+            paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let buf = crate::config::wide(&text);
+        let cds = COPYDATASTRUCT {
+            dwData: ui::SENDTO_COPYDATA_MAGIC,
+            cbData: ((buf.len() - 1) * 2) as u32, // sin el NUL final
+            lpData: buf.as_ptr() as *mut c_void,
+        };
+        let _ = SendMessageW(
+            controller,
+            WM_COPYDATA,
+            WPARAM(0),
+            LPARAM(&cds as *const _ as isize),
+        );
+    }
+}
+
+/// Peticion "Enviar a ZenDesktop": (id de caja, rutas a mover).
+type SendToRequest = (String, Vec<PathBuf>);
+
+/// Peticion "Enviar a ZenDesktop" pendiente de ejecutar en el hilo de UI
+/// (cuando la app arranco a partir del propio comando del menu).
+static PENDING_SENDTO: OnceLock<Mutex<Option<SendToRequest>>> = OnceLock::new();
+
+fn set_pending_sendto(fence_id: String, paths: Vec<PathBuf>) {
+    PENDING_SENDTO
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .replace((fence_id, paths));
+}
+
+pub(crate) fn take_pending_sendto() -> Option<SendToRequest> {
+    PENDING_SENDTO.get().and_then(|m| m.lock().unwrap().take())
 }

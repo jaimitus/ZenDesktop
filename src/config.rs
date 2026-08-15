@@ -14,12 +14,13 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use windows::core::{PCWSTR, GUID};
+use windows::core::{PCWSTR, PWSTR, GUID};
 use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
-    KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW, RegEnumKeyExW,
+    RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_ALL_ACCESS, KEY_SET_VALUE,
+    REG_OPTION_NON_VOLATILE, REG_SZ,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::Shell::{
@@ -289,6 +290,9 @@ pub struct General {
     pub zen_hides_desktop_icons: bool,
     /// Registrar la app en HKCU\...\Run.
     pub start_with_windows: bool,
+    /// Registrar "Enviar a ZenDesktop" en el menu contextual de Explorer.
+    #[serde(default)]
+    pub sendto_menu: bool,
     /// Retraso (segundos) antes de mostrar las cajas al arrancar; 0 = inmediato.
     /// Evita que las cajas tapan el escritorio mientras la sesion de Windows
     /// sigue cargando programas de inicio.
@@ -617,6 +621,7 @@ impl Default for General {
             zen_hotkey: true,
             zen_hides_desktop_icons: true,
             start_with_windows: false,
+            sendto_menu: false,
             startup_delay_seconds: 0,
             organize_folders: true,
             protected: vec![
@@ -1431,6 +1436,144 @@ pub fn apply_autostart(enabled: bool) -> Result<(), ConfigError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// "Enviar a ZenDesktop" en el menu contextual de Explorer (HKCU, sin admin)
+// ---------------------------------------------------------------------------
+
+/// Submenu en cascada: una entrada "Enviar a ZenDesktop" que despliega una
+/// entrada por caja fisica (verbo anidado bajo `\shell\` con `subcommands`
+/// vacio, el mecanismo estatico mas fiable y autosuficiente, sin CommandStore).
+pub fn apply_sendto_menu(cfg: &Config, enabled: bool, menu_label: &str) -> Result<(), ConfigError> {
+    let exe = std::env::current_exe()?;
+    let exe = exe.to_string_lossy().into_owned();
+    unsafe {
+        // 1. Limpieza total: padres actuales, entradas directas de la iteracion
+        // anterior y verbos del primer intento en CommandStore.
+        for old_parent in [
+            r"Software\Classes\*\shell\ZenDesktop.SendTo",
+            r"Software\Classes\Directory\shell\ZenDesktop.SendTo",
+        ] {
+            let _ = RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(wide(old_parent).as_ptr()));
+        }
+        for parent in [r"Software\Classes\*\shell", r"Software\Classes\Directory\shell"] {
+            delete_subkeys_with_prefix(parent, "ZenDesktop.SendTo.");
+        }
+        delete_subkeys_with_prefix(
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\CommandStore\Shell",
+            "ZenDesktop.SendTo.",
+        );
+
+        if !enabled {
+            return Ok(());
+        }
+
+        // 2. Solo las cajas fisicas (enabled + move_files) aceptan recibir ficheros.
+        let boxes: Vec<(&str, &str)> = cfg
+            .rules
+            .iter()
+            .filter(|r| r.enabled && r.move_files)
+            .map(|r| (r.id.as_str(), r.title.as_str()))
+            .collect();
+        if boxes.is_empty() {
+            return Ok(());
+        }
+
+        // 3. Padres (ficheros y carpetas) con las cajas anidadas debajo.
+        for parent in [
+            r"Software\Classes\*\shell\ZenDesktop.SendTo",
+            r"Software\Classes\Directory\shell\ZenDesktop.SendTo",
+        ] {
+            write_reg_string(parent, "MUIVerb", menu_label)?;
+            write_reg_string(parent, "subcommands", "")?;
+            write_reg_string(parent, "Icon", &format!("{exe},0"))?;
+            for (id, title) in &boxes {
+                let verb = format!("{parent}\\shell\\{id}");
+                write_reg_string(&verb, "", title)?;
+                write_reg_string(&verb, "MultiSelectModel", "Player")?;
+                write_reg_string(
+                    &format!("{verb}\\command"),
+                    "",
+                    &format!("\"{exe}\" --send-to {id} \"%1\""),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Escribe (o sobrescribe) un valor REG_SZ. `name` vacio = valor por defecto.
+unsafe fn write_reg_string(path: &str, name: &str, value: &str) -> Result<(), ConfigError> {
+    let mut key = HKEY::default();
+    let status = RegCreateKeyExW(
+        HKEY_CURRENT_USER,
+        PCWSTR(wide(path).as_ptr()),
+        0,
+        None,
+        REG_OPTION_NON_VOLATILE,
+        KEY_SET_VALUE,
+        None,
+        &mut key,
+        None,
+    );
+    if status != ERROR_SUCCESS {
+        return Err(ConfigError::Shell(windows::core::Error::from_hresult(
+            status.to_hresult(),
+        )));
+    }
+    let name_w = wide(name);
+    let value_w = wide(value);
+    let bytes = std::slice::from_raw_parts(value_w.as_ptr() as *const u8, value_w.len() * 2);
+    let result = RegSetValueExW(key, PCWSTR(name_w.as_ptr()), 0, REG_SZ, Some(bytes));
+    let _ = RegCloseKey(key);
+    if result != ERROR_SUCCESS {
+        return Err(ConfigError::Shell(windows::core::Error::from_hresult(
+            result.to_hresult(),
+        )));
+    }
+    Ok(())
+}
+
+/// Elimina las subclaves de `parent` cuyo nombre empieza por `prefix`.
+unsafe fn delete_subkeys_with_prefix(parent: &str, prefix: &str) {
+    let mut key = HKEY::default();
+    let status = RegOpenKeyExW(
+        HKEY_CURRENT_USER,
+        PCWSTR(wide(parent).as_ptr()),
+        0,
+        KEY_ALL_ACCESS,
+        &mut key,
+    );
+    if status != ERROR_SUCCESS {
+        return;
+    }
+    let mut index = 0u32;
+    loop {
+        let mut name = [0u16; 256];
+        let mut name_len = name.len() as u32;
+        let status = RegEnumKeyExW(
+            key,
+            index,
+            PWSTR(name.as_mut_ptr()),
+            &mut name_len,
+            None,
+            PWSTR::null(),
+            None,
+            None,
+        );
+        if status != ERROR_SUCCESS {
+            break;
+        }
+        let sub = String::from_utf16_lossy(&name[..name_len as usize]);
+        if sub.starts_with(prefix) {
+            // Al borrar, la siguiente subclave ocupa este indice: no incrementar.
+            let _ = RegDeleteTreeW(key, PCWSTR(wide(&sub).as_ptr()));
+        } else {
+            index += 1;
+        }
+    }
+    let _ = RegCloseKey(key);
+}
+
 /// Helper UTF-16 terminado en NUL para las APIs W.
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -1451,8 +1594,7 @@ mod tests {
 
     #[test]
     fn unknown_language_falls_back_to_english() {
-        let mut cfg = Config::default();
-        cfg.language = "xx".into();
+        let mut cfg = Config { language: "xx".into(), ..Default::default() };
         cfg.normalize();
         assert_eq!(cfg.lang().code(), "en");
 

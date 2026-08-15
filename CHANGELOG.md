@@ -7,6 +7,26 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.25] - 2026-08-15
+
+### Added
+- **"Send to ZenDesktop" from Explorer** — a cascading entry in the Windows
+  right-click menu (for files *and* folders) that lists one subcommand per
+  physical fence. Picking one moves the file(s) straight into that fence with
+  the usual toast and undo. Works whether the app is already running (the
+  request is forwarded via `WM_COPYDATA`) or not (the app starts and runs it).
+  Managed from Settings → General ("Add 'Send to ZenDesktop' to the Explorer
+  context menu"); the menu re-syncs automatically when fences change.
+
+### Changed
+- **Smaller binary** — trimmed the `image` codecs to JPEG/PNG (the formats
+  actually used by Spotify cover art and Lua widget images).
+- **Code cleanup** — removed dead code (unused i18n strings, an unused
+  compile-time assertion, a misleadingly named module) and brought
+  `cargo clippy --all-targets` down to zero warnings.
+
+---
+
 ## [1.0.24] - 2026-08-14
 
 ### Added

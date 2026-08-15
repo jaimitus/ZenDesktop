@@ -1,6 +1,6 @@
 [package]
 name          = "zendesktop"
-version       = "1.0.24"
+version       = "1.0.25"
 edition       = "2021"
 rust-version  = "1.75"
 authors       = ["ZenDesktop Core Team"]
@@ -40,11 +40,12 @@ regex = "1"
 mlua = { version = "0.12", features = ["lua54", "vendored"] }
 
 # Widget Spotify: PKCE (sha256 + base64url) y decodificacion de la portada (JPEG).
-# `image` tambien decodifica las imagenes de los widgets Lua (ctx:image), por
-# eso se habilitan tambien PNG/GIF/BMP ademas de JPEG.
+# `image` tambien decodifica las imagenes de los widgets Lua (ctx:image); solo
+# se mantienen JPEG y PNG (los formatos reales; GIF/BMP se recortan para
+# adelgazar el binario).
 sha2 = "0.10"
 base64 = "0.22"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 # Bindings Win32 / Direct2D / DirectWrite generados a partir de metadatos oficiales.
 # Se fija la version exacta: la forma de los handles (HWND, HDC...) cambia entre releases.
@@ -66,6 +67,7 @@ features = [
     "Win32_Storage_Xps", # PrintWindow / PW_CLIENTONLY (probe visual)
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage", # IDataObject::GetData (arrastrar a las cajas)
+    "Win32_System_DataExchange",      # WM_COPYDATA (reenvio "Enviar a ZenDesktop")
     "Win32_System_Diagnostics_Debug", # ReadProcessMemory / WriteProcessMemory
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
