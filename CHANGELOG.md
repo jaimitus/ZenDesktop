@@ -7,6 +7,16 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.27] - 2026-08-16
+
+### Changed
+- **Lighter embedded Spotify logo** — the Spotify glyph shipped inside the
+  binary was a 4167×4167 PNG (350 KB). It is now a 100×100 PNG (~1.6 KB)
+  with the same visual result after the crop-and-scale pipeline, shaving
+  ~350 KB off the binary (now ~4.3 MB).
+
+---
+
 ## [1.0.26] - 2026-08-15
 
 ### Fixed

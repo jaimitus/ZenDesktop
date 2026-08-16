@@ -1548,7 +1548,7 @@ fn spotify_logo_data() -> Option<CoverData> {
         const LOGO_PNG: &[u8] = include_bytes!("../logo_spotify.png");
         *guard = image::load_from_memory(LOGO_PNG).ok().and_then(|img| {
             // El PNG es el glyph de Spotify (verde) centrado sobre fondo blanco
-            // (4167x4167). Se recorta al contenido verde, el fondo blanco se
+            // (100x100). Se recorta al contenido verde, el fondo blanco se
             // vuelve transparente y se redimensiona a 128px (nitido a 150% DPI).
             let rgba = img.to_rgba8();
             let (iw, ih) = (rgba.width(), rgba.height());
