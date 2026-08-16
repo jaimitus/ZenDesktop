@@ -7,6 +7,33 @@ and versioning follows [SemVer](https://semver.org/).
 
 ---
 
+## [1.0.28] - 2026-08-16
+
+### Fixed
+- **Mouse stutter every few seconds** — two UI-thread blockers were fixed:
+  - The Dropbox/Google Drive account email was fetched with a *blocking*
+    HTTP call (8–15 s timeouts) directly on the UI thread, retried every
+    5 s when it failed. It now runs on a worker thread and the result is
+    posted back via `WM_ZEN_DROPBOX_EMAIL` / `WM_ZEN_GDRIVE_EMAIL`.
+  - Every cloud listing poll (5 s) repainted *the whole app* (`render_all`)
+    even when nothing changed. Now the listing is compared (`PartialEq`)
+    and only the affected widget fence is repainted; the same applies to
+    Spotify snapshots/queue and sync reports.
+- **Idle CPU churn** — the 1 s widget tick no longer repaints the cloud
+  widget fences (they repaint on their own data), and Spotify only
+  repaints while actually playing (animated progress bar).
+
+### Changed
+- **Lower memory ceilings** — JUMBO (256 px) icon caches capped at
+  128 per-file / 64 per-extension (worst case 96 MB → 48 MB), thumbnail
+  cache 128 → 64 entries, and the full-screen magnetic-snap guide buffer
+  (~8 MB at 1080p, ~16 MB at 4K) is now freed when a drag ends instead of
+  living for the whole session.
+- **Cleanup** — removed 10 leftover debug/probe files (settings probe
+  screenshots, preview HTML stubs, one-off patch scripts).
+
+---
+
 ## [1.0.27] - 2026-08-16
 
 ### Changed

@@ -38,7 +38,7 @@ pub struct Token {
 }
 
 /// Un archivo/carpeta listado de la cuenta Dropbox.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct DropboxEntry {
     pub name: String,
     /// Ruta con prefijo `/` (p.ej. `/ZenDesktop/nota.txt`).

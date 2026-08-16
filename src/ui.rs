@@ -196,6 +196,8 @@ static SPOTIFY_LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
 static SPOTIFY_QUEUE: Mutex<Option<(String, Vec<spotify::QueueItem>)>> = Mutex::new(None);
 
 /// El navegador devolvio el codigo de autorizacion de Dropbox (hilo redirect -> UI).
+const WM_ZEN_DROPBOX_EMAIL: u32 = WM_APP + 0x2A;
+const WM_ZEN_GDRIVE_EMAIL: u32 = WM_APP + 0x2B;
 const WM_ZEN_DROPBOX_AUTH: u32 = WM_APP + 0x1C;
 /// Un listado de carpeta remota llego del hilo de trabajo (para refrescar la
 /// vista de archivos de la caja Dropbox).
@@ -844,7 +846,7 @@ struct ThumbEntry {
 }
 
 /// Cache LRU de miniaturas compartida (hover + modo cuadricula).
-const THUMB_CACHE_CAP: usize = 128;
+const THUMB_CACHE_CAP: usize = 64;
 struct ThumbCache {
     entries: Vec<(PathBuf, ThumbEntry)>,
 }
@@ -981,21 +983,22 @@ struct IconCache {
 }
 
 /// Tope de iconos por-archivo en cache (LRU) segun la clase: los JUMBO (256px)
-/// pesan ~256KB cada uno, asi que se acotan a una cuarta parte para no disparar
-/// la memoria maxima de la app.
+/// pesan ~256KB cada uno, asi que se acotan a una octava parte de los pequenos
+/// para no disparar la memoria maxima de la app (~32MB tope JUMBO).
 const fn icon_path_cap(class: IconClass) -> usize {
     match class {
         IconClass::Small | IconClass::Large => 1024,
-        IconClass::Jumbo => 256,
+        IconClass::Jumbo => 128,
     }
 }
 
 /// Tope de iconos por-extension en cache: las extensiones son pocas, pero los
-/// JUMBO pesan ~256KB, asi que tambien se acotan para no crecer sin limite.
+/// JUMBO pesan ~256KB, asi que tambien se acotan para no crecer sin limite
+/// (~16MB tope JUMBO).
 const fn icon_ext_cap(class: IconClass) -> usize {
     match class {
         IconClass::Small | IconClass::Large => 512,
-        IconClass::Jumbo => 128,
+        IconClass::Jumbo => 64,
     }
 }
 
@@ -1753,6 +1756,29 @@ fn start_dropbox_redirect(port: u16, controller: isize) {
                 let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             }
         }
+    });
+}
+
+/// Email de la cuenta (None = aun sin resultado; Some(None) = fallo/desconectado).
+/// Se rellena desde un hilo de trabajo: `account_email()` hace una peticion de
+/// red con timeout de 8-15s y no debe bloquear nunca el hilo de interfaz
+/// (antes se llamaba en la UI y, si fallaba, se reintentaba cada 5s -> tirones).
+static DROPBOX_EMAIL: Mutex<Option<Option<String>>> = Mutex::new(None);
+static GDRIVE_EMAIL: Mutex<Option<Option<String>>> = Mutex::new(None);
+
+/// Consulta el email de la cuenta Dropbox en un hilo y publica el resultado.
+fn fetch_dropbox_email(db: dropbox::Dropbox, controller: isize) {
+    thread::spawn(move || {
+        *DROPBOX_EMAIL.lock().unwrap() = Some(db.account_email());
+        let _ = unsafe { PostMessageW(HWND(controller as *mut c_void), WM_ZEN_DROPBOX_EMAIL, WPARAM(0), LPARAM(0)) };
+    });
+}
+
+/// Consulta el email de la cuenta Google Drive en un hilo y publica el resultado.
+fn fetch_gdrive_email(gd: gdrive::GDrive, controller: isize) {
+    thread::spawn(move || {
+        *GDRIVE_EMAIL.lock().unwrap() = Some(gd.account_email());
+        let _ = unsafe { PostMessageW(HWND(controller as *mut c_void), WM_ZEN_GDRIVE_EMAIL, WPARAM(0), LPARAM(0)) };
     });
 }
 
@@ -4594,11 +4620,23 @@ impl App {
         self.spotify_tick();
         self.dropbox_tick();
         self.gdrive_tick();
+        // Repintar solo lo que de verdad cambia cada segundo:
+        // - Spotify: solo mientras reproduce (la barra de progreso se mueve);
+        //   parado/en espera se repinta cuando llega el poll (30s).
+        // - Dropbox/GDrive: se repintan solas al llegar su listado (5s); un
+        //   repintado por segundo aqui es trabajo de UI desperdiciado.
+        // - Monitor y widgets Lua (reloj, etc.): necesitan el tick de 1s.
+        let spotify_playing = self.spotify_np.as_ref().is_some_and(|n| n.is_playing);
         let indices: Vec<usize> = self
             .fences
             .iter()
             .enumerate()
-            .filter(|(_, f)| f.layout.widget.is_some())
+            .filter(|(_, f)| match f.layout.widget.as_deref() {
+                Some("spotify") => spotify_playing,
+                Some("dropbox") | Some("gdrive") => false,
+                Some(_) => true,
+                None => false,
+            })
             .map(|(i, _)| i)
             .collect();
         for i in indices {
@@ -4610,6 +4648,11 @@ impl App {
 
     fn spotify_present(&self) -> bool {
         self.fences.iter().any(|f| f.layout.widget.as_deref() == Some("spotify"))
+    }
+
+    /// Indice de la caja del widget Spotify, si existe.
+    fn spotify_fence_idx(&self) -> Option<usize> {
+        self.fences.iter().position(|f| f.layout.widget.as_deref() == Some("spotify"))
     }
 
     /// Poll de "now playing" con throttle (30s) mientras el widget este visible.
@@ -4726,7 +4769,9 @@ impl App {
             self.spotify_context_uri = ctx;
             self.spotify_queue = next;
         }
-        self.render_all();
+        if let Some(i) = self.spotify_fence_idx() {
+            let _ = self.render(i);
+        }
     }
 
     /// Salta a una pista de la cola y vuelve a la vista "now playing".
@@ -4840,7 +4885,11 @@ impl App {
                 }
             }
         }
-        self.render_all();
+        // Repintar solo la caja del widget: el snapshot llega cada 30s y no
+        // afecta a las demas cajas (antes se repintaba toda la app).
+        if let Some(i) = self.spotify_fence_idx() {
+            let _ = self.render(i);
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -4850,6 +4899,11 @@ impl App {
     /// true si la caja del widget Dropbox existe en el escritorio.
     fn dropbox_present(&self) -> bool {
         self.fences.iter().any(|f| f.layout.widget.as_deref() == Some("dropbox"))
+    }
+
+    /// Indice de la caja del widget Dropbox, si existe.
+    fn dropbox_fence_idx(&self) -> Option<usize> {
+        self.fences.iter().position(|f| f.layout.widget.as_deref() == Some("dropbox"))
     }
 
     /// Asegura la existencia de la caja del widget de Dropbox segun
@@ -5106,17 +5160,30 @@ impl App {
 
     /// Copia el listado remoto del hilo de trabajo a la app y repinta.
     fn dropbox_apply_files(&mut self) {
-        if let Some(files) = DROPBOX_FILES.lock().unwrap().take() {
-            self.dropbox_files = files;
-        }
+        // El listado se reconsulta cada 5s: solo repintar si cambio de verdad
+        // (antes cada llegada repintaba TODA la app, ~150ms de tiron).
+        let changed = if let Some(files) = DROPBOX_FILES.lock().unwrap().take() {
+            if files != self.dropbox_files {
+                self.dropbox_files = files;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         if self.dropbox_selected.is_some_and(|s| s >= self.dropbox_files.len()) {
             self.dropbox_selected = None;
         }
         if self.dropbox_email.is_none() && self.dropbox.status() == dropbox::Status::Ready {
             let db = self.dropbox.clone();
-            self.dropbox_email = db.account_email();
+            fetch_dropbox_email(db, self.controller.0 as isize);
         }
-        self.render_all();
+        if changed {
+            if let Some(i) = self.dropbox_fence_idx() {
+                let _ = self.render(i);
+            }
+        }
     }
 
     /// Copia el reporte de sincronizacion del hilo de trabajo a la app.
@@ -5135,7 +5202,9 @@ impl App {
             }
         }
         self.dropbox_sync_note = note;
-        self.render_all();
+        if let Some(i) = self.dropbox_fence_idx() {
+            let _ = self.render(i);
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -5145,6 +5214,11 @@ impl App {
     /// true si la caja del widget Google Drive existe en el escritorio.
     fn gdrive_present(&self) -> bool {
         self.fences.iter().any(|f| f.layout.widget.as_deref() == Some("gdrive"))
+    }
+
+    /// Indice de la caja del widget Google Drive, si existe.
+    fn gdrive_fence_idx(&self) -> Option<usize> {
+        self.fences.iter().position(|f| f.layout.widget.as_deref() == Some("gdrive"))
     }
 
     /// Asegura la existencia de la caja del widget de Google Drive segun `cfg.gdrive.enabled`.
@@ -5345,20 +5419,33 @@ impl App {
 
     /// Aplica el resultado del listado remoto recibido del hilo.
     fn gdrive_apply_files(&mut self) {
-        if let Some(files) = GDRIVE_FILES.lock().unwrap().take() {
-            self.gdrive_files = files;
-            if self.gdrive_sync_note == "…" {
-                self.gdrive_sync_note = self.tr.msg_gdrive_synced.to_string();
+        // Igual que Dropbox: repintar solo si el listado (5s) cambio de verdad
+        // y solo la caja del widget, no toda la app.
+        let changed = if let Some(files) = GDRIVE_FILES.lock().unwrap().take() {
+            if files != self.gdrive_files {
+                self.gdrive_files = files;
+                if self.gdrive_sync_note == "…" {
+                    self.gdrive_sync_note = self.tr.msg_gdrive_synced.to_string();
+                }
+                true
+            } else {
+                false
             }
-        }
+        } else {
+            false
+        };
         if self.gdrive_selected.is_some_and(|s| s >= self.gdrive_files.len()) {
             self.gdrive_selected = None;
         }
         if self.gdrive_email.is_none() && self.gdrive.status() == gdrive::Status::Ready {
             let gd = self.gdrive.clone();
-            self.gdrive_email = gd.account_email();
+            fetch_gdrive_email(gd, self.controller.0 as isize);
         }
-        self.render_all();
+        if changed {
+            if let Some(i) = self.gdrive_fence_idx() {
+                let _ = self.render(i);
+            }
+        }
     }
 
     /// Aplica el reporte de sincronizacion recibido del hilo.
@@ -5377,7 +5464,9 @@ impl App {
             }
         }
         self.gdrive_sync_note = note;
-        self.render_all();
+        if let Some(i) = self.gdrive_fence_idx() {
+            let _ = self.render(i);
+        }
     }
 
     /// Configura credenciales de Google Drive.
@@ -7843,6 +7932,9 @@ impl App {
         }
         if vx.is_none() && vy.is_none() {
             let _ = ShowWindow(self.guides_hwnd, SW_HIDE);
+            // Liberar la DIB full-screen (puede pesar ~8MB en 1080p, ~16MB en
+            // 4K): no tiene sentido conservarla entre drags.
+            self.guides_surface = None;
             return;
         }
         if self.guides_surface.as_ref().map_or(true, |s| s.width != w || s.height != h) {
@@ -7898,6 +7990,9 @@ impl App {
         self.guides_vx = None;
         self.guides_vy = None;
         let _ = ShowWindow(self.guides_hwnd, SW_HIDE);
+        // Liberar la DIB full-screen (~8MB en 1080p, ~16MB en 4K): solo hace
+        // falta mientras dura el arrastre con guias visibles.
+        self.guides_surface = None;
     }
 
     fn start_collapse_anim(&mut self, index: usize) {
@@ -8567,7 +8662,7 @@ impl App {
         self.gdrive.set_redirect_uri(self.cfg.gdrive.redirect_uri.clone());
         if self.gdrive.status() == gdrive::Status::Ready && self.gdrive_email.is_none() {
             let gd = self.gdrive.clone();
-            self.gdrive_email = gd.account_email();
+            fetch_gdrive_email(gd, self.controller.0 as isize);
         }
         // Caja del widget Google Drive (nativo): se crea/elimina segun `enabled`.
         self.ensure_gdrive_fence();
@@ -9442,6 +9537,23 @@ extern "system" fn controller_proc(
                 }
                 LRESULT(0)
             }
+            WM_ZEN_DROPBOX_EMAIL => {
+                // El email llego del hilo de trabajo: guardarlo (solo informativo).
+                if let Some(app) = app_from(hwnd) {
+                    if let Some(email) = DROPBOX_EMAIL.lock().unwrap().take() {
+                        app.dropbox_email = email;
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_ZEN_GDRIVE_EMAIL => {
+                if let Some(app) = app_from(hwnd) {
+                    if let Some(email) = GDRIVE_EMAIL.lock().unwrap().take() {
+                        app.gdrive_email = email;
+                    }
+                }
+                LRESULT(0)
+            }
             WM_ZEN_DROPBOX_AUTH => {
                 // El navegador devolvio el codigo: canjearlo por tokens.
                 if let Some(app) = app_from(hwnd) {
@@ -9449,7 +9561,7 @@ extern "system" fn controller_proc(
                         match app.dropbox.complete_auth(&code) {
                             Ok(()) => {
                                 let db = app.dropbox.clone();
-                                app.dropbox_email = db.account_email();
+                                fetch_dropbox_email(db, app.controller.0 as isize);
                                 app.dropbox_sync_now();
                                 app.show_toast("Dropbox: sesión iniciada correctamente", TOAST_DROP);
                             }
@@ -11867,7 +11979,7 @@ mod tests {
     fn icon_cache_cap_is_lower_for_jumbo() {
         assert_eq!(icon_path_cap(IconClass::Small), 1024);
         assert_eq!(icon_path_cap(IconClass::Large), 1024);
-        assert_eq!(icon_path_cap(IconClass::Jumbo), 256);
+        assert_eq!(icon_path_cap(IconClass::Jumbo), 128);
     }
 
     /// La cache por-extension tambien se acota: el tope es menor para JUMBO y,
@@ -11876,7 +11988,7 @@ mod tests {
     fn icon_cache_ext_cap_and_eviction() {
         assert_eq!(icon_ext_cap(IconClass::Small), 512);
         assert_eq!(icon_ext_cap(IconClass::Large), 512);
-        assert_eq!(icon_ext_cap(IconClass::Jumbo), 128);
+        assert_eq!(icon_ext_cap(IconClass::Jumbo), 64);
 
         let mut cache = IconCache::default();
         cache.by_ext.insert(("pdf".to_string(), IconClass::Large), HICON::default());

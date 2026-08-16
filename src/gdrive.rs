@@ -37,7 +37,7 @@ pub struct Token {
 }
 
 /// Un archivo/carpeta listado de la cuenta de Google Drive.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct GDriveEntry {
     pub id: String,
     pub name: String,
